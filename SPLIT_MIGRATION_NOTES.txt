@@ -1,0 +1,86 @@
+PROJECT EXIT PLAN — INDICES / METALS SPLIT
+Build date: 2026-08-07
+
+FILES
+1) app_postgres_runtime_v10_1_28_indices_live_only.py
+   Replace the CURRENT live indices project's app_postgres_runtime.py with this file.
+
+2) app_postgres_runtime_v1_0_0_metals_standalone.py
+   Use this as app_postgres_runtime.py in the NEW standalone Metals Railway project.
+
+LIVE INDICES PROJECT
+- Hard scope: NAS100 + US500 only.
+- Live OANDA lane remains the existing live lane.
+- XAU/XAG webhooks are ignored before DB insertion.
+- Metals demo execution is hard-disabled even if stale METALS_DEMO_* Railway variables remain.
+- Dashboard no longer renders the metals research/demo section.
+- Signal coverage expects NAS100 + US500 only.
+- Existing historical XAU/XAG rows remain in the old database as an archive; no new metal rows are collected.
+- After deployment, METALS_DEMO_* variables can be removed from this project.
+
+NEW METALS PROJECT
+- Hard scope: XAUUSD + XAGUSD only.
+- NAS100/US500 webhooks are ignored before DB insertion.
+- Legacy/live index OANDA execution is hard-disabled in code.
+- Uses ONLY the isolated METALS_DEMO_* OANDA practice lane.
+- Both long and short simulation remain enabled.
+- Short v1/v2 research remains available.
+- 48h is the normal minimum hold / fixed benchmark.
+- Every new hourly metal signal after 48h triggers manager review.
+- 72/96/120h are protection milestones, not forced exits.
+- XAU/XAG asset-side basket management remains separate.
+- METALS_BASKET family overlay remains advisory.
+- Close-until-flat action queue and broker audit remain active.
+
+NEW METALS RAILWAY PROJECT — REQUIRED/RECOMMENDED VARIABLES
+DATABASE_ENGINE=postgres
+POSTGRES_RUNTIME_ENABLED=true
+DATABASE_URL=<NEW METALS POSTGRES DATABASE URL>
+
+# Keep legacy/live index broker lane explicitly safe in this project:
+OANDA_ENABLED=false
+BROKER_EXECUTION_ENABLED=false
+BROKER_READ_ONLY=true
+BROKER_KILL_SWITCH=true
+
+# Metals OANDA practice lane:
+METALS_DEMO_BROKER_ENABLED=true
+METALS_DEMO_OANDA_ENV=practice
+METALS_DEMO_OANDA_API_BASE=https://api-fxpractice.oanda.com
+METALS_DEMO_OANDA_ACCOUNT_ID=<OANDA DEMO ACCOUNT ID>
+METALS_DEMO_OANDA_API_TOKEN=<OANDA DEMO TOKEN>
+METALS_DEMO_ALLOWED_INSTRUMENTS=XAU_USD,XAG_USD
+
+# Current research/demo risk:
+METALS_DEMO_XAU_RISK_AMOUNT=4
+METALS_DEMO_XAG_RISK_AMOUNT=2
+METALS_DEMO_XAU_SL_PCT=2.21
+METALS_DEMO_XAG_SL_PCT=5.24
+METALS_DEMO_XAU_MAX_RISK_OVERAGE_PCT=150
+METALS_DEMO_XAG_MAX_RISK_OVERAGE_PCT=75
+
+# Direction + manager:
+METALS_DEMO_SIMULATE_LONGS=true
+METALS_DEMO_SIMULATE_SHORTS=true
+METALS_DEMO_BASKET_MANAGER_ENABLED=true
+METALS_DEMO_MANAGER_MIN_HOLD_CANDLES=48
+METALS_DEMO_MANAGER_MAX_HOLD_CANDLES=0
+
+# Use the same webhook secret policy as the other Project Exit Plan services:
+WEBHOOK_SECRET=<YOUR WEBHOOK SECRET>
+
+TRADINGVIEW
+- Keep NAS100 and US500 alert webhooks pointed at the existing live indices project.
+- Change XAUUSD and XAGUSD alert webhooks to:
+    https://<NEW-METALS-SERVICE>/webhook/tradingview
+- The scope guards make a misrouted alert harmless: the wrong project returns ignored=true and does not store/process it.
+
+SHARED OANDA DEMO ACCOUNT WITH BCO
+This is supported.
+- Metals runtime will only query/manage XAU_USD and XAG_USD in its isolated metals lane.
+- Keep the BCO project hard-allowlisted to BCO_USD only.
+- Do not give either project a broad instrument allowlist.
+
+PROMOTION LATER
+When a metal is ready for live promotion, do not merge it back into the indices project.
+Promote the standalone Metals project/lane by explicitly patching its broker environment and allowlist for live use after the demo evidence is accepted.
