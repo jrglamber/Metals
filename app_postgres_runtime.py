@@ -32,6 +32,13 @@ PROJECT_SCOPE = "METALS_ONLY"
 PROJECT_SCOPE_ALLOWED_PAIRS = {"XAUUSD", "XAGUSD"}
 PROJECT_SCOPE_ALLOWED_OANDA_INSTRUMENTS = {"XAU_USD", "XAG_USD"}
 
+# Standalone Metals cash accounting is GBP-native.
+# Prices remain the natural OANDA instrument quote (XAU/XAG are quoted in USD),
+# but risk, margin estimates, realised/unrealised P&L and dashboard money are GBP.
+METALS_REPORTING_CURRENCY = "GBP"
+METALS_DEMO_REQUIRE_GBP_ACCOUNT = os.getenv("METALS_DEMO_REQUIRE_GBP_ACCOUNT", "true").strip().lower() == "true"
+
+
 def _project_scope_pair(raw_pair: Any) -> str:
     raw = str(raw_pair or "").strip().upper()
     compact = raw.replace(" ", "").replace("-", "").replace("_", "").replace(":", "")
@@ -1343,12 +1350,13 @@ def esc(value: Any) -> str:
 
 
 def account_currency_symbol(currency: str = "") -> str:
-    """Display symbol for the active broker account currency.
+    """Display money in the project's account/reporting currency.
 
-    OANDA live account is GBP for the user's live rollout, so dashboard money
-    labels should show £ rather than the old demo/research $ label.
-    Falls back to $ for USD/unknown.
+    The standalone Metals project is GBP-native for all cash accounting. Market
+    prices are still quoted by OANDA in the instrument's natural quote currency.
     """
+    if globals().get("PROJECT_SCOPE") == "METALS_ONLY":
+        return "£"
     c = safe_str(currency).upper()
     if c == "GBP" or safe_str(OANDA_ENV).lower() == "live":
         return "£"
@@ -22031,6 +22039,56 @@ def _metals_demo_max_risk_overage_pct(asset: str) -> float:
     return float(METALS_DEMO_MAX_RISK_OVERAGE_PCT)
 
 
+_METALS_ACCOUNT_CACHE: Dict[str, Any] = {"expires_at": 0.0, "currency": "", "raw": {}}
+_METALS_ACCOUNT_CACHE_LOCK = threading.Lock()
+
+
+def _metals_demo_account_currency(force: bool = False) -> Dict[str, Any]:
+    """Return OANDA practice account home currency, cached briefly."""
+    now_ts = time.time()
+    with _METALS_ACCOUNT_CACHE_LOCK:
+        if not force and float(_METALS_ACCOUNT_CACHE.get("expires_at") or 0) > now_ts:
+            return {
+                "ok": bool(_METALS_ACCOUNT_CACHE.get("currency")),
+                "currency": safe_str(_METALS_ACCOUNT_CACHE.get("currency")).upper(),
+                "cached": True,
+                "raw": _METALS_ACCOUNT_CACHE.get("raw") or {},
+            }
+    if not METALS_DEMO_OANDA_ACCOUNT_ID or not METALS_DEMO_OANDA_API_TOKEN:
+        return {"ok": False, "currency": "", "error": "metals_demo_credentials_missing"}
+    resp = metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary")
+    account = resp.get("data", {}).get("account", {}) if resp.get("ok") else {}
+    currency = safe_str(account.get("currency")).upper()
+    with _METALS_ACCOUNT_CACHE_LOCK:
+        _METALS_ACCOUNT_CACHE.update({"expires_at": now_ts + 60.0, "currency": currency, "raw": account})
+    return {"ok": bool(resp.get("ok") and currency), "currency": currency, "cached": False, "raw": account, "response_ok": bool(resp.get("ok"))}
+
+
+def _metals_home_conversion(pricing_payload: Dict[str, Any], quote_currency: str = "USD") -> Dict[str, Any]:
+    """Extract quote-currency -> account-home conversion factors from OANDA pricing.
+
+    `accountLoss` is deliberately used for risk sizing so a GBP risk limit is
+    calculated on the adverse/loss conversion basis. `positionValue` is used for
+    the margin/notional display where supplied.
+    """
+    quote = safe_str(quote_currency).upper()
+    rows = pricing_payload.get("homeConversions", []) or []
+    for item in rows:
+        if safe_str(item.get("currency")).upper() != quote:
+            continue
+        account_loss = safe_float(item.get("accountLoss"))
+        account_gain = safe_float(item.get("accountGain"))
+        position_value = safe_float(item.get("positionValue"))
+        return {
+            "ok": account_loss is not None and account_loss > 0,
+            "quote_currency": quote,
+            "account_loss_factor": account_loss,
+            "account_gain_factor": account_gain,
+            "position_value_factor": position_value,
+        }
+    return {"ok": False, "quote_currency": quote, "error": f"home_conversion_missing_for_{quote}"}
+
+
 def metals_demo_config_status() -> Dict[str, Any]:
     missing = []
     if not METALS_DEMO_OANDA_ACCOUNT_ID: missing.append("METALS_DEMO_OANDA_ACCOUNT_ID")
@@ -22038,6 +22096,9 @@ def metals_demo_config_status() -> Dict[str, Any]:
     live_overlap = sorted(METALS_DEMO_ALLOWED_INSTRUMENTS.intersection(BROKER_ALLOWED_INSTRUMENTS))
     return {
         "label": METALS_DEMO_LABEL,
+        "reporting_currency": METALS_REPORTING_CURRENCY,
+        "cash_accounting": "GBP_NATIVE_OANDA_HOME_CONVERSION",
+        "require_gbp_account": METALS_DEMO_REQUIRE_GBP_ACCOUNT,
         "enabled": METALS_DEMO_BROKER_ENABLED,
         "environment": METALS_DEMO_OANDA_ENV,
         "account_id": METALS_DEMO_OANDA_ACCOUNT_ID,
@@ -22053,7 +22114,7 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "basket_manager_enabled": METALS_DEMO_BASKET_MANAGER_ENABLED,
         "manager_version": METALS_DEMO_MANAGER_VERSION,
         "model_version": METALS_DEMO_MODEL_VERSION,
-        "risk": {"XAUUSD": METALS_DEMO_XAU_RISK_AMOUNT, "XAGUSD": METALS_DEMO_XAG_RISK_AMOUNT},
+        "risk_gbp": {"XAUUSD": METALS_DEMO_XAU_RISK_AMOUNT, "XAGUSD": METALS_DEMO_XAG_RISK_AMOUNT},
         "sl_pct": {"XAUUSD": METALS_DEMO_XAU_SL_PCT, "XAGUSD": METALS_DEMO_XAG_SL_PCT},
         "max_risk_overage_pct": {
             "XAUUSD": METALS_DEMO_XAU_MAX_RISK_OVERAGE_PCT,
@@ -22323,38 +22384,143 @@ def _metals_demo_side(value: Any) -> str:
 
 
 def metals_demo_sizing_preview(asset: str, side: str = "short") -> Dict[str, Any]:
-    asset=_metals_demo_asset(asset); side=_metals_demo_side(side); instrument=_metals_demo_instrument(asset)
-    risk=_metals_demo_risk(asset); sl_pct=_metals_demo_sl_pct(asset); max_overage_pct=_metals_demo_max_risk_overage_pct(asset)
-    out={"ok":False,"asset":asset,"instrument":instrument,"side":side,"requested_risk_amount":risk,"risk_amount":risk,"sl_pct":sl_pct,
-         "max_accepted_risk_overage_pct":max_overage_pct,"label":METALS_DEMO_LABEL,"warnings":[],"blocking_reasons":[]}
+    asset = _metals_demo_asset(asset)
+    side = _metals_demo_side(side)
+    instrument = _metals_demo_instrument(asset)
+    requested_risk_gbp = _metals_demo_risk(asset)
+    sl_pct = _metals_demo_sl_pct(asset)
+    max_overage_pct = _metals_demo_max_risk_overage_pct(asset)
+    out = {
+        "ok": False,
+        "asset": asset,
+        "instrument": instrument,
+        "side": side,
+        "reporting_currency": "GBP",
+        "requested_risk_gbp": requested_risk_gbp,
+        "risk_amount": requested_risk_gbp,  # DB/backwards-compatible value; now explicitly GBP
+        "sl_pct": sl_pct,
+        "max_accepted_risk_overage_pct": max_overage_pct,
+        "label": METALS_DEMO_LABEL,
+        "warnings": [],
+        "blocking_reasons": [],
+    }
     if instrument not in METALS_DEMO_ALLOWED_INSTRUMENTS:
-        out["blocking_reasons"].append("instrument_not_in_metals_demo_allowlist"); out["warnings"].append("instrument_not_in_metals_demo_allowlist"); out["executable"]=False; return out
-    meta_resp=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/instruments?instruments={urllib.parse.quote(instrument)}")
-    price_resp=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(instrument)}")
-    metas=meta_resp.get("data",{}).get("instruments",[]) if meta_resp.get("ok") else []
-    prices=price_resp.get("data",{}).get("prices",[]) if price_resp.get("ok") else []
+        out["blocking_reasons"].append("instrument_not_in_metals_demo_allowlist")
+        out["warnings"].append("instrument_not_in_metals_demo_allowlist")
+        out["executable"] = False
+        return out
+
+    account_status = _metals_demo_account_currency()
+    account_currency = safe_str(account_status.get("currency")).upper()
+    out["oanda_account_currency"] = account_currency
+    if METALS_DEMO_REQUIRE_GBP_ACCOUNT and account_currency != "GBP":
+        out["blocking_reasons"].append(f"oanda_account_currency_not_gbp:{account_currency or 'UNKNOWN'}")
+        out["warnings"].append("oanda_account_must_be_gbp")
+        out["executable"] = False
+        return out
+
+    meta_resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/instruments?instruments={urllib.parse.quote(instrument)}"
+    )
+    price_resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(instrument)}&includeHomeConversions=true"
+    )
+    metas = meta_resp.get("data", {}).get("instruments", []) if meta_resp.get("ok") else []
+    pricing_payload = price_resp.get("data", {}) if price_resp.get("ok") else {}
+    prices = pricing_payload.get("prices", []) or []
+    conversion = _metals_home_conversion(pricing_payload, "USD")
     if not metas or not prices:
-        out["blocking_reasons"].append("instrument_metadata_or_price_unavailable"); out["warnings"].append("instrument_metadata_or_price_unavailable"); out["executable"]=False; return out
-    meta,price=metas[0],prices[0]; bid=safe_float((price.get("bids") or [{}])[0].get("price")); ask=safe_float((price.get("asks") or [{}])[0].get("price"))
-    if bid is None or ask is None or bid<=0 or ask<=0:
-        out["blocking_reasons"].append("invalid_bid_ask"); out["warnings"].append("invalid_bid_ask"); out["executable"]=False; return out
-    entry=ask if side=="long" else bid; mid=(bid+ask)/2; spread_pct=(ask-bid)/mid*100 if mid else None
-    stop=entry*(1-sl_pct/100) if side=="long" else entry*(1+sl_pct/100); risk_per_unit=abs(entry-stop)
-    min_units=safe_float(meta.get("minimumTradeSize")) or 1.0; precision=int(safe_float(meta.get("tradeUnitsPrecision")) or 0); step=10**(-precision)
-    raw_units=risk/risk_per_unit if risk_per_unit>0 else 0; floored=int(raw_units/step)*step if step>0 else raw_units; units=max(min_units,floored)
-    estimated_risk=units*risk_per_unit; overage=((estimated_risk-risk)/risk*100) if risk else 0; margin_rate=safe_float(meta.get("marginRate"))
-    if spread_pct is not None and spread_pct>_metals_demo_spread_limit(asset): out["blocking_reasons"].append("spread_over_limit"); out["warnings"].append("spread_over_limit")
-    minimum_size_applied=bool(units==min_units and raw_units<min_units)
-    if minimum_size_applied and overage>0:
-        if overage>max_overage_pct: out["blocking_reasons"].append("minimum_size_risk_overage_above_asset_limit"); out["warnings"].append("minimum_size_risk_overage")
-        else: out["warnings"].append("minimum_size_risk_overage_accepted_demo_only")
-    out.update({"ok":True,"bid":bid,"ask":ask,"entry_price":entry,"mid":mid,"spread_pct":spread_pct,"spread_limit_pct":_metals_demo_spread_limit(asset),
-                "stop_price":stop,"minimum_trade_size":min_units,"minimum_size_applied":minimum_size_applied,"trade_units_precision":precision,"unit_step":step,
-                "raw_units":raw_units,"units":units,"requested_risk_quote":risk,"estimated_risk_quote":estimated_risk,
-                "actual_to_requested_risk_multiple":estimated_risk/risk if risk else None,"estimated_risk_overage_pct":overage,
-                "max_accepted_risk_overage_pct":max_overage_pct,"risk_overage_accepted":bool(minimum_size_applied and overage>0 and overage<=max_overage_pct),
-                "margin_rate":margin_rate,"estimated_margin_quote":units*entry*(margin_rate or 0),"display_precision":int(safe_float(meta.get("displayPrecision")) or 3)})
-    out["executable"]=bool(not out["blocking_reasons"] and metals_demo_config_status()["orders_allowed"]); return out
+        out["blocking_reasons"].append("instrument_metadata_or_price_unavailable")
+        out["warnings"].append("instrument_metadata_or_price_unavailable")
+        out["executable"] = False
+        return out
+    if not conversion.get("ok"):
+        out["blocking_reasons"].append("usd_to_gbp_home_conversion_unavailable")
+        out["warnings"].append("cannot_calculate_gbp_risk_without_oanda_home_conversion")
+        out["conversion"] = conversion
+        out["executable"] = False
+        return out
+
+    meta, price = metas[0], prices[0]
+    bid = safe_float((price.get("bids") or [{}])[0].get("price"))
+    ask = safe_float((price.get("asks") or [{}])[0].get("price"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        out["blocking_reasons"].append("invalid_bid_ask")
+        out["warnings"].append("invalid_bid_ask")
+        out["executable"] = False
+        return out
+
+    entry = ask if side == "long" else bid
+    mid = (bid + ask) / 2
+    spread_pct = (ask - bid) / mid * 100 if mid else None
+    stop = entry * (1 - sl_pct / 100) if side == "long" else entry * (1 + sl_pct / 100)
+
+    # Instrument is USD-quoted, so convert stop-distance USD -> GBP before sizing.
+    stop_distance_usd_per_unit = abs(entry - stop)
+    usd_to_gbp_loss = float(conversion["account_loss_factor"])
+    stop_distance_gbp_per_unit = stop_distance_usd_per_unit * usd_to_gbp_loss
+
+    min_units = safe_float(meta.get("minimumTradeSize")) or 1.0
+    precision = int(safe_float(meta.get("tradeUnitsPrecision")) or 0)
+    step = 10 ** (-precision)
+    raw_units = requested_risk_gbp / stop_distance_gbp_per_unit if stop_distance_gbp_per_unit > 0 else 0
+    floored = int(raw_units / step) * step if step > 0 else raw_units
+    units = max(min_units, floored)
+
+    estimated_risk_gbp = units * stop_distance_gbp_per_unit
+    estimated_risk_usd_reference = units * stop_distance_usd_per_unit
+    overage = ((estimated_risk_gbp - requested_risk_gbp) / requested_risk_gbp * 100) if requested_risk_gbp else 0
+    margin_rate = safe_float(meta.get("marginRate"))
+    notional_usd = units * entry
+    position_value_factor = safe_float(conversion.get("position_value_factor")) or usd_to_gbp_loss
+    estimated_margin_gbp = notional_usd * (margin_rate or 0) * position_value_factor
+
+    if spread_pct is not None and spread_pct > _metals_demo_spread_limit(asset):
+        out["blocking_reasons"].append("spread_over_limit")
+        out["warnings"].append("spread_over_limit")
+
+    minimum_size_applied = bool(units == min_units and raw_units < min_units)
+    if minimum_size_applied and overage > 0:
+        if overage > max_overage_pct:
+            out["blocking_reasons"].append("minimum_size_risk_overage_above_asset_limit")
+            out["warnings"].append("minimum_size_risk_overage")
+        else:
+            out["warnings"].append("minimum_size_risk_overage_accepted_demo_only")
+
+    out.update({
+        "ok": True,
+        "bid": bid,
+        "ask": ask,
+        "entry_price_usd": entry,
+        "entry_price": entry,
+        "mid_price_usd": mid,
+        "spread_pct": spread_pct,
+        "spread_limit_pct": _metals_demo_spread_limit(asset),
+        "stop_price_usd": stop,
+        "stop_price": stop,
+        "minimum_trade_size": min_units,
+        "minimum_size_applied": minimum_size_applied,
+        "trade_units_precision": precision,
+        "unit_step": step,
+        "raw_units": raw_units,
+        "units": units,
+        "requested_risk_gbp": requested_risk_gbp,
+        "estimated_risk_gbp": estimated_risk_gbp,
+        "estimated_risk_usd_reference": estimated_risk_usd_reference,
+        "stop_distance_usd_per_unit": stop_distance_usd_per_unit,
+        "stop_distance_gbp_per_unit": stop_distance_gbp_per_unit,
+        "usd_to_gbp_account_loss_factor": usd_to_gbp_loss,
+        "actual_to_requested_risk_multiple": estimated_risk_gbp / requested_risk_gbp if requested_risk_gbp else None,
+        "estimated_risk_overage_pct": overage,
+        "max_accepted_risk_overage_pct": max_overage_pct,
+        "risk_overage_accepted": bool(minimum_size_applied and overage > 0 and overage <= max_overage_pct),
+        "margin_rate": margin_rate,
+        "estimated_margin_gbp": estimated_margin_gbp,
+        "display_precision": int(safe_float(meta.get("displayPrecision")) or 3),
+        "cash_accounting_note": "Risk/margin are converted from USD quote values into GBP using OANDA homeConversions; broker P&L is GBP because the practice account is required to be GBP.",
+    })
+    out["executable"] = bool(not out["blocking_reasons"] and metals_demo_config_status()["orders_allowed"])
+    return out
 
 
 def _metals_demo_audit(raw_signal_id: int, asset: str, instrument: str, action: str, status: str, message: str, preview: Optional[Dict[str, Any]] = None, response: Optional[Dict[str, Any]] = None, link_id: Optional[int] = None, candidate_state: str = "") -> int:
@@ -22369,7 +22535,7 @@ def _metals_demo_audit(raw_signal_id: int, asset: str, instrument: str, action: 
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now_utc_iso(), raw_signal_id, link_id, asset, instrument, action, status, candidate_state, message,
-            preview.get("risk_amount"), preview.get("estimated_risk_quote"), preview.get("units"), safe_float(fill.get("units")),
+            preview.get("risk_amount"), preview.get("estimated_risk_gbp"), preview.get("units"), safe_float(fill.get("units")),
             preview.get("spread_pct"), safe_float(fill.get("price")) or preview.get("bid"), preview.get("stop_price"),
             safe_str((fill.get("tradeOpened") or {}).get("tradeID")), safe_str(fill.get("id") or create.get("id")),
             response.get("status_code"), json.dumps({"preview": preview, "response": response}, default=str),
@@ -22414,7 +22580,7 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     with get_conn() as conn:
         er=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=?",(raw_signal_id,)).fetchone(); fill_units=abs(safe_float(fill.get("units")) or preview.get("units") or 0); fill_price=safe_float(fill.get("price")) or preview.get("entry_price")
         link_id=db_insert_returning_id(conn,"""INSERT INTO metals_demo_trade_links (created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,model_version,signal_time,entry_signal_id,requested_risk_amount,estimated_risk_amount,requested_units,filled_units,entry_price,stop_price,current_stop_price,broker_trade_id,broker_order_id,status,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_utc_iso(),now_utc_iso(),raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_quote"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",json.dumps({"candidate":candidate,"preview":preview,"response":response},default=str)))
+            (now_utc_iso(),now_utc_iso(),raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",json.dumps({"candidate":candidate,"preview":preview,"response":response},default=str)))
         conn.commit()
     _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}",preview,response,link_id,"CANDIDATE")
     return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate}
@@ -22601,6 +22767,9 @@ def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
 
 def metals_demo_summary() -> Dict[str, Any]:
     init_db(); cfg=metals_demo_config_status(); latest={}; previews={}
+    acct = _metals_demo_account_currency() if not cfg.get("missing") else {"ok": False, "currency": ""}
+    cfg["oanda_account_currency"] = safe_str(acct.get("currency")).upper()
+    cfg["gbp_account_verified"] = bool(cfg.get("oanda_account_currency") == "GBP")
     with get_conn() as conn:
         for asset in ["XAUUSD","XAGUSD"]:
             row=_metals_demo_latest_signal_row(conn,asset)
@@ -22614,7 +22783,7 @@ def metals_demo_summary() -> Dict[str, Any]:
             try: previews[key]=metals_demo_sizing_preview(asset,side) if not cfg["missing"] else {"ok":False,"warnings":["credentials_missing"]}
             except Exception as e: previews[key]={"ok":False,"warnings":[str(e)]}
     open_links=[r for r in links if safe_str(r.get("status")).upper()=="OPEN"]; actual_open=sum(float(safe_float(r.get("last_known_unrealized_pl")) or 0) for r in open_links); actual_closed=sum(float(safe_float(r.get("realized_pl")) or 0) for r in links if safe_float(r.get("realized_pl")) is not None); fixed=[safe_float(r.get("fixed_48h_r")) for r in links]; fixed=[float(v) for v in fixed if v is not None]
-    return {"status":"ok","label":METALS_DEMO_LABEL,"config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
@@ -22624,9 +22793,9 @@ def build_metals_demo_dashboard_html() -> str:
     for asset in ["XAUUSD","XAGUSD"]:
         item=snap["latest"].get(asset,{}); lc=item.get("long") or {}; sc=item.get("short_v2") or {}; sel=item.get("selected_demo_candidate") or {}; sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td><strong>{esc(sel.get('demo_side') or '-')}</strong></td></tr>"
     opens=""
-    for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'))}</td></tr>"
+    for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
     opens=opens or '<tr><td colspan="10">No open metals demo trades.</td></tr>'
-    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'))}</div><div class='small'>48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
+    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
 
 
 @app.get("/metals-short-shadow-v2")
