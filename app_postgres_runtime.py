@@ -24271,8 +24271,8 @@ summary{{cursor:pointer;font-weight:700}} .section-note{{padding:8px;margin:8px 
 <div class="small">Build: {esc(APP_NAME)} | Scope guard: {esc(PROJECT_SCOPE)}</div>
 </body></html>"""
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard() -> str:
+@app.get("/dashboard-full", response_class=HTMLResponse)
+def dashboard_full() -> str:
     init_db()
     if PROJECT_SCOPE == "METALS_ONLY":
         return build_metals_standalone_page()
@@ -29954,3 +29954,430 @@ async def broker_oanda_test_update_managed_stops(request: Request) -> Dict[str, 
         "note": "Protected P&L is an estimate at the stop price, not guaranteed against gaps/slippage.",
         "time_utc": now_utc_iso(),
     }
+
+
+# ============================================================
+# METALS v1.1.0 — PROJECT EXIT PLAN STANDARD DASHBOARD
+# ============================================================
+# This is a presentation/read-path standardisation only.
+# Existing XAU/XAG candidate logic, OANDA practice execution,
+# GBP-native sizing, 48h baseline, hourly post-48 management,
+# stop updates and close queue remain authoritative.
+
+_METALS_STD_TOP_CACHE = {"payload": None, "expires_at": 0.0}
+_METALS_STD_TOP_LOCK = threading.Lock()
+METALS_STANDARD_TOP_CACHE_SECONDS = max(
+    5.0, min(float(os.getenv("METALS_STANDARD_TOP_CACHE_SECONDS", "20")), 120.0)
+)
+
+
+def _metals_standard_latest_family_snapshot() -> Dict[str, Any]:
+    init_db()
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT *
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+    return dict(row) if row else {}
+
+
+def _metals_standard_top_uncached() -> Dict[str, Any]:
+    snap = metals_demo_summary()
+    cfg = snap.get("config") or {}
+    family = _metals_standard_latest_family_snapshot()
+
+    # OANDA account summary is already GBP-verified by the standalone metals lane.
+    acct = {}
+    try:
+        if cfg.get("orders_allowed"):
+            resp = _metals_demo_oanda_request(
+                "GET",
+                f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary",
+            )
+            if resp.get("ok"):
+                raw = resp.get("data") or {}
+                acct = raw.get("account") or raw
+    except Exception:
+        acct = {}
+
+    open_trades = snap.get("open_trades") or []
+    mature = sum(
+        1 for r in open_trades
+        if int(safe_float(r.get("manager_last_review_candles")) or 0)
+        >= int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
+    )
+    oldest = max(
+        [int(safe_float(r.get("manager_last_review_candles")) or 0) for r in open_trades]
+        or [0]
+    )
+
+    latest = snap.get("latest") or {}
+    signal_count = sum(
+        1 for a in ("XAUUSD", "XAGUSD")
+        if (latest.get(a) or {}).get("raw_signal_id")
+    )
+    candidate_count = sum(
+        1 for a in ("XAUUSD", "XAGUSD")
+        if safe_str(((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")).upper()
+           in ("CANDIDATE", "ACCEPTED", "TRUE")
+    )
+
+    hwm_r = safe_float(family.get("high_water_r")) or 0.0
+    basket_r = safe_float(family.get("basket_r")) or 0.0
+    giveback_pct = safe_float(family.get("giveback_pct")) or 0.0
+
+    return {
+        "status": "ok",
+        "project": "METALS",
+        "mode": "OANDA PRACTICE",
+        "reporting_currency": "GBP",
+        "time_utc": now_utc_iso(),
+        "account": {
+            "nav": safe_float(acct.get("NAV")),
+            "balance": safe_float(acct.get("balance")),
+            "unrealized_pl": safe_float(acct.get("unrealizedPL")),
+            "currency": safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),
+            "gbp_verified": bool(cfg.get("gbp_account_verified")),
+        },
+        "strategy": {
+            "open_pnl": safe_float(snap.get("actual_open_pnl")) or 0.0,
+            "realized_pnl": safe_float(snap.get("actual_realized_pnl")) or 0.0,
+            "total_pnl": safe_float(snap.get("actual_total_pnl")) or 0.0,
+            "open_trades": int(snap.get("open_trade_count") or 0),
+            "open_long": int(snap.get("open_long_count") or 0),
+            "open_short": int(snap.get("open_short_count") or 0),
+            "mature_48h_plus": mature,
+            "oldest_hold": oldest,
+            "basket_r": basket_r,
+            "high_water_r": hwm_r,
+            "giveback_pct": giveback_pct,
+            "basket_state": safe_str(family.get("state") or ("FLAT" if not open_trades else "GREEN")),
+            "manager_enabled": bool(cfg.get("basket_manager_enabled")),
+            "orders_allowed": bool(cfg.get("orders_allowed")),
+        },
+        "signals": {
+            "received_assets": signal_count,
+            "expected_assets": 2,
+            "candidate_assets": candidate_count,
+            "latest": latest,
+        },
+        "research": {
+            "fixed_48h_rows": int(snap.get("fixed_48h_baseline_rows") or 0),
+            "fixed_48h_total_r": safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0,
+        },
+    }
+
+
+def metals_standard_top_snapshot(force: bool = False) -> Dict[str, Any]:
+    ts = time.time()
+    with _METALS_STD_TOP_LOCK:
+        if (
+            not force
+            and _METALS_STD_TOP_CACHE.get("payload") is not None
+            and float(_METALS_STD_TOP_CACHE.get("expires_at") or 0.0) > ts
+        ):
+            out = dict(_METALS_STD_TOP_CACHE["payload"])
+            out["cached"] = True
+            return out
+    out = _metals_standard_top_uncached()
+    with _METALS_STD_TOP_LOCK:
+        _METALS_STD_TOP_CACHE["payload"] = dict(out)
+        _METALS_STD_TOP_CACHE["expires_at"] = ts + METALS_STANDARD_TOP_CACHE_SECONDS
+    out["cached"] = False
+    return out
+
+
+@app.get("/dashboard/top")
+def metals_standard_top_route(force: bool = False) -> Dict[str, Any]:
+    return metals_standard_top_snapshot(force=force)
+
+
+def _metals_std_section_wrap(body: str) -> str:
+    return f'<div class="lazy-loaded-section">{body}</div>'
+
+
+def _metals_std_signal_state_html() -> str:
+    snap = metals_demo_summary()
+    rows = ""
+    for asset in ("XAUUSD", "XAGUSD"):
+        item = (snap.get("latest") or {}).get(asset) or {}
+        lc = item.get("long") or {}
+        sc = item.get("short_v2") or {}
+        sel = item.get("selected_demo_candidate") or {}
+        rows += f"""
+        <tr>
+          <td><strong>{esc(asset)}</strong></td>
+          <td>{esc(display_candle_time(item.get('signal_time')))}</td>
+          <td>{esc(item.get('price'))}</td>
+          <td>{esc(lc.get('demo_state') or '-')}</td>
+          <td>{esc(lc.get('demo_blockers') or '-')}</td>
+          <td>{esc(sc.get('demo_state') or '-')}</td>
+          <td>{esc(sc.get('demo_blockers') or '-')}</td>
+          <td><strong>{esc(sel.get('demo_side') or '-')}</strong></td>
+        </tr>
+        """
+    return f"""
+      <div class="section-note">
+        XAU/XAG signal models remain asset-specific. This section standardises presentation only.
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr>
+            <th>Asset</th><th>Latest</th><th>Price</th>
+            <th>Long</th><th>Long blockers</th>
+            <th>Short v2</th><th>Short blockers</th><th>Selected</th>
+          </tr></thead>
+          <tbody>{rows or '<tr><td colspan="8">Waiting for signals.</td></tr>'}</tbody>
+        </table>
+      </div>
+    """
+
+
+def _metals_std_basket_manager_html() -> str:
+    # Reuse the existing manager view, stripping only the outer details wrapper
+    # is unnecessary; nested details is acceptable and keeps all diagnostics intact.
+    return build_metals_demo_dashboard_html()
+
+
+def _metals_std_broker_html() -> str:
+    cfg = metals_demo_config_status()
+    acct = _metals_demo_account_currency()
+    previews = []
+    for asset in ("XAUUSD", "XAGUSD"):
+        for side in ("long", "short"):
+            try:
+                p = metals_demo_sizing_preview(asset, side)
+            except Exception as exc:
+                p = {"ok": False, "warnings": [str(exc)]}
+            previews.append((asset, side, p))
+    rows = ""
+    for asset, side, p in previews:
+        rows += f"""
+        <tr>
+          <td>{esc(asset)}</td><td>{esc(side.upper())}</td>
+          <td>{esc(p.get('instrument') or _metals_demo_instrument(asset))}</td>
+          <td>{money(p.get('requested_risk_gbp'),'GBP')}</td>
+          <td>{money(p.get('estimated_risk_gbp'),'GBP')}</td>
+          <td>{esc(p.get('units') or p.get('order_units') or '-')}</td>
+          <td>{esc('OK' if p.get('ok') else 'BLOCKED')}</td>
+          <td>{esc('; '.join(p.get('warnings') or []))}</td>
+        </tr>
+        """
+    return f"""
+      <div class="section-note warn">
+        <strong>DEMO ONLY — NO LIVE MONEY.</strong>
+        XAU_USD / XAG_USD are the only allowed instruments in this service.
+      </div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Lane</div><div class="v">{'ENABLED' if cfg.get('orders_allowed') else 'BLOCKED'}</div><div class="small">OANDA practice</div></div>
+        <div class="mini-card"><div class="k">Account Currency</div><div class="v">{esc(acct.get('currency') or '-')}</div><div class="small">GBP verification required</div></div>
+        <div class="mini-card"><div class="k">Manager</div><div class="v">{'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div><div class="small">48h minimum + hourly review</div></div>
+        <div class="mini-card"><div class="k">Allowed</div><div class="v">XAU + XAG</div><div class="small">No index / BCO management</div></div>
+      </div>
+      <h3>Risk / sizing previews</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Asset</th><th>Side</th><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>State</th><th>Warnings</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table></div>
+      <div class="section-note small">
+        <a href="/broker/metals-demo/status">status JSON</a> ·
+        <a href="/export/metals-demo-execution-audit.csv">execution audit</a> ·
+        <a href="/export/metals-demo-open-trades.csv">open trades</a>
+      </div>
+    """
+
+
+def _metals_std_research_html() -> str:
+    return """
+      <div class="section-note">
+        Keep the research clocks separate: generated-short v1 remains the historically
+        supported baseline, cleaned v2 is the challenger, and long candidates continue
+        to be collected prospectively.
+      </div>
+      <div class="section-note small">
+        <a href="/metals-short-shadow-v2">Short Shadow v2 JSON</a> ·
+        <a href="/export/metals-short-shadow-v2.csv">v2 CSV</a> ·
+        <a href="/metals-short-research">Short research JSON</a> ·
+        <a href="/export/metals-short-research.csv">Short research CSV</a> ·
+        <a href="/metals-research-outcomes">Long outcomes JSON</a> ·
+        <a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a> ·
+        <a href="/export/metals-research.zip">Full metals research ZIP</a>
+      </div>
+    """
+
+
+def _metals_std_execution_html() -> str:
+    init_db()
+    with get_conn() as conn:
+        q = [dict(r) for r in conn.execute("""
+            SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT 50
+        """).fetchall()]
+        a = [dict(r) for r in conn.execute("""
+            SELECT * FROM metals_demo_execution_audit ORDER BY id DESC LIMIT 50
+        """).fetchall()]
+    pending = sum(1 for r in q if safe_str(r.get("status")).upper() in ("PENDING","RETRY"))
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Pending Close Actions</div><div class="v">{pending}</div><div class="small">Persistent close-until-flat queue</div></div>
+        <div class="mini-card"><div class="k">Recent Queue Rows</div><div class="v">{len(q)}</div></div>
+        <div class="mini-card"><div class="k">Recent Audit Rows</div><div class="v">{len(a)}</div></div>
+        <div class="mini-card"><div class="k">Scope Guard</div><div class="v">METALS ONLY</div><div class="small">XAU/XAG practice</div></div>
+      </div>
+      <div class="section-note small">
+        <a href="/export/metals-demo-action-queue.csv">action queue CSV</a> ·
+        <a href="/export/metals-demo-execution-audit.csv">execution audit CSV</a> ·
+        <a href="/export/metals-demo-manager-reviews.csv">manager reviews CSV</a> ·
+        <a href="/export/metals-demo-basket-snapshots.csv">basket snapshots CSV</a>
+      </div>
+    """
+
+
+_METALS_STD_SECTIONS = {
+    "basket-manager": ("Basket Manager", _metals_std_basket_manager_html),
+    "broker": ("Broker / OANDA / Accounting", _metals_std_broker_html),
+    "execution": ("Execution / Reconciliation", _metals_std_execution_html),
+    "signals": ("Signal State", _metals_std_signal_state_html),
+    "research": ("Research / Evidence / Exports", _metals_std_research_html),
+}
+
+
+@app.get("/dashboard/section/{section_key}", response_class=HTMLResponse)
+def metals_standard_section(section_key: str) -> str:
+    item = _METALS_STD_SECTIONS.get(safe_str(section_key))
+    if not item:
+        return HTMLResponse('<div class="lazy-error">Unknown section.</div>', status_code=404)
+    title, fn = item
+    started = time.perf_counter()
+    try:
+        body = fn()
+        elapsed = time.perf_counter() - started
+        return f'<div class="lazy-meta">{esc(title)} loaded in {elapsed:.2f}s · {esc(now_display_iso())}</div>{body}'
+    except Exception as exc:
+        return f'<div class="lazy-error"><strong>{esc(title)} failed.</strong><br>{esc(type(exc).__name__)}: {esc(exc)}</div>'
+
+
+def _metals_std_placeholder(key: str, title: str, note: str = "") -> str:
+    return f"""
+    <details class="lazy-section dashboard-group" data-section="{esc(key)}">
+      <summary>{esc(title)}</summary>
+      <div class="lazy-body">
+        <div class="lazy-placeholder"><strong>Not loaded yet.</strong> {esc(note)}<br>Open this section to fetch it.</div>
+      </div>
+    </details>
+    """
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def metals_standard_dashboard() -> str:
+    sections = "".join([
+        _metals_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48 reviews, protection milestones and close queue."),
+        _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA practice lane and sizing previews."),
+        _metals_std_placeholder("execution", "Execution / Reconciliation", "Action queue, audit and scope guard."),
+        _metals_std_placeholder("signals", "Signal State", "XAU/XAG long + generated short v2 candidate state."),
+        _metals_std_placeholder("research", "Research / Evidence / Exports", "v1/v2/long evidence and download links."),
+    ])
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Project Exit Plan — Metals</title>
+<style>
+:root{{--bg:#0d1117;--panel:#161b22;--panel2:#1f2630;--border:#30363d;--text:#f3f4f6;--muted:#aab2bf;--green:#54d98c;--amber:#f7c65d;--red:#ff7b72;--blue:#58a6ff;--summary:#2a1114;--summary2:#3b1519}}
+*{{box-sizing:border-box}} body{{font-family:Arial,sans-serif;margin:0;padding:14px;background:var(--bg);color:var(--text)}} .page{{max-width:1900px;margin:auto}}
+h1{{margin:0 0 2px;font-size:clamp(28px,4vw,46px);line-height:1.05}} h2{{margin:18px 0 10px}} h3{{padding:0 12px}}
+.sub{{color:var(--muted);margin-bottom:10px;font-size:14px}} .banner{{padding:9px 12px;border-radius:9px;background:#12351f;border:1px solid #275c37;margin:8px 0;color:#d8ffe4;font-size:13px}}
+.top-status{{padding:9px 12px;border-radius:9px;background:#10263b;border:1px solid #1f4e73;margin:8px 0 12px;color:#d8ecff;font-size:14px}}
+.cards{{display:grid;gap:8px;margin-bottom:8px}} .cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}} .cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.card{{background:var(--panel);border:1px solid var(--border);padding:11px 12px;border-radius:10px;min-height:84px;overflow:hidden}}
+.label,.k{{color:var(--muted);font-size:12px}} .value,.v{{font-size:clamp(20px,2.2vw,29px);font-weight:800;margin-top:4px}} .small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}
+.pos,.status_green,.true{{color:var(--green)!important;font-weight:800}} .neg,.status_red,.false{{color:var(--red)!important;font-weight:800}} .warn,.status_amber{{color:var(--amber)!important;font-weight:800}}
+details{{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:9px;overflow:hidden}}
+details>summary{{cursor:pointer;padding:11px 13px;font-weight:800;font-size:15px;background:var(--summary);color:white;border-left:5px solid #6f1d27;user-select:none}}
+details>summary:hover{{background:var(--summary2)}} .lazy-placeholder,.section-note{{padding:12px;color:var(--muted);background:#11161d;line-height:1.5;border-bottom:1px solid var(--border)}}
+.lazy-loading{{padding:14px;color:#8ecbff;font-weight:700}} .lazy-error{{margin:10px;padding:12px;background:#2b1113;border:1px solid #5f2329;border-radius:8px;color:#ffb4ad}}
+.lazy-meta{{padding:7px 12px;background:#11161d;border-bottom:1px solid var(--border);color:var(--muted);font-size:11px}}
+.metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}} .mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}
+table{{width:100%;border-collapse:collapse;background:var(--panel)}} th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}} th{{background:#0f141a;color:white}} .table-scroll{{width:100%;overflow-x:auto}}
+a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:12px}}
+@media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
+@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.sub{{font-size:12px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
+</style>
+</head>
+<body><div class="page">
+<h1>Project Exit Plan — Metals</h1>
+<div class="sub">v1.1.0 Project Standard · XAU + XAG · OANDA practice only</div>
+<div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
+<div id="topStatus" class="top-status">Loading top tiles…</div>
+<div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
+<div class="links"><a href="/dashboard-full">Full legacy dashboard</a> · <a href="/health">Health</a> · <a href="/broker/metals-demo/status">Broker status JSON</a> · <a href="/export/metals-research.zip">Metals research ZIP</a></div>
+<h2>Details</h2>{sections}
+</div>
+<script>
+function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}
+function money(v){{const n=Number(v);if(!Number.isFinite(n))return 'n/a';return (n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}
+function cls(v){{const n=Number(v);return !Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}
+function card(l,v,s='',c=''){{return `<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}
+function localTime(iso){{if(!iso)return '';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
+async function loadTop(force=false){{
+ const st=document.getElementById('topStatus'),t0=performance.now();
+ try{{
+  const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);
+  const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},q=d.research||{{}};
+  const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';
+  document.getElementById('topTiles').innerHTML=`
+   <div class="cards four">
+    ${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · GBP verified ${{eh(a.gbp_verified)}}`,cls(a.unrealized_pl))}}
+    ${{card('Metals P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+    ${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+    ${{card('Giveback',`${{gb.toFixed(1)}}%`,`Basket state ${{eh(s.basket_state||'')}}`,gbc)}}
+   </div>
+   <div class="cards four">
+    ${{card('Open Trades',eh(s.open_trades||0),`Long ${{eh(s.open_long||0)}} · Short ${{eh(s.open_short||0)}}`)}}
+    ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}
+    ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,`Latest XAU/XAG received`)}}
+    ${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,`Current selected demo candidates`,Number(g.candidate_assets||0)>0?'pos':'neg')}}
+   </div>
+   <div class="cards three">
+    ${{card('Lane',s.orders_allowed?'ENABLED':'BLOCKED',`OANDA PRACTICE · manager ${{s.manager_enabled?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}
+    ${{card('48h Baseline',`${{Number(q.fixed_48h_total_r||0).toFixed(2)}}R`,`${{eh(q.fixed_48h_rows||0)}} matured benchmark rows`,cls(q.fixed_48h_total_r))}}
+    ${{card('Scope','XAU + XAG','Standalone metals project')}}
+   </div>`;
+  st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`;
+ }}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}
+}}
+async function loadSection(d){{
+ if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';
+ try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}
+}}
+document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));
+loadTop(false);setInterval(()=>loadTop(true),60000);
+</script>
+</body></html>"""
+
+
+@app.get("/dashboard-standard-status")
+def metals_standard_status() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": "v1.1.0",
+        "project_standard": True,
+        "project": "METALS",
+        "environment": "practice",
+        "dashboard_mode": "dark_compact_lazy",
+        "legacy_dashboard": "/dashboard-full",
+        "trading_logic_changed": False,
+        "manager_contract": {
+            "minimum_hold_candles": METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,
+            "hourly_post_48h_review": True,
+            "forced_max_hold_candles": METALS_DEMO_MANAGER_MAX_HOLD_CANDLES,
+            "family_overlay": "advisory",
+            "fixed_48h_control": True,
+            "persistent_close_queue": True,
+        },
+        "time_utc": now_utc_iso(),
+    }
+
