@@ -29993,9 +29993,9 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
     acct = {}
     try:
         if cfg.get("orders_allowed"):
-            resp = _metals_demo_oanda_request(
-                "GET",
+            resp = metals_demo_request(
                 f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary",
+                "GET",
             )
             if resp.get("ok"):
                 raw = resp.get("data") or {}
@@ -30309,7 +30309,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.1.0 Project Standard · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.1.1 Project Standard · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -30363,7 +30363,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.1.0",
+        "version": "v1.1.1",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
