@@ -30424,7 +30424,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.2.0 Master Parity · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.2.1 Master Parity Fix · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -30441,7 +30441,7 @@ async function loadTop(force=false){{
  const st=document.getElementById('topStatus'),t0=performance.now();
  try{{
   const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);
-  const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},q=d.research||{{}};
+  const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},q=d.research||{{}},ac=d.accounting||{{}};
   const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
@@ -30475,7 +30475,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.2.0",
+        "version": "v1.2.1",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
