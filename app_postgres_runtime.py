@@ -9547,6 +9547,7 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
                 }
             result["metals_demo_lane"] = execute_metals_demo_candidate(int(new_signal_db_id), source=source)
             result["metals_demo_reconcile"] = metals_demo_reconcile_and_close(_scope_pair)
+            result["focused_research"] = record_metals_focused_research(int(new_signal_db_id))
             result["project_scope"] = PROJECT_SCOPE
             result["legacy_index_pipeline_executed"] = False
             return result
@@ -24246,7 +24247,7 @@ details{{background:#171a1e;border:1px solid #30343a;border-radius:10px;padding:
 summary{{cursor:pointer;font-weight:700}} .section-note{{padding:8px;margin:8px 0;background:#20242a;border-radius:7px}}
 .status_green,.pos,.true{{color:#7bd88f}} .status_amber{{color:#f0c36b}} .status_red,.neg,.false{{color:#ff8080}}
 .table-scroll{{overflow-x:auto}}
-</style></head><body>
+.research-inner{margin:7px 10px}.research-inner>summary{background:#11161d;border-left-color:#315f39}.research-inner-body{padding:0}</style></head><body>
 <h1>Project Exit Plan — Metals</h1>
 <div class="ok"><strong>STANDALONE METALS PROJECT</strong> — XAU/XAG research + OANDA practice only. The NAS100/US500 live account is hard-disabled in this runtime.</div>
 <div class="cards">
@@ -29956,6 +29957,181 @@ async def broker_oanda_test_update_managed_stops(request: Request) -> Dict[str, 
     }
 
 
+
+# ============================================================
+# v1.2.0 FOCUSED METALS RESEARCH — master v10.1.35 parity
+# Research-only. Never consumed by execution/management.
+# ============================================================
+METALS_FOCUSED_THRESHOLDS = [40,60,75,100,150,200,300,400,500,600]
+METALS_FOCUSED_HORIZONS = [6,12,24,48]
+METALS_FOCUSED_EFFICIENCY_LOOKBACKS = [8,12,24]
+
+def ensure_metals_focused_research_tables():
+    with get_conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS metals_focused_efficiency (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, raw_signal_id INTEGER,
+            asset TEXT, signal_time TEXT, lookback_candles INTEGER, candles_found INTEGER,
+            net_move_pct REAL, path_travelled_pct REAL, efficiency REAL, state TEXT,
+            UNIQUE(raw_signal_id,lookback_candles))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS metals_focused_alignment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, raw_signal_id INTEGER UNIQUE,
+            signal_time TEXT, state TEXT, xau_8h REAL, xag_8h REAL, xau_24h REAL, xag_24h REAL,
+            xau_candidate INTEGER, xag_candidate INTEGER)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS metals_focused_recovery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, raw_signal_id INTEGER UNIQUE,
+            cycle_id TEXT, trigger_signal_time TEXT, trigger_status TEXT, trigger_action TEXT,
+            trigger_open_count INTEGER, trigger_r REAL, trigger_hwm_r REAL, trigger_giveback_pct REAL,
+            outcome_6_r REAL,outcome_12_r REAL,outcome_24_r REAL,outcome_48_r REAL,
+            completed_48 INTEGER DEFAULT 0, updated_at_utc TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS metals_focused_highwater (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, cycle_id TEXT, threshold_r REAL,
+            trigger_raw_signal_id INTEGER, trigger_signal_time TEXT, trigger_r REAL, trigger_hwm_r REAL,
+            trigger_giveback_pct REAL, trigger_banked_r REAL,
+            outcome_6_r REAL,outcome_12_r REAL,outcome_24_r REAL,outcome_48_r REAL,
+            completed_48 INTEGER DEFAULT 0, updated_at_utc TEXT,
+            UNIQUE(cycle_id,threshold_r))""")
+        conn.commit()
+
+def _mf_asset_return(conn, asset, raw_id, lookback):
+    if raw_id <= 0: return None
+    rows=conn.execute("""SELECT exec_close FROM raw_signals WHERE UPPER(pair)=? AND exec_close IS NOT NULL
+                         AND id<=? ORDER BY id DESC LIMIT ?""",(asset,int(raw_id),int(lookback)+1)).fetchall()
+    closes=[safe_float(r["exec_close"]) for r in reversed(rows)]
+    closes=[float(x) for x in closes if x is not None]
+    if len(closes)<2 or closes[0]==0:return None
+    return (closes[-1]/closes[0]-1.0)*100.0
+
+def _mf_eff_state(x):
+    x=safe_float(x)
+    if x is None:return "INSUFFICIENT_DATA"
+    if x<0.25:return "CHOPPY"
+    if x<0.40:return "MIXED"
+    if x<0.60:return "TRENDING"
+    return "CLEAN_TREND"
+
+def _mf_family_state():
+    with get_conn() as conn:
+        s=conn.execute("SELECT * FROM metals_demo_basket_snapshots WHERE basket_key='METALS_BASKET' ORDER BY id DESC LIMIT 1").fetchone()
+        st=conn.execute("""SELECT MIN(created_at_utc) AS t FROM metals_demo_trade_links
+                           WHERE UPPER(COALESCE(status,'')) IN ('OPEN','LINKED','PENDING')""").fetchone()
+    d=dict(s) if s else {}
+    n=int(safe_float(d.get("open_count")) or 0); start=safe_str(st["t"] if st else "")
+    return {"cycle_id":("METALS_"+start) if n>0 and start else "","open_count":n,
+            "r":safe_float(d.get("basket_r")) or 0.0,"hwm":safe_float(d.get("high_water_r")) or 0.0,
+            "giveback":safe_float(d.get("giveback_pct")) or 0.0,
+            "status":safe_str(d.get("state") or ("FLAT" if n<=0 else "GREEN")).upper(),
+            "action":safe_str(d.get("action") or ""),"banked_r":0.0}
+
+def _mf_elapsed(conn, raw_id):
+    row=conn.execute("""SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals
+                        WHERE id>? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''""",(int(raw_id),)).fetchone()
+    return int(row["c"] if row else 0)
+
+def record_metals_focused_research(raw_signal_id):
+    try:
+        ensure_metals_focused_research_tables(); raw_signal_id=int(raw_signal_id or 0)
+        with get_conn() as conn:
+            raw=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(raw_signal_id,)).fetchone()
+            if not raw:return {"ok":False,"research_only":True,"reason":"raw_signal_not_found"}
+            d=dict(raw); asset=safe_str(d.get("pair")).upper(); sig=safe_str(d.get("timestamp_readable"))
+            # Trend efficiency/chop
+            for lb in METALS_FOCUSED_EFFICIENCY_LOOKBACKS:
+                rows=conn.execute("""SELECT exec_close FROM raw_signals WHERE UPPER(pair)=? AND exec_close IS NOT NULL
+                                     AND id<=? ORDER BY id DESC LIMIT ?""",(asset,raw_signal_id,lb+1)).fetchall()
+                closes=[safe_float(r["exec_close"]) for r in reversed(rows)];closes=[float(x) for x in closes if x is not None]
+                eff=net=path=None
+                if len(closes)>=2 and closes[0]:
+                    net_abs=abs(closes[-1]-closes[0]);path_abs=sum(abs(b-a) for a,b in zip(closes[:-1],closes[1:]))
+                    net=abs((closes[-1]/closes[0]-1)*100);path=sum(abs((b/a-1)*100) for a,b in zip(closes[:-1],closes[1:]) if a)
+                    eff=net_abs/path_abs if path_abs else None
+                conn.execute("""INSERT INTO metals_focused_efficiency
+                    (created_at_utc,raw_signal_id,asset,signal_time,lookback_candles,candles_found,net_move_pct,path_travelled_pct,efficiency,state)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id,lookback_candles) DO NOTHING""",
+                    (now_utc_iso(),raw_signal_id,asset,sig,lb,len(closes),net,path,eff,_mf_eff_state(eff)))
+            # XAU/XAG alignment
+            latest={}
+            for a in ("XAUUSD","XAGUSD"):
+                rr=conn.execute("SELECT * FROM raw_signals WHERE UPPER(pair)=? AND id<=? ORDER BY id DESC LIMIT 1",(a,raw_signal_id)).fetchone()
+                latest[a]=dict(rr) if rr else {}
+            xau,xag=latest["XAUUSD"],latest["XAGUSD"]
+            x8=_mf_asset_return(conn,"XAUUSD",int(xau.get("id") or 0),8);g8=_mf_asset_return(conn,"XAGUSD",int(xag.get("id") or 0),8)
+            x24=_mf_asset_return(conn,"XAUUSD",int(xau.get("id") or 0),24);g24=_mf_asset_return(conn,"XAGUSD",int(xag.get("id") or 0),24)
+            if x8 is None or g8 is None:al="INSUFFICIENT_DATA"
+            elif x8>0 and g8>0:al="ALIGNED_UP"
+            elif x8<0 and g8<0:al="ALIGNED_DOWN"
+            elif (x8>0>g8) or (g8>0>x8):al="DIVERGENT"
+            else:al="MIXED"
+            conn.execute("""INSERT INTO metals_focused_alignment
+                (created_at_utc,raw_signal_id,signal_time,state,xau_8h,xag_8h,xau_24h,xag_24h,xau_candidate,xag_candidate)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+                (now_utc_iso(),raw_signal_id,sig,al,x8,g8,x24,g24,1 if is_true(xau.get("forward_test_candidate")) else 0,1 if is_true(xag.get("forward_test_candidate")) else 0))
+            st=_mf_family_state()
+            # Update future outcomes
+            for table in ("metals_focused_recovery","metals_focused_highwater"):
+                pending=conn.execute(f"SELECT * FROM {table} WHERE COALESCE(completed_48,0)=0 ORDER BY id ASC LIMIT 500").fetchall()
+                for pr in pending:
+                    pd=dict(pr);tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_mf_elapsed(conn,tid);sets=[];vals=[]
+                    for h in METALS_FOCUSED_HORIZONS:
+                        col=f"outcome_{h}_r"
+                        if elapsed>=h and safe_float(pd.get(col)) is None:
+                            sets.append(f"{col}=?");vals.append(st["r"])
+                            if h==48:sets.append("completed_48=?");vals.append(1)
+                    if sets:
+                        sets.append("updated_at_utc=?");vals.extend([now_utc_iso(),int(pd["id"])])
+                        conn.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id=?",tuple(vals))
+            warn=st["open_count"]>0 and (st["status"] in {"AMBER","RED","CRITICAL"} or st["giveback"]>=40 or st["r"]<0 or any(k in st["action"].upper() for k in ("PAUSE","CLOSE","REDUCE","DEFENCE","DEFENSE")))
+            if warn:
+                conn.execute("""INSERT INTO metals_focused_recovery
+                    (created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,trigger_status,trigger_action,trigger_open_count,trigger_r,trigger_hwm_r,trigger_giveback_pct,updated_at_utc)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+                    (now_utc_iso(),raw_signal_id,st["cycle_id"],sig,st["status"],st["action"],st["open_count"],st["r"],st["hwm"],st["giveback"],now_utc_iso()))
+            if st["cycle_id"] and st["open_count"]>0:
+                for th in METALS_FOCUSED_THRESHOLDS:
+                    if st["hwm"]>=th:
+                        conn.execute("""INSERT INTO metals_focused_highwater
+                            (created_at_utc,cycle_id,threshold_r,trigger_raw_signal_id,trigger_signal_time,trigger_r,trigger_hwm_r,trigger_giveback_pct,trigger_banked_r,updated_at_utc)
+                            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING""",
+                            (now_utc_iso(),st["cycle_id"],th,raw_signal_id,sig,st["r"],st["hwm"],st["giveback"],st["banked_r"],now_utc_iso()))
+            conn.commit()
+        return {"ok":True,"research_only":True}
+    except Exception as exc:
+        return {"ok":False,"research_only":True,"error":f"{type(exc).__name__}: {exc}"}
+
+def _mf_rows(table,limit=5000):
+    ensure_metals_focused_research_tables()
+    with get_conn() as conn:return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?",(max(1,min(int(limit),100000)),)).fetchall()]
+
+def _mf_table(title,rows,cols):
+    body="".join("<tr>"+"".join(f"<td>{esc(r.get(c))}</td>" for c in cols)+"</tr>" for r in rows[:50]) or f'<tr><td colspan="{len(cols)}">No research rows yet.</td></tr>'
+    head="".join(f"<th>{esc(c.replace('_',' ').title())}</th>" for c in cols)
+    return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
+
+def build_metals_focused_research_html():
+    return '<div class="section-note small"><strong>Focused Metals research.</strong> Same four evidence themes as the Indices master. Research-only; no execution impact.</div>' + \
+      _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
+      _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
+      _mf_table("Trend Efficiency / Chop Research",_mf_rows("metals_focused_efficiency",150),["asset","signal_time","lookback_candles","efficiency","state","net_move_pct","path_travelled_pct"]) + \
+      _mf_table("Basket Recovery / Red-State Outcomes",_mf_rows("metals_focused_recovery",100),["trigger_signal_time","trigger_status","trigger_action","trigger_open_count","trigger_r","trigger_hwm_r","trigger_giveback_pct","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
+      '<details class="research-inner"><summary>Strategy Model Evidence</summary><div class="section-note small"><a href="/metals-short-shadow-v2">Short v2 JSON</a> · <a href="/export/metals-short-shadow-v2.csv">Short v2 CSV</a> · <a href="/metals-short-research">Short research JSON</a> · <a href="/export/metals-short-research.csv">Short research CSV</a> · <a href="/metals-research-outcomes">Long outcomes JSON</a> · <a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a></div></details>'
+
+@app.get("/export/metals-focused-research.zip")
+def export_metals_focused_research_zip(limit:int=25000):
+    ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
+    tables={"highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery"}
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        for fn,tbl in tables.items():
+            rows=_mf_rows(tbl,limit);out=io.StringIO()
+            if rows:
+                fields=[]
+                for r in rows:
+                    for k in r:
+                        if k not in fields:fields.append(k)
+                w=csv.DictWriter(out,fieldnames=fields);w.writeheader();w.writerows(rows)
+            z.writestr(fn,out.getvalue())
+        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)},indent=2))
+    return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="metals-focused-research.zip"'})
+
+
 # ============================================================
 # METALS v1.1.0 — PROJECT EXIT PLAN STANDARD DASHBOARD
 # ============================================================
@@ -29985,91 +30161,30 @@ def _metals_standard_latest_family_snapshot() -> Dict[str, Any]:
 
 
 def _metals_standard_top_uncached() -> Dict[str, Any]:
-    snap = metals_demo_summary()
-    cfg = snap.get("config") or {}
-    family = _metals_standard_latest_family_snapshot()
-
-    # OANDA account summary is already GBP-verified by the standalone metals lane.
-    acct = {}
+    snap=metals_demo_summary();cfg=snap.get("config") or {};family=_metals_standard_latest_family_snapshot();acct={}
     try:
         if cfg.get("orders_allowed"):
-            resp = metals_demo_request(
-                f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary",
-                "GET",
-            )
+            resp=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary","GET")
             if resp.get("ok"):
-                raw = resp.get("data") or {}
-                acct = raw.get("account") or raw
-    except Exception:
-        acct = {}
-
-    open_trades = snap.get("open_trades") or []
-    mature = sum(
-        1 for r in open_trades
-        if int(safe_float(r.get("manager_last_review_candles")) or 0)
-        >= int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
-    )
-    oldest = max(
-        [int(safe_float(r.get("manager_last_review_candles")) or 0) for r in open_trades]
-        or [0]
-    )
-
-    latest = snap.get("latest") or {}
-    signal_count = sum(
-        1 for a in ("XAUUSD", "XAGUSD")
-        if (latest.get(a) or {}).get("raw_signal_id")
-    )
-    candidate_count = sum(
-        1 for a in ("XAUUSD", "XAGUSD")
-        if safe_str(((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")).upper()
-           in ("CANDIDATE", "ACCEPTED", "TRUE")
-    )
-
-    hwm_r = safe_float(family.get("high_water_r")) or 0.0
-    basket_r = safe_float(family.get("basket_r")) or 0.0
-    giveback_pct = safe_float(family.get("giveback_pct")) or 0.0
-
-    return {
-        "status": "ok",
-        "project": "METALS",
-        "mode": "OANDA PRACTICE",
-        "reporting_currency": "GBP",
-        "time_utc": now_utc_iso(),
-        "account": {
-            "nav": safe_float(acct.get("NAV")),
-            "balance": safe_float(acct.get("balance")),
-            "unrealized_pl": safe_float(acct.get("unrealizedPL")),
-            "currency": safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),
-            "gbp_verified": bool(cfg.get("gbp_account_verified")),
-        },
-        "strategy": {
-            "open_pnl": safe_float(snap.get("actual_open_pnl")) or 0.0,
-            "realized_pnl": safe_float(snap.get("actual_realized_pnl")) or 0.0,
-            "total_pnl": safe_float(snap.get("actual_total_pnl")) or 0.0,
-            "open_trades": int(snap.get("open_trade_count") or 0),
-            "open_long": int(snap.get("open_long_count") or 0),
-            "open_short": int(snap.get("open_short_count") or 0),
-            "mature_48h_plus": mature,
-            "oldest_hold": oldest,
-            "basket_r": basket_r,
-            "high_water_r": hwm_r,
-            "giveback_pct": giveback_pct,
-            "basket_state": safe_str(family.get("state") or ("FLAT" if not open_trades else "GREEN")),
-            "manager_enabled": bool(cfg.get("basket_manager_enabled")),
-            "orders_allowed": bool(cfg.get("orders_allowed")),
-        },
-        "signals": {
-            "received_assets": signal_count,
-            "expected_assets": 2,
-            "candidate_assets": candidate_count,
-            "latest": latest,
-        },
-        "research": {
-            "fixed_48h_rows": int(snap.get("fixed_48h_baseline_rows") or 0),
-            "fixed_48h_total_r": safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0,
-        },
-    }
-
+                raw=resp.get("data") or {};acct=raw.get("account") or raw
+    except Exception: acct={}
+    open_trades=snap.get("open_trades") or []
+    mature=sum(1 for r in open_trades if int(safe_float(r.get("manager_last_review_candles")) or 0)>=int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES))
+    oldest=max([int(safe_float(r.get("manager_last_review_candles")) or 0) for r in open_trades] or [0])
+    latest=snap.get("latest") or {}
+    signal_count=sum(1 for a in ("XAUUSD","XAGUSD") if (latest.get(a) or {}).get("raw_signal_id"))
+    candidate_count=sum(1 for a in ("XAUUSD","XAGUSD") if safe_str(((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")).upper() in ("CANDIDATE","ACCEPTED","TRUE"))
+    hwm_r=safe_float(family.get("high_water_r")) or 0.0; basket_r=safe_float(family.get("basket_r")) or 0.0; giveback_pct=safe_float(family.get("giveback_pct")) or 0.0
+    now=now_utc();week_start=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);month_start=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    with get_conn() as conn:
+        wk=conn.execute("SELECT COALESCE(SUM(realized_pl),0) AS p FROM metals_demo_trade_links WHERE closed_at_utc>=?",(week_start.isoformat(),)).fetchone()
+        mo=conn.execute("SELECT COALESCE(SUM(realized_pl),0) AS p FROM metals_demo_trade_links WHERE closed_at_utc>=?",(month_start.isoformat(),)).fetchone()
+    return {"status":"ok","project":"METALS","mode":"OANDA PRACTICE","reporting_currency":"GBP","time_utc":now_utc_iso(),
+      "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),"unrealized_pl":safe_float(acct.get("unrealizedPL")),"currency":safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),"gbp_verified":bool(cfg.get("gbp_account_verified"))},
+      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"This week","month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"This month"},
+      "strategy":{"open_pnl":safe_float(snap.get("actual_open_pnl")) or 0.0,"realized_pnl":safe_float(snap.get("actual_realized_pnl")) or 0.0,"total_pnl":safe_float(snap.get("actual_total_pnl")) or 0.0,"open_trades":int(snap.get("open_trade_count") or 0),"open_long":int(snap.get("open_long_count") or 0),"open_short":int(snap.get("open_short_count") or 0),"mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,"high_water_r":hwm_r,"giveback_pct":giveback_pct,"basket_state":safe_str(family.get("state") or ("FLAT" if not open_trades else "GREEN")),"manager_enabled":bool(cfg.get("basket_manager_enabled")),"orders_allowed":bool(cfg.get("orders_allowed"))},
+      "signals":{"received_assets":signal_count,"expected_assets":2,"candidate_assets":candidate_count,"latest":latest},
+      "research":{"fixed_48h_rows":int(snap.get("fixed_48h_baseline_rows") or 0),"fixed_48h_total_r":safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0}}
 
 def metals_standard_top_snapshot(force: bool = False) -> Dict[str, Any]:
     ts = time.time()
@@ -30240,7 +30355,7 @@ _METALS_STD_SECTIONS = {
     "broker": ("Broker / OANDA / Accounting", _metals_std_broker_html),
     "execution": ("Execution / Reconciliation", _metals_std_execution_html),
     "signals": ("Signal State", _metals_std_signal_state_html),
-    "research": ("Research / Evidence / Exports", _metals_std_research_html),
+    "research": ("Metals Research / Evidence Lab", build_metals_focused_research_html),
 }
 
 
@@ -30277,7 +30392,7 @@ def metals_standard_dashboard() -> str:
         _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA practice lane and sizing previews."),
         _metals_std_placeholder("execution", "Execution / Reconciliation", "Action queue, audit and scope guard."),
         _metals_std_placeholder("signals", "Signal State", "XAU/XAG long + generated short v2 candidate state."),
-        _metals_std_placeholder("research", "Research / Evidence / Exports", "v1/v2/long evidence and download links."),
+        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "High-water/banking outcomes, XAU/XAG alignment, trend efficiency and basket recovery. Everything inside remains collapsed until opened."),
     ])
 
     return f"""<!doctype html>
@@ -30287,13 +30402,13 @@ def metals_standard_dashboard() -> str:
 <title>Project Exit Plan — Metals</title>
 <style>
 :root{{--bg:#0d1117;--panel:#161b22;--panel2:#1f2630;--border:#30363d;--text:#f3f4f6;--muted:#aab2bf;--green:#54d98c;--amber:#f7c65d;--red:#ff7b72;--blue:#58a6ff;--summary:#2a1114;--summary2:#3b1519}}
-*{{box-sizing:border-box}} body{{font-family:Arial,sans-serif;margin:0;padding:14px;background:var(--bg);color:var(--text)}} .page{{max-width:1900px;margin:auto}}
-h1{{margin:0 0 2px;font-size:clamp(28px,4vw,46px);line-height:1.05}} h2{{margin:18px 0 10px}} h3{{padding:0 12px}}
+*{{box-sizing:border-box}} body{{font-family:Arial,sans-serif;margin:0;padding:12px;background:var(--bg);color:var(--text)}} .page{{max-width:1900px;margin:auto}}
+h1{{margin:0 0 2px;font-size:clamp(28px,3.2vw,44px);line-height:1.05}} h2{{margin:18px 0 10px}} h3{{padding:0 12px}}
 .sub{{color:var(--muted);margin-bottom:10px;font-size:14px}} .banner{{padding:9px 12px;border-radius:9px;background:#12351f;border:1px solid #275c37;margin:8px 0;color:#d8ffe4;font-size:13px}}
 .top-status{{padding:9px 12px;border-radius:9px;background:#10263b;border:1px solid #1f4e73;margin:8px 0 12px;color:#d8ecff;font-size:14px}}
-.cards{{display:grid;gap:8px;margin-bottom:8px}} .cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}} .cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}
-.card{{background:var(--panel);border:1px solid var(--border);padding:11px 12px;border-radius:10px;min-height:84px;overflow:hidden}}
-.label,.k{{color:var(--muted);font-size:12px}} .value,.v{{font-size:clamp(20px,2.2vw,29px);font-weight:800;margin-top:4px}} .small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}
+.cards{{display:grid;gap:6px;margin-bottom:6px}} .cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}} .cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.card{{background:var(--panel);border:1px solid var(--border);padding:9px 10px;border-radius:9px;min-height:75px;overflow:hidden}}
+.label,.k{{color:var(--muted);font-size:12px}} .value,.v{{font-size:clamp(18px,1.8vw,27px);font-weight:800;margin-top:4px}} .small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}
 .pos,.status_green,.true{{color:var(--green)!important;font-weight:800}} .neg,.status_red,.false{{color:var(--red)!important;font-weight:800}} .warn,.status_amber{{color:var(--amber)!important;font-weight:800}}
 details{{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:9px;overflow:hidden}}
 details>summary{{cursor:pointer;padding:11px 13px;font-weight:800;font-size:15px;background:var(--summary);color:white;border-left:5px solid #6f1d27;user-select:none}}
@@ -30309,11 +30424,11 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.1.1 Project Standard · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.2.0 Master Parity · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
-<div class="links"><a href="/dashboard-full">Full legacy dashboard</a> · <a href="/health">Health</a> · <a href="/broker/metals-demo/status">Broker status JSON</a> · <a href="/export/metals-research.zip">Metals research ZIP</a></div>
+<div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/broker/metals-demo/status">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/metals-research.zip">⬇ Metals Analysis ZIP</a><a class="export-btn research" href="/export/metals-focused-research.zip">⬇ Metals Research ZIP</a></div>
 <h2>Details</h2>{sections}
 </div>
 <script>
@@ -30329,23 +30444,20 @@ async function loadTop(force=false){{
   const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},q=d.research||{{}};
   const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';
   document.getElementById('topTiles').innerHTML=`
-   <div class="cards four">
-    ${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · GBP verified ${{eh(a.gbp_verified)}}`,cls(a.unrealized_pl))}}
-    ${{card('Metals P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
-    ${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
-    ${{card('Giveback',`${{gb.toFixed(1)}}%`,`Basket state ${{eh(s.basket_state||'')}}`,gbc)}}
-   </div>
-   <div class="cards four">
-    ${{card('Open Trades',eh(s.open_trades||0),`Long ${{eh(s.open_long||0)}} · Short ${{eh(s.open_short||0)}}`)}}
-    ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}
-    ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,`Latest XAU/XAG received`)}}
-    ${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,`Current selected demo candidates`,Number(g.candidate_assets||0)>0?'pos':'neg')}}
-   </div>
-   <div class="cards three">
-    ${{card('Lane',s.orders_allowed?'ENABLED':'BLOCKED',`OANDA PRACTICE · manager ${{s.manager_enabled?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}
-    ${{card('48h Baseline',`${{Number(q.fixed_48h_total_r||0).toFixed(2)}}R`,`${{eh(q.fixed_48h_rows||0)}} matured benchmark rows`,cls(q.fixed_48h_total_r))}}
-    ${{card('Scope','XAU + XAG','Standalone metals project')}}
-   </div>`;
+<div class="cards four">
+${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
+${{card('Broker P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_state||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
+<div class="cards four">
+${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
+${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
+${{card('Open Trades',eh(s.open_trades||0),`Long ${{eh(s.open_long||0)}} · Short ${{eh(s.open_short||0)}}`)}}
+${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
+<div class="cards three">
+${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,'Latest XAU/XAG received',Number(g.received_assets||0)===2?'pos':'warn')}}
+${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,Number(g.received_assets||0)===2?'Missing none':'Waiting')}}
+${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}</div>`;
   st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`;
  }}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}
 }}
@@ -30363,7 +30475,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.1.1",
+        "version": "v1.2.0",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
