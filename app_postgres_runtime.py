@@ -30160,31 +30160,173 @@ def _metals_standard_latest_family_snapshot() -> Dict[str, Any]:
     return dict(row) if row else {}
 
 
-def _metals_standard_top_uncached() -> Dict[str, Any]:
-    snap=metals_demo_summary();cfg=snap.get("config") or {};family=_metals_standard_latest_family_snapshot();acct={}
+
+def metals_demo_live_broker_snapshot() -> Dict[str, Any]:
+    """
+    Fresh read-only OANDA practice snapshot filtered strictly to XAU_USD/XAG_USD.
+    Shared account NAV remains account-level; all trade/P&L metrics here are metals-only.
+    """
+    cfg = metals_demo_config_status()
+    acct = {}
+    if cfg.get("missing"):
+        return {
+            "ok": False, "account": {}, "owned_open_trades": [],
+            "owned_open_count": 0, "owned_unrealized_pl": 0.0,
+            "owned_margin_used": 0.0, "account_open_count": 0,
+            "error": "metals_demo_credentials_missing",
+        }
+
     try:
-        if cfg.get("orders_allowed"):
-            resp=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary","GET")
-            if resp.get("ok"):
-                raw=resp.get("data") or {};acct=raw.get("account") or raw
-    except Exception: acct={}
-    open_trades=snap.get("open_trades") or []
-    mature=sum(1 for r in open_trades if int(safe_float(r.get("manager_last_review_candles")) or 0)>=int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES))
-    oldest=max([int(safe_float(r.get("manager_last_review_candles")) or 0) for r in open_trades] or [0])
-    latest=snap.get("latest") or {}
-    signal_count=sum(1 for a in ("XAUUSD","XAGUSD") if (latest.get(a) or {}).get("raw_signal_id"))
-    candidate_count=sum(1 for a in ("XAUUSD","XAGUSD") if safe_str(((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")).upper() in ("CANDIDATE","ACCEPTED","TRUE"))
-    hwm_r=safe_float(family.get("high_water_r")) or 0.0; basket_r=safe_float(family.get("basket_r")) or 0.0; giveback_pct=safe_float(family.get("giveback_pct")) or 0.0
-    now=now_utc();week_start=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);month_start=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+        acc_resp = metals_demo_request(
+            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary", "GET"
+        )
+        if acc_resp.get("ok"):
+            raw = acc_resp.get("data") or {}
+            acct = raw.get("account") or raw
+    except Exception:
+        acct = {}
+
+    resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades", "GET"
+    )
+    if not resp.get("ok"):
+        return {
+            "ok": False, "account": acct, "owned_open_trades": [],
+            "owned_open_count": 0, "owned_unrealized_pl": 0.0,
+            "owned_margin_used": 0.0, "account_open_count": 0,
+            "error": resp.get("error"),
+        }
+
+    all_trades = (resp.get("data") or {}).get("trades", []) or []
+    allowed = {"XAU_USD", "XAG_USD"}
+    owned = [
+        t for t in all_trades
+        if safe_str(t.get("instrument")).upper() in allowed
+    ]
+    return {
+        "ok": True,
+        "account": acct,
+        "owned_open_trades": owned,
+        "owned_open_count": len(owned),
+        "owned_unrealized_pl": sum(
+            float(safe_float(t.get("unrealizedPL")) or 0.0) for t in owned
+        ),
+        "owned_margin_used": sum(
+            float(safe_float(t.get("marginUsed")) or 0.0) for t in owned
+        ),
+        "account_open_count": len(all_trades),
+        "time_utc": now_utc_iso(),
+    }
+
+def _metals_standard_top_uncached() -> Dict[str, Any]:
+    snap = metals_demo_summary()
+    cfg = snap.get("config") or {}
+    family = _metals_standard_latest_family_snapshot()
+    broker = metals_demo_live_broker_snapshot()
+    acct = broker.get("account") or {}
+
+    open_trades = snap.get("open_trades") or []
+    mature = sum(
+        1 for r in open_trades
+        if int(safe_float(r.get("manager_last_review_candles")) or 0)
+        >= int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
+    )
+    oldest = max(
+        [int(safe_float(r.get("manager_last_review_candles")) or 0) for r in open_trades]
+        or [0]
+    )
+
+    latest = snap.get("latest") or {}
+    signal_count = sum(
+        1 for a in ("XAUUSD", "XAGUSD")
+        if (latest.get(a) or {}).get("raw_signal_id")
+    )
+    candidate_count = sum(
+        1 for a in ("XAUUSD", "XAGUSD")
+        if safe_str(
+            ((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")
+        ).upper() in ("CANDIDATE", "ACCEPTED", "TRUE")
+    )
+
+    basket_r = safe_float(family.get("basket_r")) or 0.0
+    hwm_r = safe_float(family.get("high_water_r")) or 0.0
+    giveback_pct = safe_float(family.get("giveback_pct")) or 0.0
+
+    broker_open_pnl = safe_float(broker.get("owned_unrealized_pl")) or 0.0
+    realized_pnl = safe_float(snap.get("actual_realized_pnl")) or 0.0
+
+    now = now_utc()
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     with get_conn() as conn:
-        wk=conn.execute("SELECT COALESCE(SUM(realized_pl),0) AS p FROM metals_demo_trade_links WHERE closed_at_utc>=?",(week_start.isoformat(),)).fetchone()
-        mo=conn.execute("SELECT COALESCE(SUM(realized_pl),0) AS p FROM metals_demo_trade_links WHERE closed_at_utc>=?",(month_start.isoformat(),)).fetchone()
-    return {"status":"ok","project":"METALS","mode":"OANDA PRACTICE","reporting_currency":"GBP","time_utc":now_utc_iso(),
-      "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),"unrealized_pl":safe_float(acct.get("unrealizedPL")),"currency":safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),"gbp_verified":bool(cfg.get("gbp_account_verified"))},
-      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"This week","month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"This month"},
-      "strategy":{"open_pnl":safe_float(snap.get("actual_open_pnl")) or 0.0,"realized_pnl":safe_float(snap.get("actual_realized_pnl")) or 0.0,"total_pnl":safe_float(snap.get("actual_total_pnl")) or 0.0,"open_trades":int(snap.get("open_trade_count") or 0),"open_long":int(snap.get("open_long_count") or 0),"open_short":int(snap.get("open_short_count") or 0),"mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,"high_water_r":hwm_r,"giveback_pct":giveback_pct,"basket_state":safe_str(family.get("state") or ("FLAT" if not open_trades else "GREEN")),"manager_enabled":bool(cfg.get("basket_manager_enabled")),"orders_allowed":bool(cfg.get("orders_allowed"))},
-      "signals":{"received_assets":signal_count,"expected_assets":2,"candidate_assets":candidate_count,"latest":latest},
-      "research":{"fixed_48h_rows":int(snap.get("fixed_48h_baseline_rows") or 0),"fixed_48h_total_r":safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0}}
+        wk = conn.execute(
+            """SELECT COALESCE(SUM(realized_pl),0) AS p
+               FROM metals_demo_trade_links
+               WHERE closed_at_utc>=?""",
+            (week_start.isoformat(),)
+        ).fetchone()
+        mo = conn.execute(
+            """SELECT COALESCE(SUM(realized_pl),0) AS p
+               FROM metals_demo_trade_links
+               WHERE closed_at_utc>=?""",
+            (month_start.isoformat(),)
+        ).fetchone()
+
+    return {
+        "status": "ok",
+        "project": "METALS",
+        "mode": "OANDA PRACTICE",
+        "reporting_currency": "GBP",
+        "time_utc": now_utc_iso(),
+        "account": {
+            "nav": safe_float(acct.get("NAV")),
+            "balance": safe_float(acct.get("balance")),
+            "unrealized_pl": safe_float(acct.get("unrealizedPL")),
+            "margin_available": safe_float(acct.get("marginAvailable")),
+            "currency": safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),
+            "gbp_verified": bool(cfg.get("gbp_account_verified")),
+        },
+        "accounting": {
+            "week_pnl": safe_float(wk["p"] if wk else 0) or 0.0,
+            "week_label": "Realised this week",
+            "month_pnl": safe_float(mo["p"] if mo else 0) or 0.0,
+            "month_label": "Realised this month",
+        },
+        "strategy": {
+            "open_pnl": broker_open_pnl,
+            "model_open_pnl": safe_float(snap.get("actual_open_pnl")) or 0.0,
+            "realized_pnl": realized_pnl,
+            "total_pnl": broker_open_pnl + realized_pnl,
+            "open_trades": int(broker.get("owned_open_count") or 0),
+            "local_open_trades": int(snap.get("open_trade_count") or 0),
+            "open_long": int(snap.get("open_long_count") or 0),
+            "open_short": int(snap.get("open_short_count") or 0),
+            "mature_48h_plus": mature,
+            "oldest_hold": oldest,
+            "basket_r": basket_r,
+            "high_water_r": hwm_r,
+            "giveback_pct": giveback_pct,
+            "basket_state": safe_str(
+                family.get("state") or ("FLAT" if not open_trades else "GREEN")
+            ),
+            "manager_enabled": bool(cfg.get("basket_manager_enabled")),
+            "orders_allowed": bool(cfg.get("orders_allowed")),
+            "broker_margin_used": safe_float(broker.get("owned_margin_used")) or 0.0,
+            "broker_account_open_count": int(broker.get("account_open_count") or 0),
+        },
+        "signals": {
+            "received_assets": signal_count,
+            "expected_assets": 2,
+            "candidate_assets": candidate_count,
+            "latest": latest,
+        },
+        "research": {
+            "fixed_48h_rows": int(snap.get("fixed_48h_baseline_rows") or 0),
+            "fixed_48h_total_r": safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0,
+        },
+    }
 
 def metals_standard_top_snapshot(force: bool = False) -> Dict[str, Any]:
     ts = time.time()
@@ -30350,8 +30492,296 @@ def _metals_std_execution_html() -> str:
     """
 
 
+
+def _metals_age_zone(hold: Any) -> str:
+    h = int(safe_float(hold) or 0)
+    if h < 48: return "YOUNG"
+    if h < 72: return "48–72 EARLY"
+    if h < 96: return "72–96 STRONG"
+    if h < 120: return "96–120 MATURE"
+    return "120+ LATE"
+
+def _metals_std_open_trades_html() -> str:
+    snap = metals_demo_summary()
+    local = snap.get("open_trades") or []
+    broker = metals_demo_live_broker_snapshot()
+    broker_map = {
+        safe_str(t.get("id")): t
+        for t in (broker.get("owned_open_trades") or [])
+    }
+    local_bids = {
+        safe_str(t.get("broker_trade_id"))
+        for t in local
+        if safe_str(t.get("broker_trade_id"))
+    }
+
+    rows = ""
+    linked = 0
+    local_only = 0
+
+    for t in local:
+        bid = safe_str(t.get("broker_trade_id"))
+        bt = broker_map.get(bid) if bid else None
+        if bt: linked += 1
+        else: local_only += 1
+
+        rr = safe_float(t.get("manager_current_r")) or 0.0
+        hwm = safe_float(t.get("manager_high_water_r")) or 0.0
+        mfe = safe_float(t.get("manager_mfe_r")) or 0.0
+        mae = safe_float(t.get("manager_mae_r")) or 0.0
+        fixed48 = safe_float(t.get("fixed_48h_r"))
+        upl = safe_float((bt or {}).get("unrealizedPL"))
+        risk = safe_float(t.get("estimated_risk_amount")) or safe_float(t.get("requested_risk_amount")) or 0.0
+
+        rows += f"""
+        <tr>
+          <td><strong>{esc(t.get('asset'))}</strong></td>
+          <td>{esc(safe_str(t.get('side')).upper())}</td>
+          <td>{esc(t.get('id'))}</td>
+          <td>{esc(bid or 'LOCAL ONLY')}</td>
+          <td>{esc(t.get('signal_time'))}</td>
+          <td>{safe_float(t.get('entry_price')) or 0:.3f}</td>
+          <td>{safe_float(t.get('last_known_price')) or 0:.3f}</td>
+          <td>{int(safe_float(t.get('manager_last_review_candles')) or 0)}h</td>
+          <td>{esc(_metals_age_zone(t.get('manager_last_review_candles')))}</td>
+          <td class="{pnl_class(rr)}">{rr:.3f}R</td>
+          <td>{hwm:.3f}R</td>
+          <td>{mfe:.3f}R</td>
+          <td>{mae:.3f}R</td>
+          <td>{fixed48:.3f}R</td>
+          <td class="{pnl_class(upl)}">{money(upl,'GBP')}</td>
+          <td>{esc(t.get('manager_last_decision') or '-')}</td>
+          <td>{esc(t.get('manager_last_reason') or '-')}</td>
+          <td>{esc(t.get('current_stop_price') or t.get('stop_price') or '-')}</td>
+          <td>{money(risk,'GBP')}</td>
+        </tr>
+        """
+
+    broker_only = [
+        t for t in (broker.get("owned_open_trades") or [])
+        if safe_str(t.get("id")) not in local_bids
+    ]
+    broker_only_rows = "".join(
+        f"""<tr>
+          <td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
+          <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
+          <td class="{pnl_class(t.get('unrealizedPL'))}">{money(t.get('unrealizedPL'),'GBP')}</td>
+          <td>{money(t.get('marginUsed'),'GBP')}</td><td>{esc(t.get('openTime'))}</td>
+        </tr>"""
+        for t in broker_only
+    )
+
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">OANDA Metals Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">Actual XAU/XAG broker positions</div></div>
+        <div class="mini-card"><div class="k">Linked Local Trades</div><div class="v {'pos' if linked == int(broker.get('owned_open_count') or 0) else 'warn'}">{linked}</div><div class="small">Local ↔ broker IDs matched</div></div>
+        <div class="mini-card"><div class="k">Local-Only OPEN</div><div class="v {'neg' if local_only else 'pos'}">{local_only}</div><div class="small">Should normally be zero</div></div>
+        <div class="mini-card"><div class="k">Metals Broker UPL</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">Fresh OANDA XAU/XAG UPL</div></div>
+      </div>
+      <h3>Open Metals Trades — Manager + OANDA</h3>
+      <div class="table-scroll"><table>
+        <thead><tr>
+          <th>Asset</th><th>Side</th><th>Local ID</th><th>Broker ID</th><th>Entry Time</th>
+          <th>Entry</th><th>Current</th><th>Age</th><th>Zone</th><th>Current R</th>
+          <th>HWM R</th><th>MFE R</th><th>MAE R</th><th>48h Baseline</th><th>OANDA UPL</th>
+          <th>Decision</th><th>Reason</th><th>Current SL</th><th>Effective Risk</th>
+        </tr></thead>
+        <tbody>{rows or '<tr><td colspan="19">No open Metals trades.</td></tr>'}</tbody>
+      </table></div>
+      {f'<h3>Broker-Only Metals Trades — Attention Required</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
+    """
+
+def _metals_std_basket_manager_html() -> str:
+    snap = metals_demo_summary()
+    baskets = snap.get("recent_basket_snapshots") or []
+
+    latest_by_key = {}
+    for b in baskets:
+        key = safe_str(b.get("basket_key"))
+        if key and key not in latest_by_key:
+            latest_by_key[key] = b
+
+    family = latest_by_key.get("METALS_BASKET") or {}
+    cards = ""
+    for key in ("XAUUSD:LONG", "XAUUSD:SHORT", "XAGUSD:LONG", "XAGUSD:SHORT"):
+        b = latest_by_key.get(key) or {}
+        state = safe_str(b.get("state") or "FLAT")
+        cls = "pos" if state in ("GREEN","OBSERVE") else "warn" if state == "AMBER" else "neg"
+        cards += f"""
+        <div class="mini-card">
+          <div class="k">{esc(key.replace(':',' '))}</div>
+          <div class="v {cls}">{esc(state)}</div>
+          <div class="small">
+            {safe_float(b.get('basket_r')) or 0:.2f}R · HWM {safe_float(b.get('high_water_r')) or 0:.2f}R ·
+            giveback {safe_float(b.get('giveback_pct')) or 0:.1f}% · open {int(safe_float(b.get('open_count')) or 0)}
+          </div>
+        </div>
+        """
+
+    return f"""
+      <div class="section-note">
+        <strong>Metals Basket Manager.</strong> Same Project Exit Plan operating contract as Indices:
+        48h minimum normal hold, hourly review thereafter, runner protection at 48/72/96/120h,
+        asset/side defence, persistent close-until-flat retries, and fixed-48h benchmark evidence.
+        The combined Metals family remains advisory only.
+      </div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Family Basket</div><div class="v {pnl_class(family.get('basket_r'))}">{safe_float(family.get('basket_r')) or 0:.2f}R</div><div class="small">XAU + XAG advisory overlay</div></div>
+        <div class="mini-card"><div class="k">Family High-Water</div><div class="v {pnl_class(family.get('high_water_r'))}">{safe_float(family.get('high_water_r')) or 0:.2f}R</div><div class="small">Giveback {safe_float(family.get('giveback_pct')) or 0:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Family State</div><div class="v">{esc(family.get('state') or 'FLAT')}</div><div class="small">{esc(family.get('action') or 'ADVISORY_ONLY')}</div></div>
+        <div class="mini-card"><div class="k">48h Benchmark</div><div class="v {pnl_class(snap.get('fixed_48h_baseline_total_R'))}">{safe_float(snap.get('fixed_48h_baseline_total_R')) or 0:.2f}R</div><div class="small">{int(snap.get('fixed_48h_baseline_rows') or 0)} matured rows</div></div>
+      </div>
+      <h3>Asset / Side Basket States</h3>
+      <div class="metric-grid">{cards or '<div class="mini-card"><div class="v">No basket snapshots yet</div></div>'}</div>
+      {_metals_std_open_trades_html()}
+    """
+
+def _metals_std_broker_html() -> str:
+    cfg = metals_demo_config_status()
+    broker = metals_demo_live_broker_snapshot()
+    acct = broker.get("account") or {}
+
+    previews = []
+    for asset in ("XAUUSD", "XAGUSD"):
+        for side in ("long", "short"):
+            try:
+                p = metals_demo_sizing_preview(asset, side)
+            except Exception as exc:
+                p = {"ok": False, "warnings": [str(exc)]}
+            previews.append((asset, side, p))
+
+    preview_rows = ""
+    for asset, side, p in previews:
+        preview_rows += f"""
+        <tr>
+          <td>{esc(asset)}</td><td>{esc(side.upper())}</td>
+          <td>{esc(p.get('instrument') or _metals_demo_instrument(asset))}</td>
+          <td>{money(p.get('requested_risk_gbp'),'GBP')}</td>
+          <td>{money(p.get('estimated_risk_gbp'),'GBP')}</td>
+          <td>{esc(p.get('units') or p.get('order_units') or '-')}</td>
+          <td>{esc('OK' if p.get('executable') else 'BLOCKED')}</td>
+          <td>{esc('; '.join(p.get('warnings') or []))}</td>
+        </tr>
+        """
+
+    broker_rows = "".join(
+        f"""<tr>
+          <td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
+          <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
+          <td class="{pnl_class(t.get('unrealizedPL'))}">{money(t.get('unrealizedPL'),'GBP')}</td>
+          <td>{money(t.get('marginUsed'),'GBP')}</td><td>{esc(t.get('openTime'))}</td>
+        </tr>"""
+        for t in (broker.get("owned_open_trades") or [])
+    )
+
+    return f"""
+      <div class="section-note warn">
+        <strong>DEMO / PRACTICE.</strong> This service owns XAU_USD and XAG_USD only.
+        Account NAV is shared with other practice projects; Metals P&amp;L below is filtered to XAU/XAG.
+      </div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{money(acct.get('NAV'),'GBP')}</div><div class="small">Balance {money(acct.get('balance'),'GBP')}</div></div>
+        <div class="mini-card"><div class="k">Metals Open P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">Fresh OANDA XAU/XAG UPL</div></div>
+        <div class="mini-card"><div class="k">Metals Broker Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">Account total {int(broker.get('account_open_count') or 0)}</div></div>
+        <div class="mini-card"><div class="k">Metals Margin Used</div><div class="v">{money(broker.get('owned_margin_used'),'GBP')}</div></div>
+        <div class="mini-card"><div class="k">Lane</div><div class="v {'pos' if cfg.get('orders_allowed') else 'warn'}">{'ENABLED' if cfg.get('orders_allowed') else 'BLOCKED'}</div><div class="small">OANDA practice</div></div>
+        <div class="mini-card"><div class="k">Account Currency</div><div class="v">{esc(acct.get('currency') or cfg.get('oanda_account_currency') or '-')}</div><div class="small">GBP required</div></div>
+        <div class="mini-card"><div class="k">Manager</div><div class="v {'pos' if cfg.get('basket_manager_enabled') else 'warn'}">{'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div><div class="small">48h + hourly</div></div>
+        <div class="mini-card"><div class="k">Scope</div><div class="v">XAU + XAG</div><div class="small">No BCO / index writes</div></div>
+      </div>
+
+      <h3>Actual OANDA Metals Open Trades</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
+        <tbody>{broker_rows or '<tr><td colspan="7">No OANDA Metals trades open.</td></tr>'}</tbody>
+      </table></div>
+
+      <h3>Risk / Sizing Previews</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Asset</th><th>Side</th><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>State</th><th>Warnings</th></tr></thead>
+        <tbody>{preview_rows}</tbody>
+      </table></div>
+
+      <div class="section-note small">
+        <strong>Balance vs NAV:</strong> balance changes when P&amp;L is realised; NAV includes unrealised open-trade P&amp;L.
+        <br><a href="/broker/metals-demo/status">status JSON</a> ·
+        <a href="/export/metals-demo-open-trades.csv">open trades CSV</a> ·
+        <a href="/export/metals-demo-execution-audit.csv">execution audit CSV</a>
+      </div>
+    """
+
+def _metals_std_execution_html() -> str:
+    init_db()
+    broker = metals_demo_live_broker_snapshot()
+    with get_conn() as conn:
+        q = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT 40"
+        ).fetchall()]
+        audits = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_execution_audit ORDER BY id DESC LIMIT 40"
+        ).fetchall()]
+        reviews = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_manager_reviews ORDER BY id DESC LIMIT 40"
+        ).fetchall()]
+        local = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+        ).fetchall()]
+
+    broker_ids = {safe_str(t.get("id")) for t in broker.get("owned_open_trades") or []}
+    local_ids = {safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
+    missing_on_broker = [t for t in local if safe_str(t.get("broker_trade_id")) not in broker_ids]
+    broker_only = [t for t in broker.get("owned_open_trades") or [] if safe_str(t.get("id")) not in local_ids]
+    pending = sum(1 for r in q if safe_str(r.get("status")).upper() in ("PENDING","RETRY"))
+
+    audit_rows = "".join(
+        f"""<tr>
+          <td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td>
+          <td>{esc(a.get('status'))}</td><td>{esc(a.get('asset'))}</td>
+          <td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td>
+        </tr>"""
+        for a in audits
+    )
+    review_rows = "".join(
+        f"""<tr>
+          <td>{esc(r.get('created_at_utc'))}</td><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td>
+          <td>{esc(r.get('hold_candles'))}</td><td>{_fmt_metric(r.get('current_r'),'R',2)}</td>
+          <td>{_fmt_metric(r.get('mfe_r'),'R',2)}</td><td>{_fmt_metric(r.get('mae_r'),'R',2)}</td>
+          <td>{esc(r.get('manager_phase'))}</td><td>{esc(r.get('decision'))}</td><td>{esc(r.get('reason'))}</td>
+        </tr>"""
+        for r in reviews
+    )
+
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Broker Reconciliation</div><div class="v {'pos' if not missing_on_broker and not broker_only else 'warn'}">{'SAFE' if not missing_on_broker and not broker_only else 'CHECK'}</div><div class="small">{int(broker.get('owned_open_count') or 0)} OANDA Metals trades</div></div>
+        <div class="mini-card"><div class="k">Local Missing on Broker</div><div class="v {'neg' if missing_on_broker else 'pos'}">{len(missing_on_broker)}</div></div>
+        <div class="mini-card"><div class="k">Broker-Only Trades</div><div class="v {'neg' if broker_only else 'pos'}">{len(broker_only)}</div></div>
+        <div class="mini-card"><div class="k">Pending Close Actions</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">Persistent close-until-flat queue</div></div>
+      </div>
+
+      <h3>Recent Manager Reviews</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Age</th><th>R</th><th>MFE</th><th>MAE</th><th>Phase</th><th>Decision</th><th>Reason</th></tr></thead>
+        <tbody>{review_rows or '<tr><td colspan="10">No manager reviews yet.</td></tr>'}</tbody>
+      </table></div>
+
+      <h3>Recent Execution Audit</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Time</th><th>Action</th><th>Status</th><th>Asset</th><th>Broker ID</th><th>Message</th></tr></thead>
+        <tbody>{audit_rows or '<tr><td colspan="6">No execution audit rows.</td></tr>'}</tbody>
+      </table></div>
+
+      <div class="section-note small">
+        <a href="/export/metals-demo-action-queue.csv">action queue CSV</a> ·
+        <a href="/export/metals-demo-execution-audit.csv">execution audit CSV</a> ·
+        <a href="/export/metals-demo-manager-reviews.csv">manager reviews CSV</a> ·
+        <a href="/export/metals-demo-basket-snapshots.csv">basket snapshots CSV</a>
+      </div>
+    """
+
 _METALS_STD_SECTIONS = {
     "basket-manager": ("Basket Manager", _metals_std_basket_manager_html),
+    "open-trades": ("Open Trades / Positions", _metals_std_open_trades_html),
     "broker": ("Broker / OANDA / Accounting", _metals_std_broker_html),
     "execution": ("Execution / Reconciliation", _metals_std_execution_html),
     "signals": ("Signal State", _metals_std_signal_state_html),
@@ -30389,6 +30819,7 @@ def _metals_std_placeholder(key: str, title: str, note: str = "") -> str:
 def metals_standard_dashboard() -> str:
     sections = "".join([
         _metals_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48 reviews, protection milestones and close queue."),
+        _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
         _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA practice lane and sizing previews."),
         _metals_std_placeholder("execution", "Execution / Reconciliation", "Action queue, audit and scope guard."),
         _metals_std_placeholder("signals", "Signal State", "XAU/XAG long + generated short v2 candidate state."),
@@ -30424,7 +30855,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.2.1 Master Parity Fix · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.0 Rich Dashboard · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -30446,13 +30877,13 @@ async function loadTop(force=false){{
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
-${{card('Broker P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+${{card('Broker P&L',money(s.total_pnl),`Metals UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
 ${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
 ${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_state||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
-${{card('Open Trades',eh(s.open_trades||0),`Long ${{eh(s.open_long||0)}} · Short ${{eh(s.open_short||0)}}`)}}
+${{card('Open Trades',eh(s.open_trades||0),`OANDA Metals · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
 ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,'Latest XAU/XAG received',Number(g.received_assets||0)===2?'pos':'warn')}}
@@ -30475,7 +30906,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.2.1",
+        "version": "v1.3.0",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
