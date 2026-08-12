@@ -971,6 +971,14 @@ METALS_DEMO_XAU_SL_PCT = float(os.getenv("METALS_DEMO_XAU_SL_PCT", "2.21"))
 METALS_DEMO_XAG_SL_PCT = float(os.getenv("METALS_DEMO_XAG_SL_PCT", "5.24"))
 METALS_DEMO_FIXED_HOLD_CANDLES = max(1, int(float(os.getenv("METALS_DEMO_FIXED_HOLD_CANDLES", "48"))))
 METALS_DEMO_MAX_OPEN_TRADES_PER_ASSET = max(1, int(float(os.getenv("METALS_DEMO_MAX_OPEN_TRADES_PER_ASSET", "250"))))
+# v1.3.1 — asymmetric XAG confirmation guard.
+# XAU is unrestricted. XAG may begin a same-direction campaign independently,
+# but after 10 XAG entries in that still-active campaign, further XAG entries
+# require a same-direction qualifying XAU candidate within the previous 6h.
+METALS_DEMO_XAG_XAU_CONFIRMATION_ENABLED = env_bool("METALS_DEMO_XAG_XAU_CONFIRMATION_ENABLED", True)
+METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP = max(1, int(float(os.getenv("METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP", "10"))))
+METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS = max(1.0, min(float(os.getenv("METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS", "6")), 72.0))
+
 METALS_DEMO_MAX_SPREAD_PCT_XAU = float(os.getenv("METALS_DEMO_MAX_SPREAD_PCT_XAU", "0.10"))
 METALS_DEMO_MAX_SPREAD_PCT_XAG = float(os.getenv("METALS_DEMO_MAX_SPREAD_PCT_XAG", "0.20"))
 # Legacy fallback retained for compatibility. Asset-specific limits below take precedence.
@@ -7939,6 +7947,35 @@ def _init_db_full() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_queue_status ON metals_demo_action_queue(status, created_at_utc)")
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_xag_confirmation_guard (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER NOT NULL UNIQUE,
+                signal_time TEXT,
+                xag_side TEXT,
+                enabled INTEGER,
+                solo_cap INTEGER,
+                lookback_hours REAL,
+                active_campaign INTEGER,
+                campaign_start_time TEXT,
+                campaign_entry_count_before INTEGER,
+                xau_confirmation_found INTEGER,
+                xau_confirmation_raw_signal_id INTEGER,
+                xau_confirmation_time TEXT,
+                xau_confirmation_side TEXT,
+                xau_confirmation_age_hours REAL,
+                allow_entry INTEGER,
+                decision TEXT,
+                reason TEXT,
+                outcome_48h_r REAL,
+                outcome_72h_r REAL,
+                outcome_96h_r REAL,
+                updated_at_utc TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xag_guard_time ON metals_demo_xag_confirmation_guard(signal_time)")
+
         # v10.1.27 metals demo basket-manager evidence.
         for col, typ in [
             ("manager_current_r", "REAL"), ("manager_high_water_r", "REAL"),
@@ -9548,6 +9585,22 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
             result["metals_demo_lane"] = execute_metals_demo_candidate(int(new_signal_db_id), source=source)
             result["metals_demo_reconcile"] = metals_demo_reconcile_and_close(_scope_pair)
             result["focused_research"] = record_metals_focused_research(int(new_signal_db_id))
+            try:
+                _scope_asset = _metals_demo_asset(_scope_pair)
+                if _scope_asset == "XAGUSD":
+                    # Update 48/72/96h counterfactuals for earlier guard decisions.
+                    with get_conn() as _xg:
+                        _pending_guard_ids = [
+                            int(r["raw_signal_id"]) for r in _xg.execute("""
+                                SELECT raw_signal_id FROM metals_demo_xag_confirmation_guard
+                                WHERE outcome_96h_r IS NULL
+                                ORDER BY id DESC LIMIT 250
+                            """).fetchall()
+                        ]
+                    for _gid in _pending_guard_ids:
+                        update_xag_guard_counterfactual_outcomes(_gid)
+            except Exception:
+                pass
             result["project_scope"] = PROJECT_SCOPE
             result["legacy_index_pipeline_executed"] = False
             return result
@@ -22544,6 +22597,279 @@ def _metals_demo_audit(raw_signal_id: int, asset: str, instrument: str, action: 
         conn.commit(); return audit_id
 
 
+
+def _metals_parse_signal_dt(value: Any) -> Optional[datetime]:
+    try:
+        dt = parse_signal_candle_dt(safe_str(value))
+        if dt:
+            return dt
+    except Exception:
+        pass
+    s = safe_str(value)
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _metals_candidate_side_for_row(row: Any) -> str:
+    if not row:
+        return ""
+    try:
+        c = metals_demo_candidate_for_row(_raw_signal_json(row), row)
+        if c.get("demo_candidate"):
+            return _metals_demo_side(c.get("demo_side"))
+    except Exception:
+        return ""
+    return ""
+
+
+def _xag_active_campaign_state(conn: Any, side: str) -> Dict[str, Any]:
+    """
+    Campaign remains active until the XAG basket for this direction is flat.
+    The first 10 allowance is therefore based on entries made since the oldest
+    still-open XAG trade in that campaign, not simply the current open count.
+    """
+    side = _metals_demo_side(side)
+    open_row = conn.execute("""
+        SELECT MIN(signal_time) AS campaign_start, COUNT(*) AS open_count
+        FROM metals_demo_trade_links
+        WHERE asset='XAGUSD'
+          AND LOWER(side)=?
+          AND status='OPEN'
+    """, (side,)).fetchone()
+
+    open_count = int((open_row["open_count"] if open_row else 0) or 0)
+    campaign_start = safe_str(open_row["campaign_start"] if open_row else "")
+    if open_count <= 0 or not campaign_start:
+        return {
+            "active": False,
+            "campaign_start": "",
+            "open_count": 0,
+            "entry_count": 0,
+        }
+
+    count_row = conn.execute("""
+        SELECT COUNT(*) AS c
+        FROM metals_demo_trade_links
+        WHERE asset='XAGUSD'
+          AND LOWER(side)=?
+          AND signal_time>=?
+    """, (side, campaign_start)).fetchone()
+
+    return {
+        "active": True,
+        "campaign_start": campaign_start,
+        "open_count": open_count,
+        "entry_count": int((count_row["c"] if count_row else 0) or 0),
+    }
+
+
+def metals_xag_xau_confirmation_guard(
+    conn: Any,
+    signal_row: Any,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    asset = _metals_demo_asset(signal_row["pair"])
+    signal_time = safe_str(signal_row["timestamp_readable"])
+    side = _metals_demo_side(candidate.get("demo_side"))
+    cap = int(METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP)
+    lookback = float(METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS)
+
+    base = {
+        "enabled": bool(METALS_DEMO_XAG_XAU_CONFIRMATION_ENABLED),
+        "asset": asset,
+        "side": side,
+        "signal_time": signal_time,
+        "solo_cap": cap,
+        "lookback_hours": lookback,
+        "allow": True,
+        "xau_confirmation_found": False,
+    }
+
+    # XAU is deliberately unrestricted.
+    if asset != "XAGUSD":
+        return {**base, "reason": "xau_unrestricted_or_non_xag"}
+
+    if not METALS_DEMO_XAG_XAU_CONFIRMATION_ENABLED:
+        result = {**base, "reason": "xag_xau_confirmation_disabled"}
+        _record_xag_guard_decision(conn, signal_row, result)
+        return result
+
+    campaign = _xag_active_campaign_state(conn, side)
+    count_before = int(campaign.get("entry_count") or 0)
+    base.update({
+        "active_campaign": bool(campaign.get("active")),
+        "campaign_start_time": safe_str(campaign.get("campaign_start")),
+        "campaign_entry_count_before": count_before,
+        "campaign_open_count": int(campaign.get("open_count") or 0),
+    })
+
+    # A flat XAG side starts a fresh campaign. Entries 1..10 are independent.
+    if count_before < cap:
+        result = {
+            **base,
+            "allow": True,
+            "reason": f"xag_independent_allowance_{count_before+1}_of_{cap}",
+            "decision": "ALLOW_SOLO",
+        }
+        _record_xag_guard_decision(conn, signal_row, result)
+        return result
+
+    current_dt = _metals_parse_signal_dt(signal_time)
+    if not current_dt:
+        # Fail open rather than accidentally blocking execution because of a
+        # timestamp-format defect. The decision remains auditable.
+        result = {
+            **base,
+            "allow": True,
+            "reason": "signal_time_unparseable_fail_open",
+            "decision": "ALLOW_TIMESTAMP_FAIL_OPEN",
+        }
+        _record_xag_guard_decision(conn, signal_row, result)
+        return result
+
+    # Search recent XAU signals and evaluate the *actual Metals demo candidate
+    # logic* so a raw Pine flag alone cannot unlock Silver incorrectly.
+    recent_xau = conn.execute("""
+        SELECT *
+        FROM raw_signals
+        WHERE UPPER(pair) IN ('XAUUSD','XAU')
+          AND id<=?
+        ORDER BY id DESC
+        LIMIT 24
+    """, (int(signal_row["id"]),)).fetchall()
+
+    confirmation = None
+    for xrow in recent_xau:
+        xdt = _metals_parse_signal_dt(xrow["timestamp_readable"])
+        if not xdt:
+            continue
+        age_h = (current_dt - xdt).total_seconds() / 3600.0
+        if age_h < 0:
+            continue
+        if age_h > lookback:
+            # Rows are newest-first; older rows cannot qualify.
+            continue
+        xside = _metals_candidate_side_for_row(xrow)
+        if xside == side:
+            confirmation = {
+                "raw_signal_id": int(xrow["id"]),
+                "time": safe_str(xrow["timestamp_readable"]),
+                "side": xside,
+                "age_hours": age_h,
+            }
+            break
+
+    if confirmation:
+        result = {
+            **base,
+            "allow": True,
+            "xau_confirmation_found": True,
+            "xau_confirmation_raw_signal_id": confirmation["raw_signal_id"],
+            "xau_confirmation_time": confirmation["time"],
+            "xau_confirmation_side": confirmation["side"],
+            "xau_confirmation_age_hours": confirmation["age_hours"],
+            "reason": f"xau_{side}_candidate_within_{lookback:g}h",
+            "decision": "ALLOW_XAU_CONFIRMED",
+        }
+    else:
+        result = {
+            **base,
+            "allow": False,
+            "reason": (
+                f"xag_campaign_entries_{count_before}_ge_cap_{cap};"
+                f"no_same_direction_xau_{side}_candidate_within_{lookback:g}h"
+            ),
+            "decision": "BLOCK_WAIT_XAU_CONFIRMATION",
+        }
+
+    _record_xag_guard_decision(conn, signal_row, result)
+    return result
+
+
+def _record_xag_guard_decision(conn: Any, signal_row: Any, result: Dict[str, Any]) -> None:
+    try:
+        conn.execute("""
+            INSERT INTO metals_demo_xag_confirmation_guard (
+                created_at_utc,raw_signal_id,signal_time,xag_side,enabled,solo_cap,lookback_hours,
+                active_campaign,campaign_start_time,campaign_entry_count_before,
+                xau_confirmation_found,xau_confirmation_raw_signal_id,xau_confirmation_time,
+                xau_confirmation_side,xau_confirmation_age_hours,allow_entry,decision,reason,
+                updated_at_utc
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(raw_signal_id) DO UPDATE SET
+                updated_at_utc=excluded.updated_at_utc,
+                xau_confirmation_found=excluded.xau_confirmation_found,
+                xau_confirmation_raw_signal_id=excluded.xau_confirmation_raw_signal_id,
+                xau_confirmation_time=excluded.xau_confirmation_time,
+                xau_confirmation_side=excluded.xau_confirmation_side,
+                xau_confirmation_age_hours=excluded.xau_confirmation_age_hours,
+                allow_entry=excluded.allow_entry,
+                decision=excluded.decision,
+                reason=excluded.reason
+        """, (
+            now_utc_iso(), int(signal_row["id"]), safe_str(signal_row["timestamp_readable"]),
+            safe_str(result.get("side")), 1 if result.get("enabled") else 0,
+            int(result.get("solo_cap") or 0), safe_float(result.get("lookback_hours")),
+            1 if result.get("active_campaign") else 0, safe_str(result.get("campaign_start_time")),
+            int(result.get("campaign_entry_count_before") or 0),
+            1 if result.get("xau_confirmation_found") else 0,
+            result.get("xau_confirmation_raw_signal_id"), safe_str(result.get("xau_confirmation_time")),
+            safe_str(result.get("xau_confirmation_side")), safe_float(result.get("xau_confirmation_age_hours")),
+            1 if result.get("allow") else 0, safe_str(result.get("decision")),
+            safe_str(result.get("reason")), now_utc_iso()
+        ))
+        conn.commit()
+    except Exception:
+        # Guard logging must never break execution.
+        pass
+
+
+def update_xag_guard_counterfactual_outcomes(raw_signal_id: int) -> None:
+    """
+    Research-only outcome capture for XAG candidates that reached this guard.
+    Uses the same 3.5? No: uses the configured XAG SL% so results stay in R.
+    """
+    try:
+        with get_conn() as conn:
+            guard = conn.execute("""
+                SELECT * FROM metals_demo_xag_confirmation_guard
+                WHERE raw_signal_id=? LIMIT 1
+            """, (int(raw_signal_id),)).fetchone()
+            sig = conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1", (int(raw_signal_id),)).fetchone()
+            if not guard or not sig:
+                return
+            entry = safe_float(sig["exec_close"])
+            if entry is None or entry <= 0:
+                return
+            side = _metals_demo_side(guard["xag_side"])
+            path = _metals_demo_path(conn, "XAGUSD", int(raw_signal_id), limit=120)
+            updates = []
+            vals = []
+            for horizon in (48,72,96):
+                col = f"outcome_{horizon}h_r"
+                if safe_float(guard[col]) is None and len(path) >= horizon:
+                    px = safe_float(path[horizon-1].get("exec_close"))
+                    rr = _metals_demo_r_from_price(side, float(entry), px, _metals_demo_sl_pct("XAGUSD"))
+                    updates.append(f"{col}=?")
+                    vals.append(rr)
+            if updates:
+                updates.append("updated_at_utc=?")
+                vals.extend([now_utc_iso(), int(raw_signal_id)])
+                conn.execute(
+                    f"UPDATE metals_demo_xag_confirmation_guard SET {', '.join(updates)} WHERE raw_signal_id=?",
+                    tuple(vals)
+                )
+                conn.commit()
+    except Exception:
+        pass
+
 def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_worker") -> Dict[str, Any]:
     init_db()
     with get_conn() as conn:
@@ -22557,7 +22883,29 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     if not candidate.get("demo_candidate"):
         _metals_demo_audit(raw_signal_id,asset,instrument,"candidate_evaluation","BLOCKED",candidate.get("demo_blockers") or "not_candidate",candidate_state=candidate.get("demo_state"))
         return {"ok":True,"skipped":True,"asset":asset,"candidate":candidate}
-    side=_metals_demo_side(candidate.get("demo_side")); preview=metals_demo_sizing_preview(asset,side)
+    side=_metals_demo_side(candidate.get("demo_side"))
+
+    # v1.3.1 asymmetric correlation guard:
+    # XAU unrestricted; XAG 11th+ campaign entry needs same-direction XAU <=6h.
+    with get_conn() as conn:
+        confirmation_guard = metals_xag_xau_confirmation_guard(conn, row, candidate)
+    if asset == "XAGUSD" and not confirmation_guard.get("allow", True):
+        _metals_demo_audit(
+            raw_signal_id, asset, instrument, "entry_confirmation_guard", "BLOCKED",
+            safe_str(confirmation_guard.get("reason")),
+            candidate_state=safe_str(candidate.get("demo_state") or "CANDIDATE")
+        )
+        return {
+            "ok": True,
+            "blocked": True,
+            "asset": asset,
+            "side": side,
+            "reason": "xag_requires_recent_same_direction_xau_confirmation",
+            "confirmation_guard": confirmation_guard,
+            "candidate": candidate,
+        }
+
+    preview=metals_demo_sizing_preview(asset,side)
     if not METALS_DEMO_BROKER_ENABLED:
         _metals_demo_audit(raw_signal_id,asset,instrument,"entry_preview","DISABLED_PREVIEW_ONLY","METALS_DEMO_BROKER_ENABLED=false",preview,candidate_state="CANDIDATE")
         return {"ok":True,"preview_only":True,"asset":asset,"side":side,"candidate":candidate,"preview":preview}
@@ -22581,7 +22929,7 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     with get_conn() as conn:
         er=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=?",(raw_signal_id,)).fetchone(); fill_units=abs(safe_float(fill.get("units")) or preview.get("units") or 0); fill_price=safe_float(fill.get("price")) or preview.get("entry_price")
         link_id=db_insert_returning_id(conn,"""INSERT INTO metals_demo_trade_links (created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,model_version,signal_time,entry_signal_id,requested_risk_amount,estimated_risk_amount,requested_units,filled_units,entry_price,stop_price,current_stop_price,broker_trade_id,broker_order_id,status,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_utc_iso(),now_utc_iso(),raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",json.dumps({"candidate":candidate,"preview":preview,"response":response},default=str)))
+            (now_utc_iso(),now_utc_iso(),raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",json.dumps({"candidate":candidate,"confirmation_guard":confirmation_guard,"preview":preview,"response":response},default=str)))
         conn.commit()
     _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}",preview,response,link_id,"CANDIDATE")
     return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate}
@@ -30112,12 +30460,41 @@ def build_metals_focused_research_html():
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
       _mf_table("Trend Efficiency / Chop Research",_mf_rows("metals_focused_efficiency",150),["asset","signal_time","lookback_candles","efficiency","state","net_move_pct","path_travelled_pct"]) + \
       _mf_table("Basket Recovery / Red-State Outcomes",_mf_rows("metals_focused_recovery",100),["trigger_signal_time","trigger_status","trigger_action","trigger_open_count","trigger_r","trigger_hwm_r","trigger_giveback_pct","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
+      _mf_table("XAG → XAU Confirmation Guard",_mf_rows("metals_demo_xag_confirmation_guard",150),["signal_time","xag_side","campaign_entry_count_before","xau_confirmation_found","xau_confirmation_time","xau_confirmation_age_hours","allow_entry","decision","reason","outcome_48h_r","outcome_72h_r","outcome_96h_r"]) + \
       '<details class="research-inner"><summary>Strategy Model Evidence</summary><div class="section-note small"><a href="/metals-short-shadow-v2">Short v2 JSON</a> · <a href="/export/metals-short-shadow-v2.csv">Short v2 CSV</a> · <a href="/metals-short-research">Short research JSON</a> · <a href="/export/metals-short-research.csv">Short research CSV</a> · <a href="/metals-research-outcomes">Long outcomes JSON</a> · <a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a></div></details>'
+
+
+@app.get("/export/metals-xag-confirmation-guard.csv")
+def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
+    init_db()
+    limit=max(1,min(int(limit),100000))
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_xag_confirmation_guard ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()]
+    out=io.StringIO()
+    if rows:
+        fields=[]
+        for r in rows:
+            for k in r:
+                if k not in fields:
+                    fields.append(k)
+        w=csv.DictWriter(out,fieldnames=fields,extrasaction="ignore")
+        w.writeheader(); w.writerows(rows)
+    else:
+        out.write("note\\nNo XAG confirmation-guard decisions yet\\n")
+    return Response(
+        content=out.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition":'attachment; filename="metals-xag-confirmation-guard.csv"'}
+    )
+
 
 @app.get("/export/metals-focused-research.zip")
 def export_metals_focused_research_zip(limit:int=25000):
     ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery"}
+    tables={"highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_mf_rows(tbl,limit);out=io.StringIO()
@@ -30855,7 +31232,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.0 Rich Dashboard · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.1 XAG/XAU Confirmation Guard · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -30906,7 +31283,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.0",
+        "version": "v1.3.1",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
