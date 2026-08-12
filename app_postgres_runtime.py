@@ -8008,6 +8008,9 @@ def _init_db_full() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_basket_snapshots_key ON metals_demo_basket_snapshots(basket_key, created_at_utc)")
+        add_column_if_missing(conn, "metals_demo_basket_snapshots", "basket_pnl_gbp", "REAL")
+        add_column_if_missing(conn, "metals_demo_basket_snapshots", "high_water_pnl_gbp", "REAL")
+        add_column_if_missing(conn, "metals_demo_basket_snapshots", "high_water_seen_at", "TEXT")
 
         # ============================================================
         # v10.0.80 - Trend Efficiency / Chop Research Layer
@@ -23040,24 +23043,113 @@ def _metals_demo_refresh_closed(link: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok":False,"status":"BROKER_NOT_OPEN","response":resp}
 
 def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
-    with get_conn() as conn: links=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
+    with get_conn() as conn:
+        links=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
     groups={}
-    for l in links: groups.setdefault((_metals_demo_asset(l.get("asset")),_metals_demo_side(l.get("side"))),[]).append(l)
+    for l in links:
+        groups.setdefault((_metals_demo_asset(l.get("asset")),_metals_demo_side(l.get("side"))),[]).append(l)
     snaps=[]
     with get_conn() as conn:
         for (asset,side),items in groups.items():
-            rs=[safe_float(x.get("manager_current_r")) for x in items]; rs=[float(x) for x in rs if x is not None]; br=sum(rs); key=f"{asset}:{side.upper()}"; prev=conn.execute("SELECT MAX(high_water_r) AS h FROM metals_demo_basket_snapshots WHERE basket_key=?",(key,)).fetchone(); hwm=max(float(safe_float(prev["h"] if prev else None) or 0),br); gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0; mature=sum(1 for x in items if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES); losing=sum(1 for x in rs if x<0)
+            rs=[safe_float(x.get("manager_current_r")) for x in items]
+            rs=[float(x) for x in rs if x is not None]
+            br=sum(rs)
+            basket_gbp=sum(
+                float(safe_float(x.get("manager_current_r")) or 0.0) *
+                float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(asset))
+                for x in items
+            )
+            key=f"{asset}:{side.upper()}"
+            prev=conn.execute("""SELECT high_water_r,high_water_pnl_gbp,high_water_seen_at,created_at_utc
+                                 FROM metals_demo_basket_snapshots WHERE basket_key=?
+                                 ORDER BY id DESC LIMIT 1""",(key,)).fetchone()
+            old_hwm=float(safe_float(prev["high_water_r"] if prev else None) or 0.0)
+            if br>old_hwm:
+                hwm=br; hwm_gbp=basket_gbp; hwm_seen=now_utc_iso()
+            else:
+                hwm=old_hwm
+                hwm_gbp=safe_float(prev["high_water_pnl_gbp"] if prev else None)
+                if hwm_gbp is None:
+                    hwm_gbp=hwm*float(_metals_demo_risk(asset))
+                hwm_seen=safe_str(prev["high_water_seen_at"] if prev else "")
+                if not hwm_seen and hwm>0 and prev:
+                    hwm_seen=safe_str(prev["created_at_utc"])
+            gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0
+            mature=sum(1 for x in items if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
+            losing=sum(1 for x in rs if x<0)
             phase="TINY" if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN else "EARLY" if len(items)<METALS_DEMO_BASKET_NORMAL_MIN_OPEN else "DEVELOPING" if len(items)<METALS_DEMO_BASKET_MATURE_MIN_OPEN else "MATURE"
-            if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN: state,action,reason="OBSERVE","HOLD","Young/small basket: no basket-level trim."
-            elif br<=METALS_DEMO_BASKET_SEVERE_LOSS_R and mature: state,action,reason="CRITICAL","REDUCE_WEAKEST_50_PERCENT_MATURE_ONLY","Severe asset-side basket loss."
-            elif len(items)>=METALS_DEMO_BASKET_NORMAL_MIN_OPEN and br<=METALS_DEMO_BASKET_NORMAL_LOSS_R and mature: state,action,reason="RED","REDUCE_WEAKEST_25_PERCENT_MATURE_ONLY","Developed basket loss breached defence level."
-            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R and mature: state,action,reason="AMBER","REDUCE_WEAKEST_10_PERCENT_MATURE_ONLY","Basket loss warning."
-            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and mature and hwm>0: state,action,reason="AMBER","PROTECT_OR_REDUCE_WEAKEST_MATURE_ONLY","Basket giveback warning."
-            else: state,action,reason="GREEN","HOLD","Basket within normal tolerance."
-            snap={"scope":"ASSET_SIDE","basket_key":key,"asset":asset,"side":side,"open_count":len(items),"matured_count":mature,"losing_count":losing,"losing_pct":losing/len(rs)*100 if rs else 0,"basket_r":br,"high_water_r":hwm,"giveback_pct":gb,"basket_phase":phase,"state":state,"action":action,"reason":reason}
-            conn.execute("INSERT INTO metals_demo_basket_snapshots (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_utc_iso(),review_signal_id,snap["scope"],key,asset,side,snap["open_count"],mature,snap["losing_count"],snap["losing_pct"],br,hwm,gb,phase,state,action,reason,json.dumps({"link_ids":[x.get("id") for x in items]}))); snaps.append(snap)
-        rs=[safe_float(x.get("manager_current_r")) for x in links]; rs=[float(x) for x in rs if x is not None]; br=sum(rs); key="METALS_BASKET"; prev=conn.execute("SELECT MAX(high_water_r) AS h FROM metals_demo_basket_snapshots WHERE basket_key=?",(key,)).fetchone(); hwm=max(float(safe_float(prev["h"] if prev else None) or 0),br); gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0; state="RED" if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R else "AMBER" if gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT else "GREEN"
-        conn.execute("INSERT INTO metals_demo_basket_snapshots (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_utc_iso(),review_signal_id,"FAMILY",key,"","MIXED",len(links),sum(1 for x in links if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES),sum(1 for x in rs if x<0),(sum(1 for x in rs if x<0)/len(rs)*100 if rs else 0),br,hwm,gb,"MIXED",state,"ADVISORY_ONLY","Family overlay does not directly close XAU/XAG trades.","{}")); conn.commit(); snaps.append({"scope":"FAMILY","basket_key":key,"open_count":len(links),"basket_r":br,"high_water_r":hwm,"giveback_pct":gb,"state":state,"action":"ADVISORY_ONLY"})
+            if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN:
+                state,action,reason="OBSERVE","HOLD","Young/small basket: no basket-level trim."
+            elif br<=METALS_DEMO_BASKET_SEVERE_LOSS_R and mature:
+                state,action,reason="CRITICAL","REDUCE_WEAKEST_50_PERCENT_MATURE_ONLY","Severe asset-side basket loss."
+            elif len(items)>=METALS_DEMO_BASKET_NORMAL_MIN_OPEN and br<=METALS_DEMO_BASKET_NORMAL_LOSS_R and mature:
+                state,action,reason="RED","REDUCE_WEAKEST_25_PERCENT_MATURE_ONLY","Developed basket loss breached defence level."
+            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R and mature:
+                state,action,reason="AMBER","REDUCE_WEAKEST_10_PERCENT_MATURE_ONLY","Basket loss warning."
+            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and mature and hwm>0:
+                state,action,reason="AMBER","PROTECT_OR_REDUCE_WEAKEST_MATURE_ONLY","Basket giveback warning."
+            else:
+                state,action,reason="GREEN","HOLD","Basket within normal tolerance."
+            snap={"scope":"ASSET_SIDE","basket_key":key,"asset":asset,"side":side,"open_count":len(items),
+                  "matured_count":mature,"losing_count":losing,"losing_pct":losing/len(rs)*100 if rs else 0,
+                  "basket_r":br,"basket_pnl_gbp":basket_gbp,"high_water_r":hwm,"high_water_pnl_gbp":hwm_gbp,
+                  "high_water_seen_at":hwm_seen,"giveback_pct":gb,"basket_phase":phase,
+                  "state":state,"action":action,"reason":reason}
+            conn.execute("""INSERT INTO metals_demo_basket_snapshots
+                (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,
+                 basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json,
+                 basket_pnl_gbp,high_water_pnl_gbp,high_water_seen_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_utc_iso(),review_signal_id,snap["scope"],key,asset,side,snap["open_count"],mature,
+                 snap["losing_count"],snap["losing_pct"],br,hwm,gb,phase,state,action,reason,
+                 json.dumps({"link_ids":[x.get("id") for x in items]}),basket_gbp,hwm_gbp,hwm_seen))
+            snaps.append(snap)
+
+        rs=[safe_float(x.get("manager_current_r")) for x in links]
+        rs=[float(x) for x in rs if x is not None]
+        br=sum(rs)
+        basket_gbp=sum(
+            float(safe_float(x.get("manager_current_r")) or 0.0) *
+            float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(x.get("asset")))
+            for x in links
+        )
+        key="METALS_BASKET"
+        prev=conn.execute("""SELECT high_water_r,high_water_pnl_gbp,high_water_seen_at,created_at_utc
+                             FROM metals_demo_basket_snapshots WHERE basket_key=?
+                             ORDER BY id DESC LIMIT 1""",(key,)).fetchone()
+        old_hwm=float(safe_float(prev["high_water_r"] if prev else None) or 0.0)
+        if br>old_hwm:
+            hwm=br; hwm_gbp=basket_gbp; hwm_seen=now_utc_iso()
+        else:
+            hwm=old_hwm
+            hwm_gbp=safe_float(prev["high_water_pnl_gbp"] if prev else None)
+            if hwm_gbp is None:
+                risk_basis=(
+                    sum(float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(x.get("asset"))) for x in links)/len(links)
+                    if links else (float(METALS_DEMO_XAU_RISK_AMOUNT)+float(METALS_DEMO_XAG_RISK_AMOUNT))/2.0
+                )
+                hwm_gbp=hwm*risk_basis
+            hwm_seen=safe_str(prev["high_water_seen_at"] if prev else "")
+            if not hwm_seen and hwm>0 and prev:
+                hwm_seen=safe_str(prev["created_at_utc"])
+        gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0
+        state="RED" if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R else "AMBER" if gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT else "GREEN"
+        conn.execute("""INSERT INTO metals_demo_basket_snapshots
+            (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,
+             basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json,
+             basket_pnl_gbp,high_water_pnl_gbp,high_water_seen_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now_utc_iso(),review_signal_id,"FAMILY",key,"","MIXED",len(links),
+             sum(1 for x in links if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES),
+             sum(1 for x in rs if x<0),(sum(1 for x in rs if x<0)/len(rs)*100 if rs else 0),
+             br,hwm,gb,"MIXED",state,"ADVISORY_ONLY",
+             "Family overlay does not directly close XAU/XAG trades.","{}",
+             basket_gbp,hwm_gbp,hwm_seen))
+        conn.commit()
+        snaps.append({"scope":"FAMILY","basket_key":key,"open_count":len(links),
+                      "basket_r":br,"basket_pnl_gbp":basket_gbp,"high_water_r":hwm,
+                      "high_water_pnl_gbp":hwm_gbp,"high_water_seen_at":hwm_seen,
+                      "giveback_pct":gb,"state":state,"action":"ADVISORY_ONLY"})
     return {"ok":True,"snapshots":snaps}
 
 def _metals_demo_apply_basket_defence(asset: str,signal_id: Any) -> List[Dict[str, Any]]:
@@ -30627,6 +30719,18 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
 
     basket_r = safe_float(family.get("basket_r")) or 0.0
     hwm_r = safe_float(family.get("high_water_r")) or 0.0
+    hwm_gbp = safe_float(family.get("high_water_pnl_gbp"))
+    hwm_time = safe_str(family.get("high_water_seen_at"))
+    if hwm_gbp is None:
+        risk_basis=(float(METALS_DEMO_XAU_RISK_AMOUNT)+float(METALS_DEMO_XAG_RISK_AMOUNT))/2.0
+        hwm_gbp=hwm_r*risk_basis
+    if not hwm_time and hwm_r>0:
+        with get_conn() as _hconn:
+            _hrow=_hconn.execute("""SELECT created_at_utc FROM metals_demo_basket_snapshots
+                                    WHERE basket_key='METALS_BASKET' AND basket_r>=?
+                                    ORDER BY id ASC LIMIT 1""",(hwm_r-0.000001,)).fetchone()
+        if _hrow:
+            hwm_time=safe_str(_hrow["created_at_utc"])
     giveback_pct = safe_float(family.get("giveback_pct")) or 0.0
 
     broker_open_pnl = safe_float(broker.get("owned_unrealized_pl")) or 0.0
@@ -30684,6 +30788,8 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "oldest_hold": oldest,
             "basket_r": basket_r,
             "high_water_r": hwm_r,
+            "high_water_gbp": hwm_gbp,
+            "high_water_time": hwm_time,
             "giveback_pct": giveback_pct,
             "basket_state": safe_str(
                 family.get("state") or ("FLAT" if not open_trades else "GREEN")
@@ -31232,7 +31338,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.1 XAG/XAU Confirmation Guard · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.2 High-Water Cash Tile · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31255,7 +31361,7 @@ async function loadTop(force=false){{
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
 ${{card('Broker P&L',money(s.total_pnl),`Metals UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
-${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_state||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
@@ -31283,7 +31389,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.1",
+        "version": "v1.3.2",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
