@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan - Metals Research + OANDA Practice v1.0.0"
+APP_NAME = "Project Exit Plan — Metals v1.3.5 — Audit Fixes"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -20420,7 +20420,7 @@ def export_broker_financing_transactions() -> Response:
 def broker_oanda_calendar_pnl_report(sync: bool = False) -> Dict[str, Any]:
     if sync and OANDA_ENABLED:
         try:
-            broker_snapshot()
+            broker_oanda_snapshot()
         except Exception:
             pass
         try:
@@ -24687,7 +24687,7 @@ details{{background:#171a1e;border:1px solid #30343a;border-radius:10px;padding:
 summary{{cursor:pointer;font-weight:700}} .section-note{{padding:8px;margin:8px 0;background:#20242a;border-radius:7px}}
 .status_green,.pos,.true{{color:#7bd88f}} .status_amber{{color:#f0c36b}} .status_red,.neg,.false{{color:#ff8080}}
 .table-scroll{{overflow-x:auto}}
-.research-inner{margin:7px 10px}.research-inner>summary{background:#11161d;border-left-color:#315f39}.research-inner-body{padding:0}</style></head><body>
+.research-inner{{margin:7px 10px}}.research-inner>summary{{background:#11161d;border-left-color:#315f39}}.research-inner-body{{padding:0}}</style></head><body>
 <h1>Project Exit Plan — Metals</h1>
 <div class="ok"><strong>STANDALONE METALS PROJECT</strong> — XAU/XAG research + OANDA practice only. The NAS100/US500 live account is hard-disabled in this runtime.</div>
 <div class="cards">
@@ -31343,7 +31343,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.4 Giveback Tile Parity · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.5 Audit Fixes · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31394,7 +31394,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.4",
+        "version": "v1.3.5",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
