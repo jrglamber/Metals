@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.3.7 — Broker P&L Parity"
+APP_NAME = "Project Exit Plan — Metals v1.3.9 — Broker Realised Sync Fix"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -7946,6 +7946,29 @@ def _init_db_full() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_queue_status ON metals_demo_action_queue(status, created_at_utc)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_broker_transactions (
+                transaction_id TEXT PRIMARY KEY,
+                synced_at_utc TEXT NOT NULL,
+                transaction_time TEXT,
+                transaction_type TEXT,
+                instrument TEXT,
+                pl_gbp REAL DEFAULT 0,
+                financing_gbp REAL DEFAULT 0,
+                net_realized_gbp REAL DEFAULT 0,
+                account_balance REAL,
+                raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_broker_tx_time ON metals_demo_broker_transactions(transaction_time)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_runtime_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at_utc TEXT
+            )
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS metals_demo_xag_confirmation_guard (
@@ -23167,6 +23190,189 @@ def _metals_demo_apply_basket_defence(asset: str,signal_id: Any) -> List[Dict[st
             reason=f"asset_basket_defence:{s.get('state')}:{s.get('action')}:{s.get('reason')}"; q=_metals_demo_queue_close(l,reason,signal_id); out.append({"link_id":l["id"],"result":_metals_demo_close(l,q),"reason":reason})
     return out
 
+
+_METALS_TX_SYNC_LOCK = threading.Lock()
+_METALS_TX_SYNC_CACHE = {"at": 0.0, "result": None}
+
+def _metals_runtime_get(conn: Any, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM metals_demo_runtime_state WHERE key=? LIMIT 1", (key,)).fetchone()
+    return safe_str(row["value"] if row else "") or default
+
+def _metals_runtime_set(conn: Any, key: str, value: Any) -> None:
+    now = now_utc_iso()
+    conn.execute("""
+        INSERT INTO metals_demo_runtime_state(key,value,updated_at_utc)
+        VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
+    """, (key, safe_str(value), now))
+
+def _metals_tx_instrument(tx: Dict[str, Any]) -> str:
+    instrument = safe_str(tx.get("instrument")).upper()
+    if instrument:
+        return instrument
+    # DAILY_FINANCING and some close structures may nest instrument data.
+    for pos in (tx.get("positionFinancings") or []):
+        inst = safe_str((pos or {}).get("instrument")).upper()
+        if inst:
+            return inst
+    return ""
+
+def metals_demo_sync_broker_transactions(force: bool = False) -> Dict[str, Any]:
+    """
+    Broker-authoritative realised P&L ledger for Metals.
+    Reads OANDA account transactions but persists ONLY XAU_USD / XAG_USD
+    economics, so BCO or any other practice-account activity is excluded.
+    """
+    cfg = metals_demo_config_status()
+    if cfg.get("missing") or METALS_DEMO_OANDA_ENV != "practice":
+        return {"ok": False, "skipped": True, "reason": "config_not_ready"}
+
+    import time as _time
+    with _METALS_TX_SYNC_LOCK:
+        if not force and _METALS_TX_SYNC_CACHE.get("result") is not None:
+            if _time.time() - float(_METALS_TX_SYNC_CACHE.get("at") or 0) < 30:
+                return _METALS_TX_SYNC_CACHE["result"]
+
+        # Get current broker transaction id.
+        summary = metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary")
+        if not summary.get("ok"):
+            result = {"ok": False, "error": "account_summary_failed", "response": summary}
+            _METALS_TX_SYNC_CACHE.update({"at": _time.time(), "result": result})
+            return result
+        account = (summary.get("data") or {}).get("account") or {}
+        last_id = safe_str(account.get("lastTransactionID") or (summary.get("data") or {}).get("lastTransactionID"))
+        if not last_id:
+            result = {"ok": False, "error": "missing_last_transaction_id"}
+            _METALS_TX_SYNC_CACHE.update({"at": _time.time(), "result": result})
+            return result
+
+        with get_conn() as conn:
+            cursor = _metals_runtime_get(conn, "broker_transaction_cursor", "")
+            if not cursor:
+                try:
+                    # Deliberate lookback to recover a recently closed trade that
+                    # may predate deployment of this broker ledger.
+                    cursor = str(max(0, int(float(last_id)) - 1000))
+                except Exception:
+                    cursor = last_id
+                _metals_runtime_set(conn, "broker_transaction_cursor", cursor)
+                conn.commit()
+
+        resp = metals_demo_request(
+            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/transactions/sinceid?id={urllib.parse.quote(cursor)}",
+            "GET",
+        )
+        if not resp.get("ok"):
+            result = {"ok": False, "error": "transactions_sinceid_failed", "response": resp}
+            _METALS_TX_SYNC_CACHE.update({"at": _time.time(), "result": result})
+            return result
+
+        data = resp.get("data") or {}
+        txs = data.get("transactions") or []
+        allowed = {"XAU_USD", "XAG_USD"}
+        inserted = 0
+        ignored = 0
+
+        with get_conn() as conn:
+            for tx in txs:
+                txid = safe_str(tx.get("id"))
+                if not txid:
+                    continue
+                tx_type = safe_str(tx.get("type")).upper()
+                instrument = _metals_tx_instrument(tx)
+
+                # ORDER_FILL close economics are instrument-specific.
+                # DAILY_FINANCING can be broken down by position financing.
+                records = []
+                if instrument in allowed:
+                    pl = float(safe_float(tx.get("pl")) or 0.0)
+                    fin = float(safe_float(tx.get("financing")) or 0.0)
+                    records.append((txid, instrument, pl, fin, tx))
+                elif tx_type == "DAILY_FINANCING":
+                    for idx, pos in enumerate(tx.get("positionFinancings") or []):
+                        inst = safe_str((pos or {}).get("instrument")).upper()
+                        if inst not in allowed:
+                            continue
+                        fin = float(safe_float((pos or {}).get("financing")) or 0.0)
+                        records.append((f"{txid}:{idx}", inst, 0.0, fin, pos))
+                else:
+                    ignored += 1
+                    continue
+
+                for rid, inst, pl, fin, raw in records:
+                    net = pl + fin
+                    conn.execute("""
+                        INSERT INTO metals_demo_broker_transactions(
+                            transaction_id,synced_at_utc,transaction_time,transaction_type,
+                            instrument,pl_gbp,financing_gbp,net_realized_gbp,
+                            account_balance,raw_json
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(transaction_id) DO UPDATE SET
+                            synced_at_utc=excluded.synced_at_utc,
+                            transaction_time=excluded.transaction_time,
+                            transaction_type=excluded.transaction_type,
+                            instrument=excluded.instrument,
+                            pl_gbp=excluded.pl_gbp,
+                            financing_gbp=excluded.financing_gbp,
+                            net_realized_gbp=excluded.net_realized_gbp,
+                            account_balance=excluded.account_balance,
+                            raw_json=excluded.raw_json
+                    """, (
+                        rid, now_utc_iso(), safe_str(tx.get("time")), tx_type,
+                        inst, pl, fin, net, safe_float(tx.get("accountBalance")),
+                        json.dumps(raw, default=str)[:50000]
+                    ))
+                    inserted += 1
+
+            new_cursor = safe_str(data.get("lastTransactionID")) or last_id
+            _metals_runtime_set(conn, "broker_transaction_cursor", new_cursor)
+            _metals_runtime_set(conn, "broker_transaction_sync_at", now_utc_iso())
+            conn.commit()
+
+            totals = conn.execute("""
+                SELECT COALESCE(SUM(pl_gbp),0) AS pl,
+                       COALESCE(SUM(financing_gbp),0) AS financing,
+                       COALESCE(SUM(net_realized_gbp),0) AS net
+                FROM metals_demo_broker_transactions
+            """).fetchone()
+
+        result = {
+            "ok": True,
+            "processed": len(txs),
+            "metals_records": inserted,
+            "ignored_non_metals": ignored,
+            "cursor": new_cursor,
+            "realized_pl_gbp": float(totals["pl"] or 0.0),
+            "financing_gbp": float(totals["financing"] or 0.0),
+            "net_realized_gbp": float(totals["net"] or 0.0),
+            "time_utc": now_utc_iso(),
+        }
+        _METALS_TX_SYNC_CACHE.update({"at": _time.time(), "result": result})
+        return result
+
+def metals_demo_broker_realized_summary() -> Dict[str, Any]:
+    try:
+        sync = metals_demo_sync_broker_transactions()
+    except Exception as exc:
+        sync = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(pl_gbp),0) AS pl,
+                   COALESCE(SUM(financing_gbp),0) AS financing,
+                   COALESCE(SUM(net_realized_gbp),0) AS net,
+                   COUNT(*) AS rows
+            FROM metals_demo_broker_transactions
+        """).fetchone()
+    return {
+        "ok": bool(sync.get("ok")),
+        "pl_gbp": float(row["pl"] or 0.0),
+        "financing_gbp": float(row["financing"] or 0.0),
+        "net_realized_gbp": float(row["net"] or 0.0),
+        "transaction_rows": int(row["rows"] or 0),
+        "sync": sync,
+    }
+
+
 def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
     cfg=metals_demo_config_status()
     if cfg["missing"] or METALS_DEMO_OANDA_ENV!="practice": return {"ok":False,"skipped":True,"reason":"config_not_ready"}
@@ -23203,7 +23409,8 @@ def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
     with get_conn() as conn: queued=[dict(r) for r in conn.execute("SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,l.status AS link_status FROM metals_demo_action_queue q JOIN metals_demo_trade_links l ON l.id=q.link_id WHERE q.action='CLOSE' AND q.status IN ('PENDING','RETRY') AND l.status='OPEN' ORDER BY q.id LIMIT 25").fetchall()]
     for q in queued:
         l=dict(q); l["id"]=q.get("link_id"); retries.append({"queue_id":q.get("id"),"link_id":q.get("link_id"),"result":_metals_demo_close(l,int(q["id"]))})
-    return {"ok":True,"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries}
+    tx_sync=metals_demo_sync_broker_transactions(force=True)
+    return {"ok":True,"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync}
 
 
 def metals_demo_summary() -> Dict[str, Any]:
@@ -23223,8 +23430,13 @@ def metals_demo_summary() -> Dict[str, Any]:
             key=f"{asset}_{side.upper()}"
             try: previews[key]=metals_demo_sizing_preview(asset,side) if not cfg["missing"] else {"ok":False,"warnings":["credentials_missing"]}
             except Exception as e: previews[key]={"ok":False,"warnings":[str(e)]}
-    open_links=[r for r in links if safe_str(r.get("status")).upper()=="OPEN"]; actual_open=sum(float(safe_float(r.get("last_known_unrealized_pl")) or 0) for r in open_links); actual_closed=sum(float(safe_float(r.get("realized_pl")) or 0) for r in links if safe_float(r.get("realized_pl")) is not None); fixed=[safe_float(r.get("fixed_48h_r")) for r in links]; fixed=[float(v) for v in fixed if v is not None]
-    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    open_links=[r for r in links if safe_str(r.get("status")).upper()=="OPEN"]
+    actual_open=sum(float(safe_float(r.get("last_known_unrealized_pl")) or 0) for r in open_links)
+    local_closed=sum(float(safe_float(r.get("realized_pl")) or 0) for r in links if safe_float(r.get("realized_pl")) is not None)
+    broker_realized=metals_demo_broker_realized_summary()
+    actual_closed=float(safe_float(broker_realized.get("net_realized_gbp")) or 0.0)
+    fixed=[safe_float(r.get("fixed_48h_r")) for r in links]; fixed=[float(v) for v in fixed if v is not None]
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
@@ -23270,6 +23482,19 @@ def metals_demo_preview_route(asset: str, side: str = "short") -> Dict[str, Any]
 
 @app.post("/broker/metals-demo/reconcile")
 def metals_demo_reconcile_route() -> Dict[str, Any]: return metals_demo_reconcile_and_close()
+
+@app.get("/export/metals-demo-broker-transactions.csv")
+def export_metals_demo_broker_transactions() -> Response:
+    init_db()
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_broker_transactions ORDER BY transaction_time DESC, transaction_id DESC"
+        ).fetchall()]
+    return Response(
+        dicts_to_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition":"attachment; filename=metals-demo-broker-transactions.csv"}
+    )
 
 @app.get("/export/metals-demo-broker-links.csv")
 def export_metals_demo_links() -> Response:
@@ -31351,7 +31576,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.7 Broker P&L Parity · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.9 Broker Realised Sync Fix · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31402,7 +31627,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.7",
+        "version": "v1.3.9",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
