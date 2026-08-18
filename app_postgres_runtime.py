@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.3.5 — Audit Fixes"
+APP_NAME = "Project Exit Plan — Metals v1.3.6 — Nullable Format Fix"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -30981,6 +30981,13 @@ def _metals_std_execution_html() -> str:
 
 
 
+def _metals_fmt(value: Any, decimals: int = 3, suffix: str = "") -> str:
+    v = safe_float(value)
+    if v is None:
+        return "—"
+    return f"{v:.{max(0,int(decimals))}f}{suffix}"
+
+
 def _metals_age_zone(hold: Any) -> str:
     h = int(safe_float(hold) or 0)
     if h < 48: return "YOUNG"
@@ -31028,15 +31035,15 @@ def _metals_std_open_trades_html() -> str:
           <td>{esc(t.get('id'))}</td>
           <td>{esc(bid or 'LOCAL ONLY')}</td>
           <td>{esc(t.get('signal_time'))}</td>
-          <td>{safe_float(t.get('entry_price')) or 0:.3f}</td>
-          <td>{safe_float(t.get('last_known_price')) or 0:.3f}</td>
+          <td>{_metals_fmt(t.get('entry_price'),3)}</td>
+          <td>{_metals_fmt(t.get('last_known_price'),3)}</td>
           <td>{int(safe_float(t.get('manager_last_review_candles')) or 0)}h</td>
           <td>{esc(_metals_age_zone(t.get('manager_last_review_candles')))}</td>
           <td class="{pnl_class(rr)}">{rr:.3f}R</td>
           <td>{hwm:.3f}R</td>
           <td>{mfe:.3f}R</td>
           <td>{mae:.3f}R</td>
-          <td>{fixed48:.3f}R</td>
+          <td>{_metals_fmt(fixed48,3,'R')}</td>
           <td class="{pnl_class(upl)}">{money(upl,'GBP')}</td>
           <td>{esc(t.get('manager_last_decision') or '-')}</td>
           <td>{esc(t.get('manager_last_reason') or '-')}</td>
@@ -31052,7 +31059,7 @@ def _metals_std_open_trades_html() -> str:
     broker_only_rows = "".join(
         f"""<tr>
           <td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
-          <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
+          <td>{esc(t.get('currentUnits'))}</td><td>{_metals_fmt(t.get('price'),3)}</td>
           <td class="{pnl_class(t.get('unrealizedPL'))}">{money(t.get('unrealizedPL'),'GBP')}</td>
           <td>{money(t.get('marginUsed'),'GBP')}</td><td>{esc(t.get('openTime'))}</td>
         </tr>"""
@@ -31100,8 +31107,8 @@ def _metals_std_basket_manager_html() -> str:
           <div class="k">{esc(key.replace(':',' '))}</div>
           <div class="v {cls}">{esc(state)}</div>
           <div class="small">
-            {safe_float(b.get('basket_r')) or 0:.2f}R · HWM {safe_float(b.get('high_water_r')) or 0:.2f}R ·
-            giveback {safe_float(b.get('giveback_pct')) or 0:.1f}% · open {int(safe_float(b.get('open_count')) or 0)}
+            {_metals_fmt(b.get('basket_r'),2,'R')} · HWM {_metals_fmt(b.get('high_water_r'),2,'R')} ·
+            giveback {_metals_fmt(b.get('giveback_pct'),1,'%')} · open {int(safe_float(b.get('open_count')) or 0)}
           </div>
         </div>
         """
@@ -31114,10 +31121,10 @@ def _metals_std_basket_manager_html() -> str:
         The combined Metals family remains advisory only.
       </div>
       <div class="metric-grid">
-        <div class="mini-card"><div class="k">Family Basket</div><div class="v {pnl_class(family.get('basket_r'))}">{safe_float(family.get('basket_r')) or 0:.2f}R</div><div class="small">XAU + XAG advisory overlay</div></div>
-        <div class="mini-card"><div class="k">Family High-Water</div><div class="v {pnl_class(family.get('high_water_r'))}">{safe_float(family.get('high_water_r')) or 0:.2f}R</div><div class="small">Giveback {safe_float(family.get('giveback_pct')) or 0:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Family Basket</div><div class="v {pnl_class(family.get('basket_r'))}">{_metals_fmt(family.get('basket_r'),2,'R')}</div><div class="small">XAU + XAG advisory overlay</div></div>
+        <div class="mini-card"><div class="k">Family High-Water</div><div class="v {pnl_class(family.get('high_water_r'))}">{_metals_fmt(family.get('high_water_r'),2,'R')}</div><div class="small">Giveback {_metals_fmt(family.get('giveback_pct'),1,'%')}</div></div>
         <div class="mini-card"><div class="k">Family State</div><div class="v">{esc(family.get('state') or 'FLAT')}</div><div class="small">{esc(family.get('action') or 'ADVISORY_ONLY')}</div></div>
-        <div class="mini-card"><div class="k">48h Benchmark</div><div class="v {pnl_class(snap.get('fixed_48h_baseline_total_R'))}">{safe_float(snap.get('fixed_48h_baseline_total_R')) or 0:.2f}R</div><div class="small">{int(snap.get('fixed_48h_baseline_rows') or 0)} matured rows</div></div>
+        <div class="mini-card"><div class="k">48h Benchmark</div><div class="v {pnl_class(snap.get('fixed_48h_baseline_total_R'))}">{_metals_fmt(snap.get('fixed_48h_baseline_total_R'),2,'R')}</div><div class="small">{int(snap.get('fixed_48h_baseline_rows') or 0)} matured rows</div></div>
       </div>
       <h3>Asset / Side Basket States</h3>
       <div class="metric-grid">{cards or '<div class="mini-card"><div class="v">No basket snapshots yet</div></div>'}</div>
@@ -31155,7 +31162,7 @@ def _metals_std_broker_html() -> str:
     broker_rows = "".join(
         f"""<tr>
           <td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
-          <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
+          <td>{esc(t.get('currentUnits'))}</td><td>{_metals_fmt(t.get('price'),3)}</td>
           <td class="{pnl_class(t.get('unrealizedPL'))}">{money(t.get('unrealizedPL'),'GBP')}</td>
           <td>{money(t.get('marginUsed'),'GBP')}</td><td>{esc(t.get('openTime'))}</td>
         </tr>"""
@@ -31343,7 +31350,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.5 Audit Fixes · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.3.6 Nullable Format Fix · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31394,7 +31401,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.5",
+        "version": "v1.3.6",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
