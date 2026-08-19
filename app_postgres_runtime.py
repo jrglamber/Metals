@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.4.0 — Candidate-Supported Runner"
+APP_NAME = "Project Exit Plan — Metals v1.5.0 — Live-Ready Broker Accounting"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -960,9 +960,13 @@ OANDA_SYMBOL_MAP = {
 # ============================================================
 METALS_DEMO_BROKER_ENABLED = env_bool("METALS_DEMO_BROKER_ENABLED", False)
 METALS_DEMO_OANDA_ENV = os.getenv("METALS_DEMO_OANDA_ENV", "practice").strip().lower()
+METALS_LIVE_EXECUTION_ARMED = os.getenv("METALS_LIVE_EXECUTION_ARMED", "false").strip().lower() == "true"
 METALS_DEMO_OANDA_ACCOUNT_ID = os.getenv("METALS_DEMO_OANDA_ACCOUNT_ID", "").strip()
 METALS_DEMO_OANDA_API_TOKEN = os.getenv("METALS_DEMO_OANDA_API_TOKEN", "").strip()
-METALS_DEMO_OANDA_API_BASE = os.getenv("METALS_DEMO_OANDA_API_BASE", "https://api-fxpractice.oanda.com").rstrip("/")
+METALS_DEMO_OANDA_API_BASE = os.getenv(
+    "METALS_DEMO_OANDA_API_BASE",
+    "https://api-fxtrade.oanda.com" if METALS_DEMO_OANDA_ENV == "live" else "https://api-fxpractice.oanda.com",
+).rstrip("/")
 METALS_DEMO_ALLOWED_INSTRUMENTS = {x.strip().upper() for x in os.getenv("METALS_DEMO_ALLOWED_INSTRUMENTS", "XAU_USD,XAG_USD").split(",") if x.strip()}
 METALS_DEMO_DIRECTION = os.getenv("METALS_DEMO_DIRECTION", "short").strip().lower()
 METALS_DEMO_XAU_RISK_AMOUNT = float(os.getenv("METALS_DEMO_XAU_RISK_AMOUNT", "4"))
@@ -22187,7 +22191,13 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "live_broker_allowed_instruments": sorted(BROKER_ALLOWED_INSTRUMENTS),
         "live_instrument_overlap": live_overlap,
         "missing": missing,
-        "orders_allowed": bool(METALS_DEMO_BROKER_ENABLED and METALS_DEMO_OANDA_ENV == "practice" and not missing and not live_overlap),
+        "orders_allowed": bool(
+            METALS_DEMO_BROKER_ENABLED
+            and METALS_DEMO_OANDA_ENV in {"practice","live"}
+            and (METALS_DEMO_OANDA_ENV != "live" or METALS_LIVE_EXECUTION_ARMED)
+            and not missing
+            and not live_overlap
+        ),
         "legacy_direction_env": METALS_DEMO_DIRECTION,
         "simulate_longs": METALS_DEMO_SIMULATE_LONGS,
         "simulate_shorts": METALS_DEMO_SIMULATE_SHORTS,
@@ -22205,7 +22215,8 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "hourly_review_after_min_hold": True,
         "forced_max_hold_candles": METALS_DEMO_MANAGER_MAX_HOLD_CANDLES,
         "family_overlay_execution": "ADVISORY_ONLY",
-        "safety_note": "Separate practice credentials/tables; live NAS100/US500 broker lane and index basket manager remain untouched.",
+        "live_execution_armed": METALS_LIVE_EXECUTION_ARMED,
+        "safety_note": "Standalone XAU/XAG ownership. Same lane supports practice or live; live writes additionally require METALS_LIVE_EXECUTION_ARMED=true.",
     }
 
 
@@ -22213,8 +22224,8 @@ def metals_demo_request(path: str, method: str = "GET", body: Optional[Dict[str,
     cfg = metals_demo_config_status()
     if cfg["missing"]:
         return {"ok": False, "blocked": True, "error": "Missing metals demo config: " + ",".join(cfg["missing"])}
-    if METALS_DEMO_OANDA_ENV != "practice":
-        return {"ok": False, "blocked": True, "error": "Metals lane hard-blocked unless METALS_DEMO_OANDA_ENV=practice"}
+    if METALS_DEMO_OANDA_ENV not in {"practice","live"}:
+        return {"ok": False, "blocked": True, "error": f"Unsupported Metals OANDA environment: {METALS_DEMO_OANDA_ENV}"}
     if method.upper() != "GET" and not cfg["orders_allowed"]:
         return {"ok": False, "blocked": True, "error": "Metals demo execution disabled or live-instrument overlap detected", "config": cfg}
     clean_path = "/" + safe_str(path).lstrip("/")
@@ -23281,7 +23292,7 @@ def metals_demo_sync_broker_transactions(force: bool = False) -> Dict[str, Any]:
     economics, so BCO or any other practice-account activity is excluded.
     """
     cfg = metals_demo_config_status()
-    if cfg.get("missing") or METALS_DEMO_OANDA_ENV != "practice":
+    if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice","live"}:
         return {"ok": False, "skipped": True, "reason": "config_not_ready"}
 
     import time as _time
@@ -23432,7 +23443,7 @@ def metals_demo_broker_realized_summary() -> Dict[str, Any]:
 
 def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
     cfg=metals_demo_config_status()
-    if cfg["missing"] or METALS_DEMO_OANDA_ENV!="practice": return {"ok":False,"skipped":True,"reason":"config_not_ready"}
+    if cfg["missing"] or METALS_DEMO_OANDA_ENV not in {"practice","live"}: return {"ok":False,"skipped":True,"reason":"config_not_ready"}
     response=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades")
     if not response.get("ok"): return {"ok":False,"response":response}
     broker={safe_str(t.get("id")):t for t in (response.get("data",{}).get("trades",[]) or []) if safe_str(t.get("instrument")) in METALS_DEMO_ALLOWED_INSTRUMENTS}
@@ -31170,72 +31181,202 @@ def _metals_std_basket_manager_html() -> str:
     return build_metals_demo_dashboard_html()
 
 
+
+def metals_live_readiness() -> Dict[str, Any]:
+    """Read-only production readiness. Never unlocks live writes."""
+    cfg = metals_demo_config_status()
+    broker = metals_demo_live_broker_snapshot()
+    acct = broker.get("account") or {}
+    realized = metals_demo_broker_realized_summary()
+
+    with get_conn() as conn:
+        local = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+        ).fetchall()]
+        queue = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT 500"
+        ).fetchall()]
+        tx_count = int((conn.execute(
+            "SELECT COUNT(*) AS c FROM metals_demo_broker_transactions"
+        ).fetchone() or {"c":0})["c"] or 0)
+
+    owned = broker.get("owned_open_trades") or []
+    broker_ids = {safe_str(t.get("id")) for t in owned}
+    local_ids = {safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
+    missing = [t for t in local if safe_str(t.get("broker_trade_id")) and safe_str(t.get("broker_trade_id")) not in broker_ids]
+    broker_only = [t for t in owned if safe_str(t.get("id")) not in local_ids]
+    pending = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"PENDING","RETRY","WAITING_MARKET_REOPEN","WAITING_RECONCILIATION"})
+    failed = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"FAILED","FAILED_FINAL","EXECUTION_FAILED"})
+
+    previews = []
+    previews_ok = True
+    for asset in ("XAUUSD","XAGUSD"):
+        for side in ("long","short"):
+            try:
+                p=metals_demo_sizing_preview(asset,side)
+            except Exception as exc:
+                p={"ok":False,"executable":False,"warnings":[str(exc)]}
+            previews.append({"asset":asset,"side":side,"preview":p})
+            previews_ok = previews_ok and bool(p.get("ok") or p.get("executable"))
+
+    checks = [
+        {"name":"Environment", "ok": METALS_DEMO_OANDA_ENV in {"practice","live"}, "detail":METALS_DEMO_OANDA_ENV},
+        {"name":"OANDA read access", "ok": bool(broker.get("ok")), "detail":"account/trades readable"},
+        {"name":"GBP account", "ok": safe_str(acct.get("currency")).upper()=="GBP", "detail":safe_str(acct.get("currency") or "unknown")},
+        {"name":"Exact Metals ownership", "ok": set(METALS_DEMO_ALLOWED_INSTRUMENTS)=={"XAU_USD","XAG_USD"}, "detail":", ".join(sorted(METALS_DEMO_ALLOWED_INSTRUMENTS))},
+        {"name":"No foreign-instrument overlap", "ok": not bool(cfg.get("live_instrument_overlap")), "detail":", ".join(cfg.get("live_instrument_overlap") or []) or "none"},
+        {"name":"Risk previews", "ok":previews_ok, "detail":"XAU/XAG long+short sizing"},
+        {"name":"Reconciliation", "ok":not missing and not broker_only, "detail":f"local-missing {len(missing)} / broker-only {len(broker_only)}"},
+        {"name":"Durable queue", "ok":failed==0, "detail":f"{pending} pending / {failed} failed"},
+        {"name":"Broker realised accounting", "ok":bool(realized.get("ok")) or METALS_DEMO_OANDA_ENV=="practice", "detail":f"{tx_count} transaction ledger rows"},
+        {"name":"48h+ auto management", "ok":bool(METALS_DEMO_BASKET_MANAGER_ENABLED), "detail":"hourly mature-runner manager"},
+    ]
+
+    promotion_ready = all(c["ok"] for c in checks)
+    return {
+        "status":"READY" if promotion_ready else "CHECK",
+        "promotion_ready":promotion_ready,
+        "current_environment":METALS_DEMO_OANDA_ENV,
+        "live_execution_armed":METALS_LIVE_EXECUTION_ARMED,
+        "switch_to_live_requires":[
+            "Set METALS_DEMO_OANDA_ENV=live",
+            "Use live GBP OANDA account/token",
+            "Leave XAU_USD/XAG_USD as the only owned instruments",
+            "Run /broker/metals-live-readiness while METALS_LIVE_EXECUTION_ARMED=false",
+            "Only after all checks pass set METALS_LIVE_EXECUTION_ARMED=true",
+        ],
+        "checks":checks,
+        "broker":broker,
+        "realized_accounting":realized,
+        "risk_previews":previews,
+        "time_utc":now_utc_iso(),
+    }
+
+
+@app.get("/broker/metals-live-readiness")
+def metals_live_readiness_endpoint():
+    return metals_live_readiness()
+
+
 def _metals_std_broker_html() -> str:
     cfg = metals_demo_config_status()
-    acct = _metals_demo_account_currency()
-    previews = []
-    for asset in ("XAUUSD", "XAGUSD"):
-        for side in ("long", "short"):
-            try:
-                p = metals_demo_sizing_preview(asset, side)
-            except Exception as exc:
-                p = {"ok": False, "warnings": [str(exc)]}
-            previews.append((asset, side, p))
-    rows = ""
-    for asset, side, p in previews:
-        rows += f"""
-        <tr>
-          <td>{esc(asset)}</td><td>{esc(side.upper())}</td>
-          <td>{esc(p.get('instrument') or _metals_demo_instrument(asset))}</td>
-          <td>{money(p.get('requested_risk_gbp'),'GBP')}</td>
-          <td>{money(p.get('estimated_risk_gbp'),'GBP')}</td>
+    broker = metals_demo_live_broker_snapshot()
+    acct = broker.get("account") or {}
+    ready = metals_live_readiness()
+    realized = ready.get("realized_accounting") or {}
+
+    with get_conn() as conn:
+        queue = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT 30"
+        ).fetchall()]
+        audits = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_execution_audit ORDER BY id DESC LIMIT 30"
+        ).fetchall()]
+        txs = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_broker_transactions ORDER BY transaction_time DESC, transaction_id DESC LIMIT 30"
+        ).fetchall()]
+        local = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+        ).fetchall()]
+
+    owned = broker.get("owned_open_trades") or []
+    broker_ids = {safe_str(t.get("id")) for t in owned}
+    local_ids = {safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
+    local_missing = [t for t in local if safe_str(t.get("broker_trade_id")) and safe_str(t.get("broker_trade_id")) not in broker_ids]
+    broker_only = [t for t in owned if safe_str(t.get("id")) not in local_ids]
+    pending = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"PENDING","RETRY","WAITING_MARKET_REOPEN","WAITING_RECONCILIATION"})
+    failed = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"FAILED","FAILED_FINAL","EXECUTION_FAILED"})
+
+    preview_rows=""
+    for item in ready.get("risk_previews") or []:
+        p=item.get("preview") or {}
+        preview_rows += f"""<tr>
+          <td>{esc(item.get('asset'))}</td><td>{esc(safe_str(item.get('side')).upper())}</td>
+          <td>{esc(p.get('instrument') or _metals_demo_instrument(item.get('asset')))}</td>
+          <td>{money(p.get('requested_risk_gbp'),'GBP')}</td><td>{money(p.get('estimated_risk_gbp'),'GBP')}</td>
           <td>{esc(p.get('units') or p.get('order_units') or '-')}</td>
-          <td>{esc('OK' if p.get('ok') else 'BLOCKED')}</td>
-          <td>{esc('; '.join(p.get('warnings') or []))}</td>
-        </tr>
-        """
+          <td class="{'pos' if p.get('executable') else 'warn'}">{'OK' if p.get('executable') else 'BLOCKED'}</td>
+          <td>{esc('; '.join(p.get('warnings') or p.get('blocking_reasons') or []))}</td>
+        </tr>"""
+
+    broker_rows="".join(
+        f"""<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td><td>{esc(t.get('currentUnits'))}</td>
+        <td>{_metals_fmt(t.get('price'),3)}</td><td class="{pnl_class(t.get('unrealizedPL'))}">{money(t.get('unrealizedPL'),'GBP')}</td>
+        <td>{money(t.get('marginUsed'),'GBP')}</td><td>{esc(t.get('openTime'))}</td></tr>"""
+        for t in owned
+    )
+    tx_rows="".join(
+        f"""<tr><td>{esc(t.get('transaction_time'))}</td><td>{esc(t.get('transaction_id'))}</td><td>{esc(t.get('transaction_type'))}</td>
+        <td>{esc(t.get('instrument'))}</td><td class="{pnl_class(t.get('pl_gbp'))}">{money(t.get('pl_gbp'),'GBP')}</td>
+        <td>{money(t.get('financing_gbp'),'GBP')}</td><td>{money(t.get('net_realized_gbp'),'GBP')}</td></tr>"""
+        for t in txs
+    )
+    queue_rows="".join(
+        f"""<tr><td>{esc(q.get('created_at_utc'))}</td><td>{esc(q.get('action_type') or q.get('action'))}</td>
+        <td>{esc(q.get('status'))}</td><td>{esc(q.get('asset'))}</td><td>{esc(q.get('broker_trade_id'))}</td>
+        <td>{esc(q.get('attempts'))}</td><td>{esc(q.get('last_error') or q.get('notes'))}</td></tr>"""
+        for q in queue
+    )
+    audit_rows="".join(
+        f"""<tr><td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td><td>{esc(a.get('status'))}</td>
+        <td>{esc(a.get('asset'))}</td><td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td></tr>"""
+        for a in audits
+    )
+    readiness_rows="".join(
+        f"<tr><td>{esc(c.get('name'))}</td><td class='{'pos' if c.get('ok') else 'neg'}'>{'PASS' if c.get('ok') else 'CHECK'}</td><td>{esc(c.get('detail'))}</td></tr>"
+        for c in ready.get("checks") or []
+    )
+
     return f"""
-      <div class="section-note warn">
-        <strong>DEMO ONLY — NO LIVE MONEY.</strong>
-        XAU_USD / XAG_USD are the only allowed instruments in this service.
+      <div class="section-note {'neg' if METALS_DEMO_OANDA_ENV=='live' else 'warn'}">
+        <strong>{'LIVE' if METALS_DEMO_OANDA_ENV=='live' else 'DEMO / PRACTICE'} METALS LANE.</strong>
+        This standalone service owns XAU_USD/XAG_USD only. Practice and live now use the same broker, reconciliation, manager and accounting architecture.
       </div>
+
       <div class="metric-grid">
-        <div class="mini-card"><div class="k">Lane</div><div class="v">{'ENABLED' if cfg.get('orders_allowed') else 'BLOCKED'}</div><div class="small">OANDA practice</div></div>
-        <div class="mini-card"><div class="k">Account Currency</div><div class="v">{esc(acct.get('currency') or '-')}</div><div class="small">GBP verification required</div></div>
-        <div class="mini-card"><div class="k">Manager</div><div class="v">{'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div><div class="small">48h minimum + hourly review</div></div>
-        <div class="mini-card"><div class="k">Allowed</div><div class="v">XAU + XAG</div><div class="small">No index / BCO management</div></div>
+        <div class="mini-card"><div class="k">Live Readiness</div><div class="v {'pos' if ready.get('promotion_ready') else 'warn'}">{esc(ready.get('status'))}</div><div class="small">Writes can stay locked during readiness checks</div></div>
+        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {'pos' if cfg.get('orders_allowed') else 'warn'}">{'ENABLED' if cfg.get('orders_allowed') else 'LOCKED'}</div><div class="small">{esc(METALS_DEMO_OANDA_ENV.upper())} · live arm {'ON' if METALS_LIVE_EXECUTION_ARMED else 'OFF'}</div></div>
+        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{money(acct.get('NAV'),'GBP')}</div><div class="small">Balance {money(acct.get('balance'),'GBP')}</div></div>
+        <div class="mini-card"><div class="k">Margin Available</div><div class="v">{money(acct.get('marginAvailable'),'GBP')}</div><div class="small">Currency {esc(acct.get('currency') or '-')}</div></div>
+        <div class="mini-card"><div class="k">Metals Open P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">{int(broker.get('owned_open_count') or 0)} XAU/XAG broker trades</div></div>
+        <div class="mini-card"><div class="k">Realised / Financing</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">P/L {money(realized.get('pl_gbp'),'GBP')} · financing {money(realized.get('financing_gbp'),'GBP')}</div></div>
+        <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if not local_missing and not broker_only else 'neg'}">{'SAFE' if not local_missing and not broker_only else 'CHECK'}</div><div class="small">Local missing {len(local_missing)} · broker-only {len(broker_only)}</div></div>
+        <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
       </div>
-      <h3>Risk / sizing previews</h3>
-      <div class="table-scroll"><table>
-        <thead><tr><th>Asset</th><th>Side</th><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>State</th><th>Warnings</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table></div>
+
+      <h3>Live Promotion Readiness</h3>
+      <div class="table-scroll"><table><thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+      <tbody>{readiness_rows}</tbody></table></div>
+
+      <h3>Risk / Sizing Previews — Both Directions</h3>
+      <div class="table-scroll"><table><thead><tr><th>Asset</th><th>Side</th><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>State</th><th>Warnings</th></tr></thead>
+      <tbody>{preview_rows}</tbody></table></div>
+
+      <h3>Actual OANDA Metals Open Trades</h3>
+      <div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
+      <tbody>{broker_rows or '<tr><td colspan="7">No OANDA Metals trades open.</td></tr>'}</tbody></table></div>
+
+      <h3>Broker-Authoritative Realised P&amp;L / Financing</h3>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Transaction</th><th>Type</th><th>Instrument</th><th>P/L</th><th>Financing</th><th>Net Realised</th></tr></thead>
+      <tbody>{tx_rows or '<tr><td colspan="7">No Metals broker transaction rows yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Durable Broker Action Queue</h3>
+      <div class="table-scroll"><table><thead><tr><th>Created</th><th>Action</th><th>Status</th><th>Asset</th><th>Broker ID</th><th>Attempts</th><th>Error / Notes</th></tr></thead>
+      <tbody>{queue_rows or '<tr><td colspan="7">No queued Metals broker actions.</td></tr>'}</tbody></table></div>
+
+      <h3>Recent Execution Audit</h3>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Status</th><th>Asset</th><th>Broker ID</th><th>Message</th></tr></thead>
+      <tbody>{audit_rows or '<tr><td colspan="6">No execution audit rows.</td></tr>'}</tbody></table></div>
+
       <div class="section-note small">
-        <a href="/broker/metals-demo/status">status JSON</a> ·
-        <a href="/export/metals-demo-execution-audit.csv">execution audit</a> ·
-        <a href="/export/metals-demo-open-trades.csv">open trades</a>
+        <a href="/broker/metals-live-readiness">live-readiness JSON</a> ·
+        <a href="/broker/metals-demo/status">broker status JSON</a> ·
+        <a href="/export/metals-demo-open-trades.csv">open trades</a> ·
+        <a href="/export/metals-demo-broker-transactions.csv">broker transactions</a> ·
+        <a href="/export/metals-demo-action-queue.csv">action queue</a> ·
+        <a href="/export/metals-demo-execution-audit.csv">execution audit</a>
       </div>
     """
-
-
-def _metals_std_research_html() -> str:
-    return """
-      <div class="section-note">
-        Keep the research clocks separate: generated-short v1 remains the historically
-        supported baseline, cleaned v2 is the challenger, and long candidates continue
-        to be collected prospectively.
-      </div>
-      <div class="section-note small">
-        <a href="/metals-short-shadow-v2">Short Shadow v2 JSON</a> ·
-        <a href="/export/metals-short-shadow-v2.csv">v2 CSV</a> ·
-        <a href="/metals-short-research">Short research JSON</a> ·
-        <a href="/export/metals-short-research.csv">Short research CSV</a> ·
-        <a href="/metals-research-outcomes">Long outcomes JSON</a> ·
-        <a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a> ·
-        <a href="/export/metals-research.zip">Full metals research ZIP</a>
-      </div>
-    """
-
 
 def _metals_std_execution_html() -> str:
     init_db()
@@ -31633,7 +31774,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.4.0 Candidate-Supported Runner · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.5.0 Live-Ready Broker Accounting · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31684,7 +31825,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.4.0",
+        "version": "v1.5.0",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
