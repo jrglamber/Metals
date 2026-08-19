@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.5.1 — Ghost Trade Reconciliation"
+APP_NAME = "Project Exit Plan — Metals v1.5.2 — Broker High-Water Fix"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -31226,6 +31226,157 @@ def metals_demo_live_broker_snapshot() -> Dict[str, Any]:
         "time_utc": now_utc_iso(),
     }
 
+
+def _metals_broker_basket_r(broker: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reconstruct current Metals basket R from actual OANDA UPL and each
+    linked trade's effective GBP risk. This makes the top-level R/HWM
+    broker-aware even before the local hourly manager has reviewed a trade.
+    """
+    owned = broker.get("owned_open_trades") or []
+    broker_by_id = {safe_str(t.get("id")): t for t in owned}
+
+    with get_conn() as conn:
+        links = [dict(r) for r in conn.execute("""
+            SELECT * FROM metals_demo_trade_links
+            WHERE status='OPEN'
+            ORDER BY id
+        """).fetchall()]
+
+    total_r = 0.0
+    linked = 0
+    unlinked = 0
+    details = []
+
+    for link in links:
+        bid = safe_str(link.get("broker_trade_id"))
+        bt = broker_by_id.get(bid)
+        if not bt:
+            continue
+
+        upl = float(safe_float(bt.get("unrealizedPL")) or 0.0)
+        risk = (
+            safe_float(link.get("estimated_risk_amount"))
+            or safe_float(link.get("requested_risk_amount"))
+            or _metals_demo_risk(link.get("asset"))
+        )
+        risk = float(risk or 0.0)
+        rr = (upl / risk) if risk > 0 else 0.0
+        total_r += rr
+        linked += 1
+        details.append({
+            "local_id": link.get("id"),
+            "broker_trade_id": bid,
+            "asset": link.get("asset"),
+            "upl_gbp": upl,
+            "effective_risk_gbp": risk,
+            "broker_r": rr,
+        })
+
+    # If an OANDA Metals trade is genuinely broker-only, we cannot safely
+    # manufacture an R value without its original risk basis. Cash HWM remains
+    # exact; R HWM uses linked trades only and flags the discrepancy.
+    linked_ids = {safe_str(x.get("broker_trade_id")) for x in links}
+    unlinked = sum(1 for t in owned if safe_str(t.get("id")) not in linked_ids)
+
+    return {
+        "basket_r": total_r,
+        "linked_count": linked,
+        "unlinked_broker_count": unlinked,
+        "details": details,
+    }
+
+
+def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Persistent broker-authoritative Metals high-water.
+
+    Cash basis:
+      current = actual OANDA XAU/XAG unrealised P&L
+      HWM     = maximum current during the active Metals basket
+      giveback= HWM - current
+
+    R basis:
+      current = sum(actual OANDA trade UPL / original effective risk)
+      HWM     = maximum current broker-R during the active basket
+
+    A new basket cycle begins after OANDA Metals open-count reaches zero.
+    """
+    current_gbp = float(safe_float(broker.get("owned_unrealized_pl")) or 0.0)
+    open_count = int(broker.get("owned_open_count") or 0)
+    r_state = _metals_broker_basket_r(broker)
+    current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
+    now = now_utc_iso()
+
+    with get_conn() as conn:
+        old_open = int(safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0)
+        old_hwm_gbp = float(safe_float(_metals_runtime_get(conn, "broker_hwm_gbp", "0")) or 0.0)
+        old_hwm_r = float(safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0)
+        old_seen = _metals_runtime_get(conn, "broker_hwm_seen_at", "")
+
+        # Basket fully flat: arm a clean reset for the next actual basket.
+        if open_count == 0:
+            _metals_runtime_set(conn, "broker_hwm_open_count", 0)
+            _metals_runtime_set(conn, "broker_hwm_gbp", 0.0)
+            _metals_runtime_set(conn, "broker_hwm_r", 0.0)
+            _metals_runtime_set(conn, "broker_hwm_seen_at", "")
+            conn.commit()
+            return {
+                "current_gbp": 0.0, "current_r": 0.0,
+                "high_water_gbp": 0.0, "high_water_r": 0.0,
+                "high_water_seen_at": "",
+                "giveback_gbp": 0.0, "giveback_r": 0.0,
+                "giveback_pct": 0.0,
+                "open_count": 0,
+                "linked_r_count": r_state.get("linked_count", 0),
+                "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
+            }
+
+        # If the previous observed state was flat, this is a fresh basket cycle.
+        fresh_cycle = old_open == 0
+        if fresh_cycle:
+            hwm_gbp = max(0.0, current_gbp)
+            hwm_r = max(0.0, current_r)
+            seen = now if (hwm_gbp > 0 or hwm_r > 0) else ""
+        else:
+            hwm_gbp = old_hwm_gbp
+            hwm_r = old_hwm_r
+            seen = old_seen
+
+            if current_gbp > hwm_gbp:
+                hwm_gbp = current_gbp
+                seen = now
+            if current_r > hwm_r:
+                hwm_r = current_r
+                if not seen:
+                    seen = now
+
+        _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
+        _metals_runtime_set(conn, "broker_hwm_gbp", hwm_gbp)
+        _metals_runtime_set(conn, "broker_hwm_r", hwm_r)
+        _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
+        conn.commit()
+
+    giveback_gbp = max(0.0, hwm_gbp - current_gbp)
+    giveback_r = max(0.0, hwm_r - current_r)
+    giveback_pct = (giveback_gbp / hwm_gbp * 100.0) if hwm_gbp > 0 else 0.0
+
+    return {
+        "current_gbp": current_gbp,
+        "current_r": current_r,
+        "high_water_gbp": hwm_gbp,
+        "high_water_r": hwm_r,
+        "high_water_seen_at": seen,
+        "giveback_gbp": giveback_gbp,
+        "giveback_r": giveback_r,
+        "giveback_pct": giveback_pct,
+        "open_count": open_count,
+        "linked_r_count": r_state.get("linked_count", 0),
+        "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
+        "r_details": r_state.get("details", []),
+    }
+
+
 def _metals_standard_top_uncached() -> Dict[str, Any]:
     snap = metals_demo_summary()
     cfg = snap.get("config") or {}
@@ -31256,24 +31407,16 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
         ).upper() in ("CANDIDATE", "ACCEPTED", "TRUE")
     )
 
-    basket_r = safe_float(family.get("basket_r")) or 0.0
-    hwm_r = safe_float(family.get("high_water_r")) or 0.0
-    hwm_gbp = safe_float(family.get("high_water_pnl_gbp"))
-    hwm_time = safe_str(family.get("high_water_seen_at"))
-    if hwm_gbp is None:
-        risk_basis=(float(METALS_DEMO_XAU_RISK_AMOUNT)+float(METALS_DEMO_XAG_RISK_AMOUNT))/2.0
-        hwm_gbp=hwm_r*risk_basis
-    if not hwm_time and hwm_r>0:
-        with get_conn() as _hconn:
-            _hrow=_hconn.execute("""SELECT created_at_utc FROM metals_demo_basket_snapshots
-                                    WHERE basket_key='METALS_BASKET' AND basket_r>=?
-                                    ORDER BY id ASC LIMIT 1""",(hwm_r-0.000001,)).fetchone()
-        if _hrow:
-            hwm_time=safe_str(_hrow["created_at_utc"])
-    giveback_pct = safe_float(family.get("giveback_pct")) or 0.0
-    current_basket_gbp = safe_float(family.get("basket_pnl_gbp")) or 0.0
-    giveback_r = max(0.0, hwm_r - basket_r)
-    giveback_gbp = max(0.0, float(hwm_gbp or 0.0) - current_basket_gbp)
+    # Top-level HWM / Giveback is broker-authoritative and updates on every
+    # dashboard refresh, not only after a local manager review.
+    broker_hwm = _metals_broker_highwater_state(broker)
+    basket_r = float(safe_float(broker_hwm.get("current_r")) or 0.0)
+    hwm_r = float(safe_float(broker_hwm.get("high_water_r")) or 0.0)
+    hwm_gbp = float(safe_float(broker_hwm.get("high_water_gbp")) or 0.0)
+    hwm_time = safe_str(broker_hwm.get("high_water_seen_at"))
+    giveback_pct = float(safe_float(broker_hwm.get("giveback_pct")) or 0.0)
+    giveback_r = float(safe_float(broker_hwm.get("giveback_r")) or 0.0)
+    giveback_gbp = float(safe_float(broker_hwm.get("giveback_gbp")) or 0.0)
 
     broker_open_pnl = safe_float(broker.get("owned_unrealized_pl")) or 0.0
     realized_pnl = safe_float(snap.get("actual_realized_pnl")) or 0.0
@@ -31336,6 +31479,9 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "giveback_r": giveback_r,
             "giveback_gbp": giveback_gbp,
             "giveback_pct": giveback_pct,
+            "high_water_source": "OANDA_XAU_XAG_OPEN_PNL",
+            "broker_r_linked_count": int(broker_hwm.get("linked_r_count") or 0),
+            "broker_r_unlinked_count": int(broker_hwm.get("unlinked_broker_count") or 0),
             "basket_state": safe_str(
                 family.get("state") or ("FLAT" if not open_trades else "GREEN")
             ),
@@ -31593,6 +31739,7 @@ def _metals_std_broker_html() -> str:
         <div class="mini-card"><div class="k">Realised / Financing</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">P/L {money(realized.get('pl_gbp'),'GBP')} · financing {money(realized.get('financing_gbp'),'GBP')}</div></div>
         <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if not local_missing and not broker_only else 'neg'}">{'SAFE' if not local_missing and not broker_only else 'CHECK'}</div><div class="small">Local missing {len(local_missing)} · broker-only {len(broker_only)}</div></div>
         <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
+        <div class="mini-card"><div class="k">HWM Source</div><div class="v pos">OANDA</div><div class="small">XAU/XAG open P&amp;L · refreshed continuously</div></div>
       </div>
 
       <h3>Live Promotion Readiness</h3>
@@ -32029,7 +32176,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.5.1 Ghost Trade Reconciliation · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.5.2 Broker High-Water Fix · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -32080,7 +32227,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.5.1",
+        "version": "v1.5.2",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
