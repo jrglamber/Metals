@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.5.0 — Live-Ready Broker Accounting"
+APP_NAME = "Project Exit Plan — Metals v1.5.1 — Ghost Trade Reconciliation"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -23126,12 +23126,186 @@ def _metals_demo_close(link: Dict[str, Any],qid: int) -> Dict[str, Any]:
     _metals_demo_audit(int(link.get("raw_signal_id") or 0),link.get("asset"),link.get("instrument"),"manager_close","RETRY",safe_str(last.get("error") or "close failed; persistent retry retained"),response=last,link_id=int(link["id"]),candidate_state="MANAGED")
     return {"ok":False,"status":"RETRY","response":last}
 
+
+def _metals_demo_find_close_in_transaction_ledger(broker_trade_id: Any) -> Dict[str, Any]:
+    """Find broker-authoritative close evidence for one Metals trade ID."""
+    tid = safe_str(broker_trade_id)
+    if not tid:
+        return {"ok": False, "reason": "missing_broker_trade_id"}
+
+    # Ensure the local OANDA transaction ledger is as fresh as possible first.
+    try:
+        metals_demo_sync_broker_transactions(force=True)
+    except Exception:
+        pass
+
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM metals_demo_broker_transactions
+            WHERE raw_json LIKE ?
+            ORDER BY transaction_time DESC, transaction_id DESC
+            LIMIT 100
+        """, (f"%{tid}%",)).fetchall()]
+
+    for row in rows:
+        try:
+            raw = json.loads(safe_str(row.get("raw_json")) or "{}")
+        except Exception:
+            raw = {}
+
+        # OANDA ORDER_FILL close payload.
+        for closed in (raw.get("tradesClosed") or []):
+            if safe_str((closed or {}).get("tradeID")) == tid:
+                pl = safe_float((closed or {}).get("realizedPL"))
+                fin = safe_float((closed or {}).get("financing"))
+                return {
+                    "ok": True,
+                    "source": "transaction_tradesClosed",
+                    "transaction_id": row.get("transaction_id"),
+                    "closed_at_utc": row.get("transaction_time"),
+                    "realized_pl": pl,
+                    "financing": fin,
+                    "net_realized": (float(pl or 0.0) + float(fin or 0.0)),
+                    "close_price": safe_float(raw.get("price")),
+                    "raw": raw,
+                }
+
+        # Partial/final reduction can also carry close economics.
+        reduced = raw.get("tradeReduced") or {}
+        if safe_str(reduced.get("tradeID")) == tid:
+            pl = safe_float(reduced.get("realizedPL"))
+            fin = safe_float(reduced.get("financing"))
+            return {
+                "ok": True,
+                "source": "transaction_tradeReduced",
+                "transaction_id": row.get("transaction_id"),
+                "closed_at_utc": row.get("transaction_time"),
+                "realized_pl": pl,
+                "financing": fin,
+                "net_realized": (float(pl or 0.0) + float(fin or 0.0)),
+                "close_price": safe_float(raw.get("price")),
+                "raw": raw,
+            }
+
+    return {"ok": False, "reason": "no_trade_level_close_evidence_in_ledger"}
+
+
+def _metals_demo_mark_link_closed_from_broker(
+    link: Dict[str, Any],
+    *,
+    realized_pl: Any = None,
+    financing: Any = None,
+    close_price: Any = None,
+    closed_at_utc: Any = None,
+    close_reason: str = "broker_stop_or_external_close",
+    evidence_source: str = "",
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Close the local link only after broker close evidence exists."""
+    now = now_utc_iso()
+    closed_at = safe_str(closed_at_utc) or now
+    pl = safe_float(realized_pl)
+    fin = safe_float(financing)
+    px = safe_float(close_price)
+
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE metals_demo_trade_links
+            SET updated_at_utc=?,
+                status='CLOSED_BROKER',
+                realized_pl=COALESCE(?, realized_pl),
+                last_known_unrealized_pl=0,
+                last_known_price=COALESCE(?, last_known_price),
+                closed_at_utc=COALESCE(NULLIF(closed_at_utc,''), ?),
+                close_reason=?,
+                manager_last_decision='CLOSED_BROKER_RECONCILED',
+                manager_last_reason=?,
+                last_reconciled_at_utc=?
+            WHERE id=?
+        """, (
+            now, pl, px, closed_at, close_reason,
+            f"{close_reason}; source={evidence_source or 'broker'}",
+            now, int(link["id"]),
+        ))
+        conn.commit()
+
+    try:
+        _metals_demo_audit(
+            int(link.get("raw_signal_id") or 0),
+            safe_str(link.get("asset")),
+            safe_str(link.get("instrument")),
+            "broker_close_reconciliation",
+            "CLOSED_BROKER",
+            f"Local OPEN ghost cleared; broker trade {safe_str(link.get('broker_trade_id'))} confirmed closed via {evidence_source or 'broker'}.",
+            response=evidence or {},
+            candidate_state="RECONCILIATION",
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status": "CLOSED_BROKER",
+        "link_id": link.get("id"),
+        "broker_trade_id": link.get("broker_trade_id"),
+        "realized_pl": pl,
+        "financing": fin,
+        "close_price": px,
+        "closed_at_utc": closed_at,
+        "evidence_source": evidence_source,
+    }
+
+
 def _metals_demo_refresh_closed(link: Dict[str, Any]) -> Dict[str, Any]:
-    resp=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/trades/{urllib.parse.quote(safe_str(link.get('broker_trade_id')))}"); trade=resp.get("data",{}).get("trade") if resp.get("ok") else None
-    if trade and safe_str(trade.get("state")).upper()=="CLOSED":
-        with get_conn() as conn: conn.execute("UPDATE metals_demo_trade_links SET updated_at_utc=?,status='CLOSED_BROKER',realized_pl=?,closed_at_utc=COALESCE(closed_at_utc,?),close_reason=COALESCE(close_reason,'broker_stop_or_external_close') WHERE id=?",(now_utc_iso(),safe_float(trade.get("realizedPL")),now_utc_iso(),int(link["id"]))); conn.commit()
-        return {"ok":True,"status":"CLOSED_BROKER","realized_pl":safe_float(trade.get("realizedPL"))}
-    return {"ok":False,"status":"BROKER_NOT_OPEN","response":resp}
+    """
+    Reconcile one local OPEN link whose broker trade is absent from /openTrades.
+    Never assumes absence means closed without checking broker evidence.
+    """
+    tid = safe_str(link.get("broker_trade_id"))
+    if not tid:
+        return {"ok": False, "status": "MISSING_BROKER_TRADE_ID"}
+
+    # First preference: OANDA trade endpoint gives full closed-trade state.
+    resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/trades/{urllib.parse.quote(tid)}"
+    )
+    trade = (resp.get("data") or {}).get("trade") if resp.get("ok") else None
+
+    if trade and safe_str(trade.get("state")).upper() == "CLOSED":
+        return _metals_demo_mark_link_closed_from_broker(
+            link,
+            realized_pl=trade.get("realizedPL"),
+            financing=trade.get("financing"),
+            close_price=trade.get("averageClosePrice") or trade.get("price"),
+            closed_at_utc=trade.get("closeTime"),
+            close_reason="broker_trade_confirmed_closed",
+            evidence_source="oanda_trade_endpoint",
+            evidence={"trade": trade},
+        )
+
+    # Fallback: exact trade-level close evidence from the OANDA transaction ledger.
+    tx = _metals_demo_find_close_in_transaction_ledger(tid)
+    if tx.get("ok"):
+        return _metals_demo_mark_link_closed_from_broker(
+            link,
+            realized_pl=tx.get("realized_pl"),
+            financing=tx.get("financing"),
+            close_price=tx.get("close_price"),
+            closed_at_utc=tx.get("closed_at_utc"),
+            close_reason="broker_transaction_confirmed_close",
+            evidence_source=safe_str(tx.get("source")),
+            evidence=tx,
+        )
+
+    # Do NOT silently close the row when broker evidence is unavailable.
+    return {
+        "ok": False,
+        "status": "BROKER_NOT_OPEN_UNRESOLVED",
+        "broker_trade_id": tid,
+        "trade_endpoint": resp,
+        "transaction_evidence": tx,
+    }
 
 def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
     with get_conn() as conn:
@@ -23441,8 +23615,80 @@ def metals_demo_broker_realized_summary() -> Dict[str, Any]:
     }
 
 
+
+def metals_demo_reconcile_local_ghosts(asset: str = "") -> Dict[str, Any]:
+    """
+    Clear stale local OPEN links after proving their OANDA trade has closed.
+    This function never submits an order and is safe to run in practice/live
+    with execution locked.
+    """
+    cfg = metals_demo_config_status()
+    if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice","live"}:
+        return {"ok": False, "skipped": True, "reason": "config_not_ready"}
+
+    # Refresh transaction ledger first so fallback close evidence is current.
+    try:
+        tx_sync = metals_demo_sync_broker_transactions(force=True)
+    except Exception as exc:
+        tx_sync = {"ok": False, "error": str(exc)}
+
+    response = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades"
+    )
+    if not response.get("ok"):
+        return {"ok": False, "reason": "open_trades_fetch_failed", "response": response}
+
+    broker_open = {
+        safe_str(t.get("id")): t
+        for t in ((response.get("data") or {}).get("trades") or [])
+        if safe_str(t.get("instrument")) in METALS_DEMO_ALLOWED_INSTRUMENTS
+    }
+
+    with get_conn() as conn:
+        sql = "SELECT * FROM metals_demo_trade_links WHERE status='OPEN'"
+        params = []
+        if asset:
+            sql += " AND asset=?"
+            params.append(_metals_demo_asset(asset))
+        local_open = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+    ghosts = [
+        link for link in local_open
+        if safe_str(link.get("broker_trade_id"))
+        and safe_str(link.get("broker_trade_id")) not in broker_open
+    ]
+
+    results = []
+    for link in ghosts:
+        results.append({
+            "link_id": link.get("id"),
+            "broker_trade_id": link.get("broker_trade_id"),
+            "result": _metals_demo_refresh_closed(link),
+        })
+
+    resolved = sum(1 for r in results if (r.get("result") or {}).get("ok"))
+    unresolved = len(results) - resolved
+    return {
+        "ok": unresolved == 0,
+        "checked_local_open": len(local_open),
+        "broker_open": len(broker_open),
+        "ghosts_found": len(ghosts),
+        "ghosts_resolved": resolved,
+        "ghosts_unresolved": unresolved,
+        "transaction_sync": tx_sync,
+        "results": results,
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/broker/metals-reconcile-ghosts")
+def metals_demo_reconcile_local_ghosts_endpoint():
+    return metals_demo_reconcile_local_ghosts()
+
+
 def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
     cfg=metals_demo_config_status()
+    ghost_sweep = metals_demo_reconcile_local_ghosts(asset)
     if cfg["missing"] or METALS_DEMO_OANDA_ENV not in {"practice","live"}: return {"ok":False,"skipped":True,"reason":"config_not_ready"}
     response=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades")
     if not response.get("ok"): return {"ok":False,"response":response}
@@ -23478,7 +23724,7 @@ def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
     for q in queued:
         l=dict(q); l["id"]=q.get("link_id"); retries.append({"queue_id":q.get("id"),"link_id":q.get("link_id"),"result":_metals_demo_close(l,int(q["id"]))})
     tx_sync=metals_demo_sync_broker_transactions(force=True)
-    return {"ok":True,"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync}
+    return {"ok":True,"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync,"ghost_reconciliation":ghost_sweep}
 
 
 def metals_demo_summary() -> Dict[str, Any]:
@@ -31227,6 +31473,7 @@ def metals_live_readiness() -> Dict[str, Any]:
         {"name":"No foreign-instrument overlap", "ok": not bool(cfg.get("live_instrument_overlap")), "detail":", ".join(cfg.get("live_instrument_overlap") or []) or "none"},
         {"name":"Risk previews", "ok":previews_ok, "detail":"XAU/XAG long+short sizing"},
         {"name":"Reconciliation", "ok":not missing and not broker_only, "detail":f"local-missing {len(missing)} / broker-only {len(broker_only)}"},
+        {"name":"No local ghost trades", "ok":len(missing)==0, "detail":f"{len(missing)} local OPEN links absent from OANDA"},
         {"name":"Durable queue", "ok":failed==0, "detail":f"{pending} pending / {failed} failed"},
         {"name":"Broker realised accounting", "ok":bool(realized.get("ok")) or METALS_DEMO_OANDA_ENV=="practice", "detail":f"{tx_count} transaction ledger rows"},
         {"name":"48h+ auto management", "ok":bool(METALS_DEMO_BASKET_MANAGER_ENABLED), "detail":"hourly mature-runner manager"},
@@ -31259,6 +31506,10 @@ def metals_live_readiness_endpoint():
 
 
 def _metals_std_broker_html() -> str:
+    try:
+        metals_demo_reconcile_local_ghosts()
+    except Exception:
+        pass
     cfg = metals_demo_config_status()
     broker = metals_demo_live_broker_snapshot()
     acct = broker.get("account") or {}
@@ -31421,6 +31672,10 @@ def _metals_age_zone(hold: Any) -> str:
     return "120+ LATE"
 
 def _metals_std_open_trades_html() -> str:
+    try:
+        metals_demo_reconcile_local_ghosts()
+    except Exception:
+        pass
     snap = metals_demo_summary()
     local = snap.get("open_trades") or []
     broker = metals_demo_live_broker_snapshot()
@@ -31774,7 +32029,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.5.0 Live-Ready Broker Accounting · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.5.1 Ghost Trade Reconciliation · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31825,7 +32080,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.5.0",
+        "version": "v1.5.1",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
