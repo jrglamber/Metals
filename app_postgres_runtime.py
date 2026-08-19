@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.3.9 — Broker Realised Sync Fix"
+APP_NAME = "Project Exit Plan — Metals v1.4.0 — Candidate-Supported Runner"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -23003,14 +23003,71 @@ def _metals_demo_phase(hold: int) -> str:
     return "120_PLUS_LATE_RUNNER"
 
 def _metals_demo_decision(m: Dict[str, Any]) -> Dict[str, Any]:
-    h=int(m.get("hold_candles") or 0); r=safe_float(m.get("current_r")); hwm=safe_float(m.get("high_water_r")); gb=safe_float(m.get("giveback_pct")); support=bool(m.get("direction_support")); reversal=bool(m.get("adverse_reversal")); phase=_metals_demo_phase(h)
-    if h<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES: return {"decision":"HOLD_MIN_48","phase":phase,"reason":"Normal management locked before 48h; emergency broker SL remains active."}
-    if METALS_DEMO_MANAGER_MAX_HOLD_CANDLES>0 and h>=METALS_DEMO_MANAGER_MAX_HOLD_CANDLES: return {"decision":"CLOSE_MAX_HOLD","phase":phase,"reason":"Configured demo max hold reached."}
-    if r is not None and r<=-0.75 and not support: return {"decision":"CLOSE_DERIORATED","phase":phase,"reason":f"Mature trade {r:.2f}R with directional support absent."}
-    if hwm is not None and hwm>=0.75 and gb is not None and gb>=75 and (r or 0)<=0.10: return {"decision":"CLOSE_GIVEBACK","phase":phase,"reason":f"{gb:.1f}% giveback surrendered most of a profitable move."}
-    if hwm is not None and hwm>=1.50 and gb is not None and gb>=65 and not support: return {"decision":"CLOSE_GIVEBACK","phase":phase,"reason":f"Runner gave back {gb:.1f}% from {hwm:.2f}R HWM with support absent."}
-    if reversal and not support and r is not None and r<=0.50: return {"decision":"CLOSE_REVERSAL","phase":phase,"reason":"Opposing structure active and mature trade lacks profit cushion."}
-    return {"decision":"EXTEND","phase":phase,"reason":"Trade remains acceptable; review again on next hourly metal signal."}
+    h=int(m.get("hold_candles") or 0)
+    r=safe_float(m.get("current_r"))
+    hwm=safe_float(m.get("high_water_r"))
+    gb=safe_float(m.get("giveback_pct"))
+    support=bool(m.get("direction_support"))
+    reversal=bool(m.get("adverse_reversal"))
+    phase=_metals_demo_phase(h)
+
+    if h<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES:
+        return {
+            "decision":"HOLD_MIN_48",
+            "phase":phase,
+            "reason":"Normal management locked before 48h; emergency broker SL remains active."
+        }
+
+    # Project Exit Plan mature-runner rule:
+    # 48h is a minimum/first review, never a forced expiry.
+    # Ignore any stale Railway max-hold value; 72/96/120 remain milestones only.
+    # This mirrors the no-forced-max behaviour already used by Live Indices.
+
+    # HARD safety exit: a runner that has surrendered almost all a prior move.
+    # Candidate support does not override severe giveback, matching the Indices
+    # candidate-supported extension rule's too_much_giveback blocker.
+    if hwm is not None and hwm>=0.75 and gb is not None and gb>=75 and (r or 0)<=0.10:
+        return {
+            "decision":"CLOSE_GIVEBACK",
+            "phase":phase,
+            "reason":f"{gb:.1f}% giveback surrendered most of a profitable move."
+        }
+
+    # SOFT post-48 exits are suppressed while the same-direction Metals model
+    # is still producing a qualifying candidate.
+    if support:
+        return {
+            "decision":"EXTEND",
+            "phase":phase,
+            "reason":"candidate_supported_post48_extension_override; same-direction Metals candidate still active."
+        }
+
+    if r is not None and r<=-0.75:
+        return {
+            "decision":"CLOSE_DERIORATED",
+            "phase":phase,
+            "reason":f"Mature trade {r:.2f}R with directional support absent."
+        }
+
+    if hwm is not None and hwm>=1.50 and gb is not None and gb>=65:
+        return {
+            "decision":"CLOSE_GIVEBACK",
+            "phase":phase,
+            "reason":f"Runner gave back {gb:.1f}% from {hwm:.2f}R HWM with support absent."
+        }
+
+    if reversal and r is not None and r<=0.50:
+        return {
+            "decision":"CLOSE_REVERSAL",
+            "phase":phase,
+            "reason":"Opposing structure active and mature trade lacks same-direction candidate support."
+        }
+
+    return {
+        "decision":"EXTEND",
+        "phase":phase,
+        "reason":"Trade remains acceptable; review again on next hourly metal signal."
+    }
 
 def _metals_demo_protect_fraction(hold: int) -> float:
     if hold>=120: return METALS_DEMO_MANAGER_PROTECT_120
@@ -31576,7 +31633,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.3.9 Broker Realised Sync Fix · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.4.0 Candidate-Supported Runner · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -31627,7 +31684,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.3.9",
+        "version": "v1.4.0",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
