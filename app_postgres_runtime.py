@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.6.1 — Trade Age Fix"
+APP_NAME = "Project Exit Plan — Metals v1.6.2 — AI Broker Basket Context"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -30182,39 +30182,79 @@ def _metals_aiobs_candidate(conn, row):
 
 
 def _metals_aiobs_state(conn, raw_signal_id):
+    """
+    Point-in-time Metals observer state using broker-derived basket R/HWM/
+    giveback, matching the production top dashboard rather than stale
+    metals_demo_basket_snapshots research rows.
+    """
     row=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
     if not row:
         return {},{},{}
     asset=_project_scope_pair(row["pair"])
     candidate,side,raw,selected=_metals_aiobs_candidate(conn,row)
-    links=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
-    mature=sum(1 for t in links if int(safe_float(t.get("manager_last_review_candles")) or 0)>=48)
-    basket=conn.execute("""SELECT * FROM metals_demo_basket_snapshots
-                           WHERE basket_key='METALS_BASKET' ORDER BY id DESC LIMIT 1""").fetchone()
-    basket=dict(basket) if basket else {}
-    basket_r=float(safe_float(basket.get("basket_r")) or 0.0)
-    hwm=float(safe_float(basket.get("high_water_r")) or 0.0)
-    give=float(safe_float(basket.get("giveback_pct")) or 0.0)
+
+    links=[dict(r) for r in conn.execute(
+        "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+    ).fetchall()]
+
+    # True trade age for maturity count.
+    broker = metals_demo_live_broker_snapshot()
+    broker_by_id = {
+        safe_str(t.get("id")): t
+        for t in (broker.get("owned_open_trades") or [])
+    }
+    mature=0
+    for t in links:
+        age=_metals_trade_age_hours(
+            t,
+            broker_by_id.get(safe_str(t.get("broker_trade_id")))
+        )
+        if age >= 48:
+            mature += 1
+
+    # Same broker-authoritative state as top dashboard.
+    broker_hwm=_metals_broker_highwater_state(broker)
+    basket_r=float(safe_float(broker_hwm.get("current_r")) or 0.0)
+    hwm=float(safe_float(broker_hwm.get("high_water_r")) or 0.0)
+    give=float(safe_float(broker_hwm.get("giveback_pct")) or 0.0)
 
     other="XAGUSD" if asset=="XAUUSD" else "XAUUSD"
     other_row=_metals_demo_latest_signal_row(conn,other)
-    peer_candidate=False;peer_side=""
+    peer_candidate=False
+    peer_side=""
     if other_row:
         oc,oside,_,_=_metals_aiobs_candidate(conn,other_row)
-        peer_candidate=oc;peer_side=oside
+        peer_candidate=oc
+        peer_side=oside
     peer_supported=bool(candidate and peer_candidate and side and side==peer_side)
 
     return {
-        "asset":asset,"candidate":candidate,"side":side,
-        "peer_asset":other,"peer_candidate":peer_candidate,"peer_side":peer_side,
+        "asset":asset,
+        "candidate":candidate,
+        "side":side,
+        "peer_asset":other,
+        "peer_candidate":peer_candidate,
+        "peer_side":peer_side,
         "peer_supported":peer_supported,
-        "open_count":len(links),"mature_48h_plus":mature,
-        "basket_r":basket_r,"high_water_r":hwm,"giveback_pct":give,
+        "open_count":len(links),
+        "mature_48h_plus":mature,
+
+        # Explicit provenance.
+        "basket_state_source":"OANDA_XAU_XAG_OPEN_PNL",
+        "basket_r":basket_r,
+        "high_water_r":hwm,
+        "giveback_pct":give,
+        "broker_open_pnl_gbp":float(safe_float(broker_hwm.get("current_gbp")) or 0.0),
+        "broker_high_water_gbp":float(safe_float(broker_hwm.get("high_water_gbp")) or 0.0),
+        "broker_giveback_gbp":float(safe_float(broker_hwm.get("giveback_gbp")) or 0.0),
+        "broker_r_linked_count":int(broker_hwm.get("linked_r_count") or 0),
+        "broker_r_unlinked_count":int(broker_hwm.get("unlinked_broker_count") or 0),
+
         "giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),
         "high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),
         "consumed_bank_stages":0,
-        "basket_state":safe_str(basket.get("state")),
-        "basket_action":safe_str(basket.get("action")),
+        "basket_state":"BROKER_ACTIVE" if int(broker_hwm.get("open_count") or 0)>0 else "FLAT",
+        "basket_action":"",
     },raw,selected
 
 
@@ -30284,7 +30324,7 @@ def capture_ai_regime_snapshot(raw_signal_id):
             "counterpart_latest_known":counterpart,
             "event_state":current,
             "recent_history":recent,
-            "research_note":"XAU/XAG family. Snapshot captured before deterministic processing; AI has zero execution authority.",
+            "research_note":"XAU/XAG family. Snapshot captured before deterministic processing; AI has zero execution authority. Basket R/HWM/giveback use broker-derived OANDA XAU/XAG state.",
         }
         snapshot={"captured_at_utc":now_utc_iso(),"event_state":current,"model_input":model_input}
         status="CAPTURED" if api_eligible else "CAPTURED_NO_CALL"
@@ -32784,7 +32824,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.6.1 Trade Age Fix · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.6.2 AI Broker Basket Context · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -32835,7 +32875,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.6.1",
+        "version": "v1.6.2",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
