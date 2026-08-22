@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.6.2 — AI Broker Basket Context"
+APP_NAME = "Project Exit Plan — Metals v1.6.3 — 8H Regime Age Research"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -30341,6 +30341,240 @@ def capture_ai_regime_snapshot(raw_signal_id):
     q=enqueue_ai_regime_observer(raw_signal_id) if api_eligible else {"queued":False,"reason":"event_driven_capture_only"}
     return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,"queue":q,"research_only":True}
 
+
+# ============================================================
+# METALS — 8H REGIME AGE RESEARCH
+# Research-only. No execution/manager authority.
+# ============================================================
+METALS_REGIME_AGE_BUCKETS = (
+    (0.0, 8.0, "0-8h"),
+    (8.0, 16.0, "8-16h"),
+    (16.0, 24.0, "16-24h"),
+    (24.0, 32.0, "24-32h"),
+    (32.0, 48.0, "32-48h"),
+    (48.0, 10**9, "48h+"),
+)
+
+def _metals_regime_age_bucket(hours_value):
+    h = float(safe_float(hours_value) or 0.0)
+    for lo, hi, label in METALS_REGIME_AGE_BUCKETS:
+        if lo <= h < hi:
+            return label
+    return "48h+"
+
+def ensure_metals_regime_age_table():
+    with get_conn() as conn:
+        id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS metals_regime_age_research (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id BIGINT NOT NULL UNIQUE,
+                pair TEXT NOT NULL,
+                signal_time TEXT,
+                regime_8h TEXT,
+                regime_start_time TEXT,
+                regime_age_h REAL,
+                regime_age_bucket TEXT,
+                long_candidate INTEGER DEFAULT 0,
+                short_candidate INTEGER DEFAULT 0,
+                selected_side TEXT,
+                selected_candidate INTEGER DEFAULT 0,
+                source_note TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_regime_age_pair_time ON metals_regime_age_research(pair, signal_time)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_regime_age_regime ON metals_regime_age_research(pair, regime_8h, regime_age_bucket)")
+        conn.commit()
+
+def _metals_context8_from_raw(raw):
+    contexts = raw.get("contexts") or []
+    if isinstance(contexts, list):
+        for c in contexts:
+            if isinstance(c, dict) and safe_str(c.get("context_tf")).strip().upper() == "8H":
+                return c
+    return {"ctx_trend_state": raw.get("ctx_trend_state"), "context_tf": raw.get("context_tf")}
+
+def _metals_regime8_value(raw):
+    ctx8 = _metals_context8_from_raw(raw)
+    s = safe_str(ctx8.get("ctx_trend_state")).strip().upper()
+    if "BULL" in s: return "BULL"
+    if "BEAR" in s: return "BEAR"
+    if s in {"UP","LONG"}: return "BULL"
+    if s in {"DOWN","SHORT"}: return "BEAR"
+    return s or "UNKNOWN"
+
+def _metals_signal_time_from_row(row):
+    return safe_str(row.get("timestamp_readable") or row.get("timestamp") or row.get("created_at_utc"))
+
+def _metals_raw_from_row_for_regime_age(row):
+    try:
+        return _raw_signal_json(row)
+    except Exception:
+        try:
+            return json.loads(safe_str(row.get("raw_json")) or "{}")
+        except Exception:
+            return {}
+
+def _metals_compute_regime_age(conn, raw_signal_id, pair, regime_8h, signal_time):
+    current_dt = parse_dt(signal_time)
+    if current_dt is None:
+        return {"regime_start_time": signal_time, "regime_age_h": 0.0, "regime_age_bucket": "0-8h"}
+
+    rows = conn.execute(
+        "SELECT * FROM raw_signals WHERE pair=? AND id<=? ORDER BY id DESC LIMIT 500",
+        (pair, int(raw_signal_id))
+    ).fetchall()
+
+    start_dt = current_dt
+    for rr in rows:
+        d = dict(rr)
+        raw = _metals_raw_from_row_for_regime_age(d)
+        rr_regime = _metals_regime8_value(raw)
+        rr_dt = parse_dt(_metals_signal_time_from_row(d))
+        if rr_regime != regime_8h:
+            break
+        if rr_dt is not None:
+            start_dt = rr_dt
+
+    age_h = max(0.0, (current_dt - start_dt).total_seconds() / 3600.0)
+    return {
+        "regime_start_time": start_dt.isoformat(),
+        "regime_age_h": age_h,
+        "regime_age_bucket": _metals_regime_age_bucket(age_h),
+    }
+
+def record_metals_regime_age_research(raw_signal_id):
+    ensure_metals_regime_age_table()
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM metals_regime_age_research WHERE raw_signal_id=? LIMIT 1",
+            (int(raw_signal_id),)
+        ).fetchone()
+        if existing:
+            return dict(existing)
+
+        row = conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1", (int(raw_signal_id),)).fetchone()
+        if not row:
+            return {"ok": False, "reason": "raw_signal_missing"}
+        row = dict(row)
+        raw = _metals_raw_from_row_for_regime_age(row)
+
+        pair = _project_scope_pair(row.get("pair") or raw.get("pair"))
+        signal_time = _metals_signal_time_from_row(row)
+        regime_8h = _metals_regime8_value(raw)
+        age = _metals_compute_regime_age(conn, int(raw_signal_id), pair, regime_8h, signal_time)
+
+        try:
+            selected = metals_demo_candidate_for_row(raw, row)
+        except Exception:
+            selected = {}
+
+        selected_candidate = 1 if int(safe_float(selected.get("demo_candidate")) or 0) == 1 else 0
+        selected_side = safe_str(selected.get("demo_side")).lower()
+
+        long_candidate = 1 if (
+            truthy(raw.get("metal_long_candidate"))
+            if "truthy" in globals() else bool(raw.get("metal_long_candidate"))
+        ) else 0
+        short_candidate = 1 if (
+            truthy(raw.get("metal_short_candidate"))
+            if "truthy" in globals() else bool(raw.get("metal_short_candidate"))
+        ) else 0
+
+        if selected_candidate and selected_side == "long":
+            long_candidate = 1
+        if selected_candidate and selected_side == "short":
+            short_candidate = 1
+
+        conn.execute("""
+            INSERT INTO metals_regime_age_research(
+                created_at_utc, raw_signal_id, pair, signal_time,
+                regime_8h, regime_start_time, regime_age_h, regime_age_bucket,
+                long_candidate, short_candidate, selected_side, selected_candidate,
+                source_note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_utc_iso(), int(raw_signal_id), pair, signal_time,
+            regime_8h, age["regime_start_time"], float(age["regime_age_h"]),
+            age["regime_age_bucket"], long_candidate, short_candidate,
+            selected_side, selected_candidate,
+            "research_only_point_in_time_8h_regime_age"
+        ))
+        conn.commit()
+
+        return {
+            "ok": True,
+            "raw_signal_id": int(raw_signal_id),
+            "pair": pair,
+            "regime_8h": regime_8h,
+            "regime_start_time": age["regime_start_time"],
+            "regime_age_h": float(age["regime_age_h"]),
+            "regime_age_bucket": age["regime_age_bucket"],
+            "selected_side": selected_side,
+            "selected_candidate": bool(selected_candidate),
+            "research_only": True,
+        }
+
+def build_metals_regime_age_research_html():
+    ensure_metals_regime_age_table()
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_regime_age_research ORDER BY id DESC LIMIT 100"
+        ).fetchall()]
+    if not rows:
+        return '<div class="section-note small">No 8H regime-age research rows yet. The next Metals signal will start prospective logging.</div>'
+
+    trs = ""
+    for r in rows:
+        side = "LONG" if int(safe_float(r.get("long_candidate")) or 0) else ("SHORT" if int(safe_float(r.get("short_candidate")) or 0) else "—")
+        trs += f"""<tr>
+          <td>{esc(r.get('signal_time'))}</td>
+          <td><strong>{esc(r.get('pair'))}</strong></td>
+          <td><strong>{esc(r.get('regime_8h'))}</strong></td>
+          <td>{float(safe_float(r.get('regime_age_h')) or 0.0):.1f}h</td>
+          <td>{esc(r.get('regime_age_bucket'))}</td>
+          <td>{side}</td>
+          <td>{'YES' if int(safe_float(r.get('selected_candidate')) or 0) else 'NO'}</td>
+        </tr>"""
+
+    return f"""
+      <div class="section-note small">
+        <strong>Research only.</strong> Prospective age of the current confirmed 8H regime.
+        It has no entry, exit, sizing, stop, peer-confirmation or manager authority.
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Candle</th><th>Asset</th><th>8H Regime</th><th>Regime Age</th><th>Age Bucket</th><th>Candidate Side</th><th>Selected</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table></div>
+      <div class="section-note small"><a href="/export/metals-regime-age.csv">Export Metals 8H Regime Age CSV</a></div>
+    """
+
+@app.get("/export/metals-regime-age.csv")
+def export_metals_regime_age_csv(limit: int = 50000):
+    ensure_metals_regime_age_table()
+    limit = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_regime_age_research ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()]
+    out = io.StringIO()
+    if rows:
+        fields = []
+        for r in rows:
+            for k in r:
+                if k not in fields: fields.append(k)
+        w = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+        w.writeheader(); w.writerows(rows)
+    else:
+        out.write("note\nNo Metals regime-age research rows yet\n")
+    return Response(
+        content=out.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="metals-regime-age.csv"'}
+    )
+
 # ============================================================
 # WEBHOOK
 # ============================================================
@@ -30460,6 +30694,12 @@ async def tradingview_webhook(
             },
         )
 
+    # Record prospective 8H regime-age research BEFORE deterministic processing.
+    try:
+        regime_age_research = record_metals_regime_age_research(int(new_id))
+    except Exception as _regage_exc:
+        regime_age_research = {"ok":False,"research_only":True,"error":f"{type(_regage_exc).__name__}: {_regage_exc}"}
+
     # Freeze AI regime-observer evidence BEFORE deterministic signal/broker processing.
     try:
         ai_regime_observer = capture_ai_regime_snapshot(int(new_id))
@@ -30490,6 +30730,7 @@ async def tradingview_webhook(
         "received_at_utc": received_at,
         "broker_auto_maintenance": broker_auto_maintenance,
         "ai_regime_observer": ai_regime_observer,
+        "regime_age_research": regime_age_research,
     }
 
 
@@ -31677,6 +31918,7 @@ def _mf_table(title,rows,cols):
 
 def build_metals_focused_research_html():
     return '<div class="section-note small"><strong>Focused Metals research.</strong> Same evidence themes as the Indices master plus the event-driven AI Regime Observer. All AI output is research-only with zero execution authority.</div>' + \
+      '<details class="research-inner"><summary>8H Regime Age — Prospective Research</summary><div class="research-inner-body">' + build_metals_regime_age_research_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
@@ -32824,7 +33066,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">v1.6.2 AI Broker Basket Context · XAU + XAG · OANDA practice only</div>
+<div class="sub">v1.6.3 8H Regime Age Research · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -32875,7 +33117,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.6.2",
+        "version": "v1.6.3",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
