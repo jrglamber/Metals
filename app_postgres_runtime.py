@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.6.3 — 8H Regime Age Research"
+APP_NAME = "Project Exit Plan — Metals v1.6.4 — Manager Resilience + Risk Visibility"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1020,6 +1020,12 @@ METALS_DEMO_BASKET_NORMAL_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_NORMAL_LO
 METALS_DEMO_BASKET_SEVERE_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_SEVERE_LOSS_R", "-5.0"))
 METALS_DEMO_BASKET_GIVEBACK_WARN_PCT = float(os.getenv("METALS_DEMO_BASKET_GIVEBACK_WARN_PCT", "70"))
 METALS_DEMO_MANAGER_VERSION = "metals_demo_basket_manager_v1_hourly_post48_long_short"
+# v1.6.4 — resilient metals manager maintenance.
+# The strategy still makes management decisions only on a NEW stored hourly metals signal.
+# This worker self-heals missed post-signal reconciliation after deploy/restart/worker errors
+# and retries queued closes, without inventing extra intra-hour strategy decisions.
+METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED = env_bool("METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED", True)
+METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS = max(30.0, min(float(os.getenv("METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS", "60")), 300.0))
 
 app = FastAPI(title=APP_NAME)
 
@@ -10262,6 +10268,173 @@ def start_broker_retry_background_worker() -> None:
         pass
 
 
+# ============================================================
+# v1.6.4 - RESILIENT METALS MANAGER MAINTENANCE WORKER
+# ============================================================
+_metals_demo_manager_worker_started = False
+_metals_demo_manager_worker_thread: Optional[threading.Thread] = None
+_metals_demo_manager_worker_last_heartbeat_utc = ""
+_metals_demo_manager_worker_last_result: Dict[str, Any] = {}
+_metals_demo_manager_worker_lock = threading.Lock()
+
+
+def metals_demo_manager_worker_status() -> Dict[str, Any]:
+    return {
+        "enabled": bool(METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED),
+        "started_flag": bool(_metals_demo_manager_worker_started),
+        "thread_alive": bool(_metals_demo_manager_worker_thread and _metals_demo_manager_worker_thread.is_alive()),
+        "thread_name": safe_str(getattr(_metals_demo_manager_worker_thread, "name", "")),
+        "last_heartbeat_utc": _metals_demo_manager_worker_last_heartbeat_utc,
+        "interval_seconds": METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS,
+        "last_result": _metals_demo_manager_worker_last_result,
+        "decision_cadence": "new_hourly_metals_signal_only",
+    }
+
+
+def _metals_demo_asset_reconcile_needed(asset: str) -> Dict[str, Any]:
+    """Return whether an asset needs a self-healing manager reconcile.
+
+    We deliberately do NOT reconcile every minute just because the worker wakes up.
+    A full manager pass is needed only when:
+    - an OPEN trade has not yet been reviewed against the latest stored asset signal; or
+    - a persistent CLOSE queue item is waiting/retrying.
+
+    This preserves the agreed hourly post-48 strategy cadence while making restart /
+    missed-worker recovery automatic.
+    """
+    a = _metals_demo_asset(asset)
+    with get_conn() as conn:
+        latest = _metals_demo_latest_signal_row(conn, a)
+        latest_id = int(latest["id"]) if latest else None
+        opens = [dict(r) for r in conn.execute(
+            "SELECT id, manager_last_review_signal_id FROM metals_demo_trade_links WHERE status='OPEN' AND asset=?",
+            (a,),
+        ).fetchall()]
+        pending_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM metals_demo_action_queue q
+            JOIN metals_demo_trade_links l ON l.id=q.link_id
+            WHERE l.asset=? AND l.status='OPEN' AND q.action='CLOSE' AND q.status IN ('PENDING','RETRY')
+            """,
+            (a,),
+        ).fetchone()
+        pending = int(pending_row["c"] if pending_row else 0)
+
+    stale_links = []
+    if latest_id is not None:
+        stale_links = [
+            int(r["id"]) for r in opens
+            if int(r.get("manager_last_review_signal_id") or 0) != latest_id
+        ]
+    return {
+        "asset": a,
+        "latest_signal_id": latest_id,
+        "open_count": len(opens),
+        "stale_link_ids": stale_links,
+        "pending_close_count": pending,
+        "needed": bool((latest_id is not None and stale_links) or pending > 0),
+    }
+
+
+def run_metals_demo_manager_maintenance_tick(source: str = "background_worker") -> Dict[str, Any]:
+    global _metals_demo_manager_worker_last_result
+    result: Dict[str, Any] = {
+        "ok": True,
+        "source": source,
+        "time_utc": now_utc_iso(),
+        "assets": {},
+    }
+    cfg = metals_demo_config_status()
+    if not METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED:
+        result.update({"skipped": True, "reason": "worker_disabled"})
+        _metals_demo_manager_worker_last_result = result
+        return result
+    if not METALS_DEMO_BASKET_MANAGER_ENABLED:
+        result.update({"skipped": True, "reason": "basket_manager_disabled"})
+        _metals_demo_manager_worker_last_result = result
+        return result
+    if not METALS_DEMO_BROKER_ENABLED:
+        result.update({"skipped": True, "reason": "metals_demo_broker_disabled"})
+        _metals_demo_manager_worker_last_result = result
+        return result
+    if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
+        result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
+        _metals_demo_manager_worker_last_result = result
+        return result
+
+    for asset in ["XAUUSD", "XAGUSD"]:
+        check = _metals_demo_asset_reconcile_needed(asset)
+        asset_result: Dict[str, Any] = {"check": check, "reconciled": False}
+        if check.get("needed"):
+            try:
+                asset_result["result"] = metals_demo_reconcile_and_close(asset)
+                asset_result["reconciled"] = True
+            except Exception as e:
+                result["ok"] = False
+                asset_result["error"] = f"{type(e).__name__}: {e}"
+        result["assets"][asset] = asset_result
+
+    _metals_demo_manager_worker_last_result = result
+    if not result.get("ok"):
+        try:
+            log_system_event("metals_demo_manager_worker_warning", json.dumps(result, default=str)[:1800])
+        except Exception:
+            pass
+    return result
+
+
+def metals_demo_manager_background_loop() -> None:
+    global _metals_demo_manager_worker_last_heartbeat_utc
+    try:
+        log_system_event(
+            "metals_demo_manager_worker_started",
+            f"Metals manager maintenance started; interval={METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS}s; decisions remain new-signal-only",
+        )
+    except Exception:
+        pass
+    while True:
+        _metals_demo_manager_worker_last_heartbeat_utc = now_utc_iso()
+        try:
+            acquired = _metals_demo_manager_worker_lock.acquire(blocking=False)
+            if acquired:
+                try:
+                    run_metals_demo_manager_maintenance_tick("background_worker")
+                finally:
+                    _metals_demo_manager_worker_lock.release()
+        except Exception as e:
+            try:
+                log_system_event("metals_demo_manager_worker_error", safe_str(e)[:1800])
+            except Exception:
+                pass
+        _metals_demo_manager_worker_last_heartbeat_utc = now_utc_iso()
+        time.sleep(METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS)
+
+
+def start_metals_demo_manager_background_worker() -> None:
+    global _metals_demo_manager_worker_started, _metals_demo_manager_worker_thread
+    if not METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED:
+        try:
+            log_system_event("metals_demo_manager_worker_disabled", "METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED=false")
+        except Exception:
+            pass
+        return
+    if _metals_demo_manager_worker_thread is not None and _metals_demo_manager_worker_thread.is_alive():
+        _metals_demo_manager_worker_started = True
+        return
+    _metals_demo_manager_worker_started = True
+    _metals_demo_manager_worker_thread = threading.Thread(
+        target=metals_demo_manager_background_loop,
+        name="metals-demo-manager-maintenance",
+        daemon=True,
+    )
+    _metals_demo_manager_worker_thread.start()
+    try:
+        log_system_event("metals_demo_manager_worker_thread_started", json.dumps(metals_demo_manager_worker_status(), default=str)[:1200])
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -10275,6 +10448,12 @@ def startup() -> None:
         pass
     try:
         start_broker_retry_background_worker()
+    except Exception:
+        pass
+    try:
+        # Starts with an immediate maintenance tick, so existing OPEN metals
+        # trades are backfilled/reviewed after a deploy without waiting for Monday's next signal.
+        start_metals_demo_manager_background_worker()
     except Exception:
         pass
 
@@ -23750,19 +23929,23 @@ def metals_demo_summary() -> Dict[str, Any]:
     broker_realized=metals_demo_broker_realized_summary()
     actual_closed=float(safe_float(broker_realized.get("net_realized_gbp")) or 0.0)
     fixed=[safe_float(r.get("fixed_48h_r")) for r in links]; fixed=[float(v) for v in fixed if v is not None]
-    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review. Background maintenance self-heals missed/restart reconciliation without adding intra-hour decisions.","manager_worker":metals_demo_manager_worker_status(),"recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
     except Exception as e: return f'<details class="priority"><summary>Metals Demo Basket Manager</summary><div class="section-note warn">Unavailable: {esc(e)}</div></details>'
     cfg=snap["config"]; state="ENABLED" if cfg.get("orders_allowed") else "DISABLED / PREVIEW"; lane_class="status_green" if cfg.get("orders_allowed") else "status_amber"
+    worker=snap.get("manager_worker") or {}; worker_state="ALIVE" if worker.get("thread_alive") else ("DISABLED" if not worker.get("enabled") else "NOT RUNNING")
+    xau_prev=(snap.get("previews") or {}).get("XAUUSD_LONG") or {}; xag_prev=(snap.get("previews") or {}).get("XAGUSD_LONG") or {}
+    xau_req=safe_float(xau_prev.get("requested_risk_gbp")); xau_eff=safe_float(xau_prev.get("estimated_risk_gbp")); xag_req=safe_float(xag_prev.get("requested_risk_gbp")); xag_eff=safe_float(xag_prev.get("estimated_risk_gbp"))
+    risk_visibility=(f"XAU requested {money(xau_req,'GBP')} → effective {money(xau_eff,'GBP')}" if xau_eff is not None else f"XAU requested {money(xau_req,'GBP')} → effective n/a") + " | " + (f"XAG requested {money(xag_req,'GBP')} → effective {money(xag_eff,'GBP')}" if xag_eff is not None else f"XAG requested {money(xag_req,'GBP')} → effective n/a")
     sig=""
     for asset in ["XAUUSD","XAGUSD"]:
         item=snap["latest"].get(asset,{}); lc=item.get("long") or {}; sc=item.get("short_v2") or {}; sel=item.get("selected_demo_candidate") or {}; sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td><strong>{esc(sel.get('demo_side') or '-')}</strong></td></tr>"
     opens=""
     for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
     opens=opens or '<tr><td colspan="10">No open metals demo trades.</td></tr>'
-    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
+    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'} | Worker: {esc(worker_state)}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><div class='section-note small'><strong>Effective risk at current OANDA minimum size:</strong> {esc(risk_visibility)}. Any minimum-size overage is explicitly demo-only and is retained in audit/export data.</div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
 
 
 @app.get("/metals-short-shadow-v2")
@@ -23790,6 +23973,12 @@ def export_metals_short_shadow_v2_summary(limit: int = RESEARCH_ROW_EXPORT_LIMIT
 
 @app.get("/broker/metals-demo/status")
 def metals_demo_status_route() -> Dict[str, Any]: return metals_demo_summary()
+
+@app.get("/broker/metals-demo/manager-worker-status")
+def metals_demo_manager_worker_status_route() -> Dict[str, Any]: return metals_demo_manager_worker_status()
+
+@app.post("/broker/metals-demo/manager-maintenance")
+def metals_demo_manager_maintenance_route() -> Dict[str, Any]: return run_metals_demo_manager_maintenance_tick("manual_route")
 
 @app.get("/broker/metals-demo/preview/{asset}")
 def metals_demo_preview_route(asset: str, side: str = "short") -> Dict[str, Any]: return metals_demo_sizing_preview(asset, side)
