@@ -25,8 +25,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.6"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Historical HWM Repair + Weekend-Safe Recovery"
+METALS_APP_VERSION = "v1.6.7"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — HWM Repair + Focused Research Restore"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -24780,6 +24780,607 @@ def _metals_std_execution_html() -> str:
         <a href="/export/metals-demo-basket-snapshots.csv">basket snapshots CSV</a>
       </div>
     """
+
+
+# ============================================================
+# v1.6.7 — RESTORED FOCUSED METALS RESEARCH
+# Research-only. Never consumed by execution/management.
+#
+# This block existed in the earlier Metals build but was omitted from the
+# v1.6.6 source while the dashboard registry still referenced it. That caused
+# module import to fail before Uvicorn could start.
+# ============================================================
+METALS_FOCUSED_THRESHOLDS = [40, 60, 75, 100, 150, 200, 300, 400, 500, 600]
+METALS_FOCUSED_HORIZONS = [6, 12, 24, 48]
+METALS_FOCUSED_EFFICIENCY_LOOKBACKS = [8, 12, 24]
+
+
+def ensure_metals_focused_research_tables() -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_focused_efficiency (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER,
+                asset TEXT,
+                signal_time TEXT,
+                lookback_candles INTEGER,
+                candles_found INTEGER,
+                net_move_pct REAL,
+                path_travelled_pct REAL,
+                efficiency REAL,
+                state TEXT,
+                UNIQUE(raw_signal_id, lookback_candles)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_focused_alignment (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER UNIQUE,
+                signal_time TEXT,
+                state TEXT,
+                xau_8h REAL,
+                xag_8h REAL,
+                xau_24h REAL,
+                xag_24h REAL,
+                xau_candidate INTEGER,
+                xag_candidate INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_focused_recovery (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER UNIQUE,
+                cycle_id TEXT,
+                trigger_signal_time TEXT,
+                trigger_status TEXT,
+                trigger_action TEXT,
+                trigger_open_count INTEGER,
+                trigger_r REAL,
+                trigger_hwm_r REAL,
+                trigger_giveback_pct REAL,
+                outcome_6_r REAL,
+                outcome_12_r REAL,
+                outcome_24_r REAL,
+                outcome_48_r REAL,
+                completed_48 INTEGER DEFAULT 0,
+                updated_at_utc TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_focused_highwater (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                cycle_id TEXT,
+                threshold_r REAL,
+                trigger_raw_signal_id INTEGER,
+                trigger_signal_time TEXT,
+                trigger_r REAL,
+                trigger_hwm_r REAL,
+                trigger_giveback_pct REAL,
+                trigger_banked_r REAL,
+                outcome_6_r REAL,
+                outcome_12_r REAL,
+                outcome_24_r REAL,
+                outcome_48_r REAL,
+                completed_48 INTEGER DEFAULT 0,
+                updated_at_utc TEXT,
+                UNIQUE(cycle_id, threshold_r)
+            )
+        """)
+        conn.commit()
+
+
+def _mf_asset_return(conn: Any, asset: str, raw_id: int, lookback: int) -> Optional[float]:
+    if int(raw_id or 0) <= 0:
+        return None
+    rows = conn.execute("""
+        SELECT exec_close
+        FROM raw_signals
+        WHERE UPPER(pair)=?
+          AND exec_close IS NOT NULL
+          AND id<=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (safe_str(asset).upper(), int(raw_id), int(lookback) + 1)).fetchall()
+    closes = [safe_float(r["exec_close"]) for r in reversed(rows)]
+    closes = [float(x) for x in closes if x is not None]
+    if len(closes) < 2 or closes[0] == 0:
+        return None
+    return (closes[-1] / closes[0] - 1.0) * 100.0
+
+
+def _mf_eff_state(value: Any) -> str:
+    x = safe_float(value)
+    if x is None:
+        return "INSUFFICIENT_DATA"
+    if x < 0.25:
+        return "CHOPPY"
+    if x < 0.40:
+        return "MIXED"
+    if x < 0.60:
+        return "TRENDING"
+    return "CLEAN_TREND"
+
+
+def _mf_family_state() -> Dict[str, Any]:
+    """Read the latest research-only FAMILY basket state."""
+    with get_conn() as conn:
+        snap = conn.execute("""
+            SELECT *
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              AND scope='FAMILY'
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+        first_open = conn.execute("""
+            SELECT MIN(created_at_utc) AS t
+            FROM metals_demo_trade_links
+            WHERE UPPER(COALESCE(status,'')) IN ('OPEN','LINKED','PENDING')
+        """).fetchone()
+
+    d = dict(snap) if snap else {}
+    n = int(safe_float(d.get("open_count")) or 0)
+    start = safe_str(first_open["t"] if first_open else "")
+    return {
+        "cycle_id": ("METALS_" + start) if n > 0 and start else "",
+        "open_count": n,
+        "r": float(safe_float(d.get("basket_r")) or 0.0),
+        "hwm": float(safe_float(d.get("high_water_r")) or 0.0),
+        "giveback": float(safe_float(d.get("giveback_pct")) or 0.0),
+        "status": safe_str(d.get("state") or ("FLAT" if n <= 0 else "GREEN")).upper(),
+        "action": safe_str(d.get("action") or ""),
+        "banked_r": 0.0,
+    }
+
+
+def _mf_elapsed(conn: Any, raw_id: int) -> int:
+    row = conn.execute("""
+        SELECT COUNT(DISTINCT timestamp_readable) AS c
+        FROM raw_signals
+        WHERE id>?
+          AND timestamp_readable IS NOT NULL
+          AND timestamp_readable<>''
+    """, (int(raw_id),)).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def record_metals_focused_research(raw_signal_id: int) -> Dict[str, Any]:
+    """Restore the prospective focused-research recorder.
+
+    It is deliberately isolated from entries, exits, sizing, stops and manager
+    decisions. Errors are returned as research errors and never alter strategy.
+    """
+    try:
+        ensure_metals_focused_research_tables()
+        raw_signal_id = int(raw_signal_id or 0)
+
+        with get_conn() as conn:
+            raw = conn.execute(
+                "SELECT * FROM raw_signals WHERE id=? LIMIT 1",
+                (raw_signal_id,),
+            ).fetchone()
+            if not raw:
+                return {"ok": False, "research_only": True, "reason": "raw_signal_not_found"}
+
+            d = dict(raw)
+            asset = safe_str(d.get("pair")).upper()
+            sig = safe_str(d.get("timestamp_readable"))
+
+            # Trend efficiency / chop.
+            for lb in METALS_FOCUSED_EFFICIENCY_LOOKBACKS:
+                rows = conn.execute("""
+                    SELECT exec_close
+                    FROM raw_signals
+                    WHERE UPPER(pair)=?
+                      AND exec_close IS NOT NULL
+                      AND id<=?
+                    ORDER BY id DESC
+                    LIMIT ?
+                """, (asset, raw_signal_id, lb + 1)).fetchall()
+
+                closes = [safe_float(r["exec_close"]) for r in reversed(rows)]
+                closes = [float(x) for x in closes if x is not None]
+                eff = net = path = None
+                if len(closes) >= 2 and closes[0]:
+                    net_abs = abs(closes[-1] - closes[0])
+                    path_abs = sum(abs(b - a) for a, b in zip(closes[:-1], closes[1:]))
+                    net = abs((closes[-1] / closes[0] - 1.0) * 100.0)
+                    path = sum(
+                        abs((b / a - 1.0) * 100.0)
+                        for a, b in zip(closes[:-1], closes[1:])
+                        if a
+                    )
+                    eff = net_abs / path_abs if path_abs else None
+
+                conn.execute("""
+                    INSERT INTO metals_focused_efficiency(
+                        created_at_utc,raw_signal_id,asset,signal_time,
+                        lookback_candles,candles_found,net_move_pct,
+                        path_travelled_pct,efficiency,state
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(raw_signal_id,lookback_candles) DO NOTHING
+                """, (
+                    now_utc_iso(), raw_signal_id, asset, sig, lb, len(closes),
+                    net, path, eff, _mf_eff_state(eff),
+                ))
+
+            # XAU/XAG point-in-time alignment.
+            latest: Dict[str, Dict[str, Any]] = {}
+            for a in ("XAUUSD", "XAGUSD"):
+                rr = conn.execute("""
+                    SELECT *
+                    FROM raw_signals
+                    WHERE UPPER(pair)=?
+                      AND id<=?
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (a, raw_signal_id)).fetchone()
+                latest[a] = dict(rr) if rr else {}
+
+            xau, xag = latest["XAUUSD"], latest["XAGUSD"]
+            x8 = _mf_asset_return(conn, "XAUUSD", int(xau.get("id") or 0), 8)
+            g8 = _mf_asset_return(conn, "XAGUSD", int(xag.get("id") or 0), 8)
+            x24 = _mf_asset_return(conn, "XAUUSD", int(xau.get("id") or 0), 24)
+            g24 = _mf_asset_return(conn, "XAGUSD", int(xag.get("id") or 0), 24)
+
+            if x8 is None or g8 is None:
+                alignment = "INSUFFICIENT_DATA"
+            elif x8 > 0 and g8 > 0:
+                alignment = "ALIGNED_UP"
+            elif x8 < 0 and g8 < 0:
+                alignment = "ALIGNED_DOWN"
+            elif (x8 > 0 > g8) or (g8 > 0 > x8):
+                alignment = "DIVERGENT"
+            else:
+                alignment = "MIXED"
+
+            conn.execute("""
+                INSERT INTO metals_focused_alignment(
+                    created_at_utc,raw_signal_id,signal_time,state,
+                    xau_8h,xag_8h,xau_24h,xag_24h,xau_candidate,xag_candidate
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(raw_signal_id) DO NOTHING
+            """, (
+                now_utc_iso(), raw_signal_id, sig, alignment,
+                x8, g8, x24, g24,
+                1 if is_true(xau.get("forward_test_candidate")) else 0,
+                1 if is_true(xag.get("forward_test_candidate")) else 0,
+            ))
+
+            state = _mf_family_state()
+
+            # Fill future outcomes for prior prospective triggers.
+            for table in ("metals_focused_recovery", "metals_focused_highwater"):
+                pending = conn.execute(
+                    f"SELECT * FROM {table} "
+                    "WHERE COALESCE(completed_48,0)=0 ORDER BY id ASC LIMIT 500"
+                ).fetchall()
+                for prior in pending:
+                    pd = dict(prior)
+                    trigger_id = int(
+                        pd.get("raw_signal_id")
+                        or pd.get("trigger_raw_signal_id")
+                        or 0
+                    )
+                    elapsed = _mf_elapsed(conn, trigger_id)
+                    sets = []
+                    vals = []
+                    for h in METALS_FOCUSED_HORIZONS:
+                        col = f"outcome_{h}_r"
+                        if elapsed >= h and safe_float(pd.get(col)) is None:
+                            sets.append(f"{col}=?")
+                            vals.append(state["r"])
+                            if h == 48:
+                                sets.append("completed_48=?")
+                                vals.append(1)
+                    if sets:
+                        sets.append("updated_at_utc=?")
+                        vals.extend([now_utc_iso(), int(pd["id"])])
+                        conn.execute(
+                            f"UPDATE {table} SET {', '.join(sets)} WHERE id=?",
+                            tuple(vals),
+                        )
+
+            warning_state = (
+                state["open_count"] > 0
+                and (
+                    state["status"] in {"AMBER", "RED", "CRITICAL"}
+                    or state["giveback"] >= 40
+                    or state["r"] < 0
+                    or any(
+                        k in state["action"].upper()
+                        for k in ("PAUSE", "CLOSE", "REDUCE", "DEFENCE", "DEFENSE")
+                    )
+                )
+            )
+            if warning_state:
+                conn.execute("""
+                    INSERT INTO metals_focused_recovery(
+                        created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,
+                        trigger_status,trigger_action,trigger_open_count,trigger_r,
+                        trigger_hwm_r,trigger_giveback_pct,updated_at_utc
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(raw_signal_id) DO NOTHING
+                """, (
+                    now_utc_iso(), raw_signal_id, state["cycle_id"], sig,
+                    state["status"], state["action"], state["open_count"],
+                    state["r"], state["hwm"], state["giveback"], now_utc_iso(),
+                ))
+
+            if state["cycle_id"] and state["open_count"] > 0:
+                for threshold in METALS_FOCUSED_THRESHOLDS:
+                    if state["hwm"] >= threshold:
+                        conn.execute("""
+                            INSERT INTO metals_focused_highwater(
+                                created_at_utc,cycle_id,threshold_r,
+                                trigger_raw_signal_id,trigger_signal_time,
+                                trigger_r,trigger_hwm_r,trigger_giveback_pct,
+                                trigger_banked_r,updated_at_utc
+                            )
+                            VALUES(?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(cycle_id,threshold_r) DO NOTHING
+                        """, (
+                            now_utc_iso(), state["cycle_id"], threshold,
+                            raw_signal_id, sig, state["r"], state["hwm"],
+                            state["giveback"], state["banked_r"], now_utc_iso(),
+                        ))
+
+            conn.commit()
+
+        return {"ok": True, "research_only": True}
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "research_only": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _mf_rows(table: str, limit: int = 5000) -> List[Dict[str, Any]]:
+    ensure_metals_focused_research_tables()
+    allowed = {
+        "metals_focused_highwater",
+        "metals_focused_alignment",
+        "metals_focused_efficiency",
+        "metals_focused_recovery",
+        "metals_demo_xag_confirmation_guard",
+    }
+    if table not in allowed:
+        raise ValueError(f"unsupported focused research table: {table}")
+    with get_conn() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 100000)),),
+            ).fetchall()
+        ]
+
+
+def _mf_table(title: str, rows: List[Dict[str, Any]], cols: List[str]) -> str:
+    body = "".join(
+        "<tr>" + "".join(f"<td>{esc(r.get(c))}</td>" for c in cols) + "</tr>"
+        for r in rows[:50]
+    ) or f'<tr><td colspan="{len(cols)}">No research rows yet.</td></tr>'
+    head = "".join(f"<th>{esc(c.replace('_',' ').title())}</th>" for c in cols)
+    return (
+        f'<details class="research-inner"><summary>{esc(title)}</summary>'
+        f'<div class="research-inner-body"><div class="table-scroll"><table>'
+        f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
+    )
+
+
+def build_metals_focused_research_html() -> str:
+    """Research dashboard that cannot prevent app startup if optional panels are absent."""
+    optional_panels = ""
+
+    regime_builder = globals().get("build_metals_regime_age_research_html")
+    if callable(regime_builder):
+        try:
+            optional_panels += (
+                '<details class="research-inner"><summary>8H Regime Age — Prospective Research</summary>'
+                '<div class="research-inner-body">'
+                + regime_builder()
+                + '</div></details>'
+            )
+        except Exception as exc:
+            optional_panels += (
+                '<div class="section-note warn">8H regime-age panel unavailable: '
+                + esc(f"{type(exc).__name__}: {exc}")
+                + '</div>'
+            )
+
+    ai_builder = globals().get("build_ai_regime_observer_html")
+    if callable(ai_builder):
+        try:
+            optional_panels += (
+                '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary>'
+                '<div class="research-inner-body">'
+                + ai_builder()
+                + '</div></details>'
+            )
+        except Exception as exc:
+            optional_panels += (
+                '<div class="section-note warn">AI regime-observer panel unavailable: '
+                + esc(f"{type(exc).__name__}: {exc}")
+                + '</div>'
+            )
+
+    return (
+        '<div class="section-note small"><strong>Focused Metals research.</strong> '
+        'Prospective evidence only; zero execution authority.</div>'
+        + optional_panels
+        + _mf_table(
+            "Live High-Water / Banking Outcomes",
+            _mf_rows("metals_focused_highwater", 100),
+            [
+                "threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r",
+                "trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r",
+            ],
+        )
+        + _mf_table(
+            "XAU / XAG Alignment / Divergence",
+            _mf_rows("metals_focused_alignment", 100),
+            [
+                "signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h",
+                "xau_candidate","xag_candidate",
+            ],
+        )
+        + _mf_table(
+            "Trend Efficiency / Chop Research",
+            _mf_rows("metals_focused_efficiency", 150),
+            [
+                "asset","signal_time","lookback_candles","efficiency","state",
+                "net_move_pct","path_travelled_pct",
+            ],
+        )
+        + _mf_table(
+            "Basket Recovery / Red-State Outcomes",
+            _mf_rows("metals_focused_recovery", 100),
+            [
+                "trigger_signal_time","trigger_status","trigger_action","trigger_open_count",
+                "trigger_r","trigger_hwm_r","trigger_giveback_pct",
+                "outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r",
+            ],
+        )
+        + _mf_table(
+            "XAG → XAU Confirmation Guard",
+            _mf_rows("metals_demo_xag_confirmation_guard", 150),
+            [
+                "signal_time","xag_side","campaign_entry_count_before",
+                "xau_confirmation_found","xau_confirmation_time",
+                "xau_confirmation_age_hours","allow_entry","decision","reason",
+                "outcome_48h_r","outcome_72h_r","outcome_96h_r",
+            ],
+        )
+        + '<details class="research-inner"><summary>Strategy Model Evidence</summary>'
+          '<div class="section-note small">'
+          '<a href="/metals-short-shadow-v2">Short v2 JSON</a> · '
+          '<a href="/export/metals-short-shadow-v2.csv">Short v2 CSV</a> · '
+          '<a href="/metals-short-research">Short research JSON</a> · '
+          '<a href="/export/metals-short-research.csv">Short research CSV</a> · '
+          '<a href="/metals-research-outcomes">Long outcomes JSON</a> · '
+          '<a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a>'
+          '</div></details>'
+    )
+
+
+@app.get("/export/metals-xag-confirmation-guard.csv")
+def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
+    init_db()
+    limit = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM metals_demo_xag_confirmation_guard ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        ]
+    out_csv = io.StringIO()
+    if rows:
+        fields: List[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
+        writer = csv.DictWriter(out_csv, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    else:
+        out_csv.write("note\\nNo XAG confirmation-guard decisions yet\\n")
+    return Response(
+        content=out_csv.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="metals-xag-confirmation-guard.csv"'},
+    )
+
+
+@app.get("/export/metals-focused-research.zip")
+def export_metals_focused_research_zip(limit: int = 25000):
+    ensure_metals_focused_research_tables()
+    limit = max(1, min(int(limit), 100000))
+    buf = io.BytesIO()
+    tables = {
+        "highwater-banking-research.csv": "metals_focused_highwater",
+        "alignment-research.csv": "metals_focused_alignment",
+        "trend-efficiency-research.csv": "metals_focused_efficiency",
+        "basket-recovery-research.csv": "metals_focused_recovery",
+        "xag-xau-confirmation-guard.csv": "metals_demo_xag_confirmation_guard",
+    }
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for filename, table in tables.items():
+            rows = _mf_rows(table, limit)
+            csv_out = io.StringIO()
+            if rows:
+                fields: List[str] = []
+                for row in rows:
+                    for key in row:
+                        if key not in fields:
+                            fields.append(key)
+                writer = csv.DictWriter(csv_out, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            z.writestr(filename, csv_out.getvalue())
+
+        # Optional AI observer export: include only if that research module exists.
+        ensure_ai = globals().get("ensure_ai_regime_observer_table")
+        if callable(ensure_ai):
+            try:
+                ensure_ai()
+                with get_conn() as conn:
+                    ai_rows = [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT * FROM ai_regime_observer ORDER BY id DESC LIMIT ?",
+                            (limit,),
+                        ).fetchall()
+                    ]
+                ai_out = io.StringIO()
+                if ai_rows:
+                    fields: List[str] = []
+                    for row in ai_rows:
+                        for key in row:
+                            if key not in fields:
+                                fields.append(key)
+                    writer = csv.DictWriter(ai_out, fieldnames=fields, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(ai_rows)
+                z.writestr("ai-regime-observer.csv", ai_out.getvalue())
+            except Exception as exc:
+                z.writestr(
+                    "ai-regime-observer-unavailable.txt",
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+        z.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "project": "METALS",
+                    "version": METALS_APP_VERSION,
+                    "research_only": True,
+                    "generated_at_utc": now_utc_iso(),
+                    "streams": list(tables.keys()),
+                },
+                indent=2,
+            ),
+        )
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="metals-focused-research.zip"'},
+    )
 
 _METALS_STD_SECTIONS = {
     "basket-manager": ("Basket Manager", _metals_std_basket_manager_html),
