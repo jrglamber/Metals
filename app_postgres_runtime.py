@@ -25,7 +25,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan — Metals v1.6.4 — Manager Resilience + Risk Visibility"
+APP_NAME = "Project Exit Plan — Metals v1.6.5 — HWM Continuity + Weekend-Safe Recovery"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -10362,6 +10362,44 @@ def run_metals_demo_manager_maintenance_tick(source: str = "background_worker") 
         result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
         _metals_demo_manager_worker_last_result = result
         return result
+
+    # Reconciliation parity is broker-state maintenance, not a strategy decision.
+    # If broker/local OPEN counts diverge (e.g. 47 broker vs 49 local after closes),
+    # prove the missing broker IDs closed and retire only those local ghosts.
+    try:
+        with get_conn() as conn:
+            local_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE status='OPEN'"
+            ).fetchone()
+            local_open_count = int(local_row["c"] if local_row else 0)
+
+        open_resp = metals_demo_request(
+            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades",
+            "GET",
+        )
+        if open_resp.get("ok"):
+            broker_rows = [
+                t for t in ((open_resp.get("data") or {}).get("trades") or [])
+                if safe_str(t.get("instrument")).upper() in set(METALS_DEMO_ALLOWED_INSTRUMENTS)
+            ]
+            broker_open_count = len(broker_rows)
+            result["open_parity_before"] = {
+                "local_open": local_open_count,
+                "broker_open": broker_open_count,
+                "match": local_open_count == broker_open_count,
+            }
+            if local_open_count != broker_open_count:
+                result["ghost_cleanup"] = metals_demo_reconcile_local_ghosts()
+        else:
+            result["open_parity_before"] = {
+                "local_open": local_open_count,
+                "broker_open": None,
+                "match": None,
+                "error": open_resp.get("error"),
+            }
+    except Exception as e:
+        result["ok"] = False
+        result["ghost_cleanup_error"] = f"{type(e).__name__}: {e}"
 
     for asset in ["XAUUSD", "XAGUSD"]:
         check = _metals_demo_asset_reconcile_needed(asset)
@@ -23627,6 +23665,117 @@ def _metals_runtime_set(conn: Any, key: str, value: Any) -> None:
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
     """, (key, safe_str(value), now))
 
+
+_METALS_MARKET_STATE_LOCK = threading.Lock()
+_METALS_MARKET_STATE_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
+
+
+def _metals_demo_market_state(force: bool = False) -> Dict[str, Any]:
+    """Read the latest OANDA Metals quote state without placing any order.
+
+    The quote timestamp is used for high-water timestamps. This matters over a
+    weekend: a Saturday dashboard refresh must not make a Friday price look like
+    a new Saturday market high-water merely because the app was redeployed.
+    """
+    import time as _time
+    with _METALS_MARKET_STATE_LOCK:
+        cached = _METALS_MARKET_STATE_CACHE.get("result")
+        if not force and cached is not None and (_time.time() - float(_METALS_MARKET_STATE_CACHE.get("at") or 0.0)) < 30.0:
+            return dict(cached)
+
+    cfg = metals_demo_config_status()
+    if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
+        result = {"ok": False, "tradeable": None, "latest_price_time": "", "reason": "config_not_ready"}
+    else:
+        instruments = ",".join(sorted({"XAU_USD", "XAG_USD"} & set(METALS_DEMO_ALLOWED_INSTRUMENTS)))
+        resp = metals_demo_request(
+            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(instruments)}",
+            "GET",
+        )
+        prices = ((resp.get("data") or {}).get("prices") or []) if resp.get("ok") else []
+        times = [safe_str(p.get("time")) for p in prices if safe_str(p.get("time"))]
+        latest_time = ""
+        parsed = [(parse_dt(t), t) for t in times]
+        parsed = [(dt, raw) for dt, raw in parsed if dt is not None]
+        if parsed:
+            latest_time = max(parsed, key=lambda x: x[0])[1]
+        result = {
+            "ok": bool(resp.get("ok")),
+            "tradeable": any(parse_bool(p.get("tradeable"), False) for p in prices) if prices else None,
+            "latest_price_time": latest_time,
+            "prices": [
+                {
+                    "instrument": safe_str(p.get("instrument")),
+                    "tradeable": parse_bool(p.get("tradeable"), False),
+                    "time": safe_str(p.get("time")),
+                    "status": safe_str(p.get("status")),
+                }
+                for p in prices
+            ],
+            "error": resp.get("error"),
+        }
+
+    with _METALS_MARKET_STATE_LOCK:
+        _METALS_MARKET_STATE_CACHE["at"] = _time.time()
+        _METALS_MARKET_STATE_CACHE["result"] = dict(result)
+    return result
+
+
+def _metals_highwater_observation_time() -> str:
+    """Best market-time timestamp for a broker HWM observation."""
+    try:
+        market = _metals_demo_market_state()
+        if safe_str(market.get("latest_price_time")):
+            return safe_str(market.get("latest_price_time"))
+    except Exception:
+        pass
+
+    # Fallback to the last actually received XAU/XAG signal, not wall-clock time.
+    try:
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT received_at_utc,timestamp_readable
+                FROM raw_signals
+                WHERE UPPER(pair) IN ('XAUUSD','XAU','XAGUSD','XAG')
+                ORDER BY id DESC
+                LIMIT 1
+            """).fetchone()
+        if row:
+            return safe_str(row["received_at_utc"]) or safe_str(row["timestamp_readable"])
+    except Exception:
+        pass
+
+    return now_utc_iso()
+
+
+def _metals_historical_family_hwm_seed(conn: Any) -> Dict[str, Any]:
+    """Latest pre-v1.6.5 family HWM persisted by the existing manager.
+
+    The latest family snapshot already carries the current basket's preserved
+    high-water. It is used once to migrate an active basket into the new
+    broker-authoritative runtime HWM store without resetting history.
+    """
+    row = conn.execute("""
+        SELECT high_water_pnl_gbp,high_water_r,high_water_seen_at,created_at_utc
+        FROM metals_demo_basket_snapshots
+        WHERE basket_key='METALS_BASKET'
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+    if not row:
+        return {
+            "high_water_gbp": 0.0,
+            "high_water_r": 0.0,
+            "high_water_seen_at": "",
+            "source": "none",
+        }
+    return {
+        "high_water_gbp": float(safe_float(row["high_water_pnl_gbp"]) or 0.0),
+        "high_water_r": float(safe_float(row["high_water_r"]) or 0.0),
+        "high_water_seen_at": safe_str(row["high_water_seen_at"] or row["created_at_utc"]),
+        "source": "metals_demo_basket_snapshots:METALS_BASKET",
+    }
+
 def _metals_tx_instrument(tx: Dict[str, Any]) -> str:
     instrument = safe_str(tx.get("instrument")).upper()
     if instrument:
@@ -32322,37 +32471,67 @@ def _metals_broker_basket_r(broker: Dict[str, Any]) -> Dict[str, Any]:
 
 def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Persistent broker-authoritative Metals high-water.
+    Persistent broker-authoritative Metals high-water with migration continuity.
 
-    Cash basis:
-      current = actual OANDA XAU/XAG unrealised P&L
-      HWM     = maximum current during the active Metals basket
-      giveback= HWM - current
+    v1.6.5 fixes a v1.6.4 deployment bug:
+      - v1.6.4 introduced new broker_hwm_* runtime keys.
+      - an already-active basket therefore looked like a fresh basket on first
+        deploy and its prior ~£HWM was replaced by the current UPL.
+      - the new HWM timestamp was wall-clock deployment time, which could be a
+        Saturday even though Metals was closed.
 
-    R basis:
-      current = sum(actual OANDA trade UPL / original effective risk)
-      HWM     = maximum current broker-R during the active basket
-
-    A new basket cycle begins after OANDA Metals open-count reaches zero.
+    Behaviour now:
+      1) never mutate/reset HWM on a failed broker read;
+      2) one-time migrate an already-active basket from the existing persisted
+         METALS_BASKET family high-water;
+      3) retain the HWM monotonically until OANDA Metals is genuinely flat;
+      4) timestamp a new HWM with the latest OANDA quote/signal market time,
+         not simply the dashboard-refresh wall clock.
     """
+    broker_ok = bool(broker.get("ok"))
     current_gbp = float(safe_float(broker.get("owned_unrealized_pl")) or 0.0)
     open_count = int(broker.get("owned_open_count") or 0)
-    r_state = _metals_broker_basket_r(broker)
+    r_state = _metals_broker_basket_r(broker) if broker_ok else {
+        "basket_r": 0.0, "linked_count": 0, "unlinked_broker_count": 0, "details": []
+    }
     current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
-    now = now_utc_iso()
 
     with get_conn() as conn:
         old_open = int(safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0)
         old_hwm_gbp = float(safe_float(_metals_runtime_get(conn, "broker_hwm_gbp", "0")) or 0.0)
         old_hwm_r = float(safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0)
         old_seen = _metals_runtime_get(conn, "broker_hwm_seen_at", "")
+        initialized = _metals_runtime_get(conn, "broker_hwm_v165_initialized", "") == "1"
 
-        # Basket fully flat: arm a clean reset for the next actual basket.
+        # A failed broker read must never look like a flat basket and erase HWM.
+        if not broker_ok:
+            giveback_gbp = max(0.0, old_hwm_gbp - current_gbp)
+            giveback_r = max(0.0, old_hwm_r - current_r)
+            return {
+                "current_gbp": current_gbp,
+                "current_r": current_r,
+                "high_water_gbp": old_hwm_gbp,
+                "high_water_r": old_hwm_r,
+                "high_water_seen_at": old_seen,
+                "giveback_gbp": giveback_gbp,
+                "giveback_r": giveback_r,
+                "giveback_pct": (giveback_gbp / old_hwm_gbp * 100.0) if old_hwm_gbp > 0 else 0.0,
+                "open_count": old_open,
+                "linked_r_count": r_state.get("linked_count", 0),
+                "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
+                "r_details": r_state.get("details", []),
+                "source": "stored_runtime_broker_read_failed",
+            }
+
+        # Genuine broker flat closes the cycle. Keep the initialization marker so
+        # the next basket starts cleanly rather than importing an old snapshot.
         if open_count == 0:
             _metals_runtime_set(conn, "broker_hwm_open_count", 0)
             _metals_runtime_set(conn, "broker_hwm_gbp", 0.0)
             _metals_runtime_set(conn, "broker_hwm_r", 0.0)
             _metals_runtime_set(conn, "broker_hwm_seen_at", "")
+            _metals_runtime_set(conn, "broker_hwm_v165_initialized", "1")
+            _metals_runtime_set(conn, "broker_hwm_source", "flat_reset")
             conn.commit()
             return {
                 "current_gbp": 0.0, "current_r": 0.0,
@@ -32363,32 +32542,65 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
                 "open_count": 0,
                 "linked_r_count": r_state.get("linked_count", 0),
                 "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
+                "r_details": r_state.get("details", []),
+                "source": "flat_reset",
             }
 
-        # If the previous observed state was flat, this is a fresh basket cycle.
-        fresh_cycle = old_open == 0
-        if fresh_cycle:
-            hwm_gbp = max(0.0, current_gbp)
-            hwm_r = max(0.0, current_r)
-            seen = now if (hwm_gbp > 0 or hwm_r > 0) else ""
+        # One-time continuity migration for a basket that was already open when
+        # v1.6.4/v1.6.5 was deployed. This is the important regression fix.
+        if not initialized:
+            hist = _metals_historical_family_hwm_seed(conn)
+            hist_gbp = float(safe_float(hist.get("high_water_gbp")) or 0.0)
+            hist_r = float(safe_float(hist.get("high_water_r")) or 0.0)
+            hist_seen = safe_str(hist.get("high_water_seen_at"))
+
+            hwm_gbp = max(old_hwm_gbp, hist_gbp, current_gbp)
+            hwm_r = max(old_hwm_r, hist_r, current_r)
+
+            if hist_gbp >= old_hwm_gbp and hist_gbp >= current_gbp and hist_gbp > 0:
+                seen = hist_seen
+                source = "migrated_existing_family_hwm"
+            elif old_hwm_gbp >= current_gbp and old_hwm_gbp > 0:
+                seen = old_seen
+                source = "preserved_existing_runtime_hwm"
+            else:
+                seen = _metals_highwater_observation_time() if current_gbp > 0 else ""
+                source = "current_broker_seed"
+
+            _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
+            _metals_runtime_set(conn, "broker_hwm_gbp", hwm_gbp)
+            _metals_runtime_set(conn, "broker_hwm_r", hwm_r)
+            _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
+            _metals_runtime_set(conn, "broker_hwm_v165_initialized", "1")
+            _metals_runtime_set(conn, "broker_hwm_source", source)
+            conn.commit()
         else:
-            hwm_gbp = old_hwm_gbp
-            hwm_r = old_hwm_r
-            seen = old_seen
+            # After a KNOWN flat state, old_open==0 means a real fresh basket.
+            fresh_cycle = old_open == 0
+            if fresh_cycle:
+                hwm_gbp = max(0.0, current_gbp)
+                hwm_r = max(0.0, current_r)
+                seen = _metals_highwater_observation_time() if (hwm_gbp > 0 or hwm_r > 0) else ""
+                source = "fresh_broker_cycle"
+            else:
+                hwm_gbp = old_hwm_gbp
+                hwm_r = old_hwm_r
+                seen = old_seen
+                source = _metals_runtime_get(conn, "broker_hwm_source", "persistent_broker_hwm")
 
-            if current_gbp > hwm_gbp:
-                hwm_gbp = current_gbp
-                seen = now
-            if current_r > hwm_r:
-                hwm_r = current_r
-                if not seen:
-                    seen = now
+                if current_gbp > hwm_gbp + 0.005:
+                    hwm_gbp = current_gbp
+                    seen = _metals_highwater_observation_time()
+                    source = "broker_cash_new_high"
+                if current_r > hwm_r + 0.000001:
+                    hwm_r = current_r
 
-        _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
-        _metals_runtime_set(conn, "broker_hwm_gbp", hwm_gbp)
-        _metals_runtime_set(conn, "broker_hwm_r", hwm_r)
-        _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
-        conn.commit()
+            _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
+            _metals_runtime_set(conn, "broker_hwm_gbp", hwm_gbp)
+            _metals_runtime_set(conn, "broker_hwm_r", hwm_r)
+            _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
+            _metals_runtime_set(conn, "broker_hwm_source", source)
+            conn.commit()
 
     giveback_gbp = max(0.0, hwm_gbp - current_gbp)
     giveback_r = max(0.0, hwm_r - current_r)
@@ -32407,6 +32619,7 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         "linked_r_count": r_state.get("linked_count", 0),
         "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
         "r_details": r_state.get("details", []),
+        "source": source,
     }
 
 
@@ -32557,7 +32770,7 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "giveback_r": giveback_r,
             "giveback_gbp": giveback_gbp,
             "giveback_pct": giveback_pct,
-            "high_water_source": "OANDA_XAU_XAG_OPEN_PNL",
+            "high_water_source": safe_str(broker_hwm.get("source") or "OANDA_XAU_XAG_OPEN_PNL"),
             "broker_r_linked_count": int(broker_hwm.get("linked_r_count") or 0),
             "broker_r_unlinked_count": int(broker_hwm.get("unlinked_broker_count") or 0),
             "basket_state": safe_str(
@@ -33276,8 +33489,8 @@ async function loadTop(force=false){{
   const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
-${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
-${{card('Broker P&L',money(s.headline_pnl),`Open broker P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
+${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Account-wide UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
+${{card('Broker P&L',money(s.headline_pnl),`Metals-only open P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
 ${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
