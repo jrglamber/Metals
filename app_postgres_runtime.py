@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.9"
+METALS_APP_VERSION = "v1.6.10"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Cumulative Safe Maintenance"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Standardised Dashboard + Safe Maintenance"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -33587,11 +33587,10 @@ ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA Metals · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
-<div class="cards four">
+<div class="cards three">
 ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,'Latest XAU/XAG received',Number(g.received_assets||0)===2?'pos':'warn')}}
-${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}
-${{card('Manager Worker',(s.manager_worker&&s.manager_worker.thread_alive)?'ALIVE':'CHECK',`60s self-heal · ${{eh((s.manager_worker||{{}}).last_heartbeat_utc||'no heartbeat yet')}}`,(s.manager_worker&&s.manager_worker.thread_alive)?'pos':'warn')}}
-${{card('Risk Sizing',`XAU £${{Number((((s.risk_visibility||{{}}).XAUUSD||{{}}).requested_risk_gbp)||0).toFixed(0)}} · XAG £${{Number((((s.risk_visibility||{{}}).XAGUSD||{{}}).requested_risk_gbp)||0).toFixed(0)}}`,`Effective open avg XAU ${{money((((s.risk_visibility||{{}}).XAUUSD||{{}}).average_open_effective_risk_gbp))}} · XAG ${{money((((s.risk_visibility||{{}}).XAGUSD||{{}}).average_open_effective_risk_gbp))}}`,'warn')}}</div>`;
+${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,Number(g.received_assets||0)===2?'Missing none':'Waiting')}}
+${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}</div>`;
   st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`;
  }}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}
 }}
