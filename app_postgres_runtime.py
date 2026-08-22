@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.8"
-METALS_BUILD_LINEAGE = "full_v1.6.4_baseline_plus_targeted_hwm_recovery_fixes"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Cumulative Stable Build"
+METALS_APP_VERSION = "v1.6.9"
+METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Cumulative Safe Maintenance"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1022,12 +1022,28 @@ METALS_DEMO_BASKET_NORMAL_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_NORMAL_LO
 METALS_DEMO_BASKET_SEVERE_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_SEVERE_LOSS_R", "-5.0"))
 METALS_DEMO_BASKET_GIVEBACK_WARN_PCT = float(os.getenv("METALS_DEMO_BASKET_GIVEBACK_WARN_PCT", "70"))
 METALS_DEMO_MANAGER_VERSION = "metals_demo_basket_manager_v1_hourly_post48_long_short"
-# v1.6.4 — resilient metals manager maintenance.
-# The strategy still makes management decisions only on a NEW stored hourly metals signal.
-# This worker self-heals missed post-signal reconciliation after deploy/restart/worker errors
-# and retries queued closes, without inventing extra intra-hour strategy decisions.
-METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED = env_bool("METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED", True)
-METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS = max(30.0, min(float(os.getenv("METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS", "60")), 300.0))
+
+# v1.6.9 cumulative maintenance layer.
+# These are operational/resilience controls only; they do not change signal,
+# entry, exit, stop, basket-defence or sizing rules.
+METALS_DEMO_MANAGER_MAINTENANCE_ENABLED = env_bool("METALS_DEMO_MANAGER_MAINTENANCE_ENABLED", True)
+METALS_DEMO_MANAGER_MAINTENANCE_INTERVAL_SECONDS = max(
+    30.0, min(float(os.getenv("METALS_DEMO_MANAGER_MAINTENANCE_INTERVAL_SECONDS", "60")), 300.0)
+)
+METALS_DEMO_MANAGER_FRESH_SIGNAL_SECONDS = max(
+    900, min(int(float(os.getenv("METALS_DEMO_MANAGER_FRESH_SIGNAL_SECONDS", "7200"))), 21600)
+)
+
+# Optional operator-supplied floor for one-time HWM recovery.
+# Default is deliberately zero: the app will never invent a historical cash HWM.
+# If ever needed, set the exact previously observed HWM in Railway and optionally
+# its timestamp; the active basket HWM can only move UP from this floor.
+METALS_HWM_RECOVERY_FLOOR_GBP = max(
+    0.0, float(os.getenv("METALS_HWM_RECOVERY_FLOOR_GBP", "0") or 0)
+)
+METALS_HWM_RECOVERY_FLOOR_SEEN_AT = os.getenv(
+    "METALS_HWM_RECOVERY_FLOOR_SEEN_AT", ""
+).strip()
 
 app = FastAPI(title=APP_NAME)
 
@@ -10270,210 +10286,6 @@ def start_broker_retry_background_worker() -> None:
         pass
 
 
-# ============================================================
-# v1.6.4 - RESILIENT METALS MANAGER MAINTENANCE WORKER
-# ============================================================
-_metals_demo_manager_worker_started = False
-_metals_demo_manager_worker_thread: Optional[threading.Thread] = None
-_metals_demo_manager_worker_last_heartbeat_utc = ""
-_metals_demo_manager_worker_last_result: Dict[str, Any] = {}
-_metals_demo_manager_worker_lock = threading.Lock()
-
-
-def metals_demo_manager_worker_status() -> Dict[str, Any]:
-    return {
-        "enabled": bool(METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED),
-        "started_flag": bool(_metals_demo_manager_worker_started),
-        "thread_alive": bool(_metals_demo_manager_worker_thread and _metals_demo_manager_worker_thread.is_alive()),
-        "thread_name": safe_str(getattr(_metals_demo_manager_worker_thread, "name", "")),
-        "last_heartbeat_utc": _metals_demo_manager_worker_last_heartbeat_utc,
-        "interval_seconds": METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS,
-        "last_result": _metals_demo_manager_worker_last_result,
-        "decision_cadence": "new_hourly_metals_signal_only",
-    }
-
-
-def _metals_demo_asset_reconcile_needed(asset: str) -> Dict[str, Any]:
-    """Return whether an asset needs a self-healing manager reconcile.
-
-    We deliberately do NOT reconcile every minute just because the worker wakes up.
-    A full manager pass is needed only when:
-    - an OPEN trade has not yet been reviewed against the latest stored asset signal; or
-    - a persistent CLOSE queue item is waiting/retrying.
-
-    This preserves the agreed hourly post-48 strategy cadence while making restart /
-    missed-worker recovery automatic.
-    """
-    a = _metals_demo_asset(asset)
-    with get_conn() as conn:
-        latest = _metals_demo_latest_signal_row(conn, a)
-        latest_id = int(latest["id"]) if latest else None
-        opens = [dict(r) for r in conn.execute(
-            "SELECT id, manager_last_review_signal_id FROM metals_demo_trade_links WHERE status='OPEN' AND asset=?",
-            (a,),
-        ).fetchall()]
-        pending_row = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM metals_demo_action_queue q
-            JOIN metals_demo_trade_links l ON l.id=q.link_id
-            WHERE l.asset=? AND l.status='OPEN' AND q.action='CLOSE' AND q.status IN ('PENDING','RETRY')
-            """,
-            (a,),
-        ).fetchone()
-        pending = int(pending_row["c"] if pending_row else 0)
-
-    stale_links = []
-    if latest_id is not None:
-        stale_links = [
-            int(r["id"]) for r in opens
-            if int(r.get("manager_last_review_signal_id") or 0) != latest_id
-        ]
-    return {
-        "asset": a,
-        "latest_signal_id": latest_id,
-        "open_count": len(opens),
-        "stale_link_ids": stale_links,
-        "pending_close_count": pending,
-        "needed": bool((latest_id is not None and stale_links) or pending > 0),
-    }
-
-
-def run_metals_demo_manager_maintenance_tick(source: str = "background_worker") -> Dict[str, Any]:
-    global _metals_demo_manager_worker_last_result
-    result: Dict[str, Any] = {
-        "ok": True,
-        "source": source,
-        "time_utc": now_utc_iso(),
-        "assets": {},
-    }
-    cfg = metals_demo_config_status()
-    if not METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED:
-        result.update({"skipped": True, "reason": "worker_disabled"})
-        _metals_demo_manager_worker_last_result = result
-        return result
-    if not METALS_DEMO_BASKET_MANAGER_ENABLED:
-        result.update({"skipped": True, "reason": "basket_manager_disabled"})
-        _metals_demo_manager_worker_last_result = result
-        return result
-    if not METALS_DEMO_BROKER_ENABLED:
-        result.update({"skipped": True, "reason": "metals_demo_broker_disabled"})
-        _metals_demo_manager_worker_last_result = result
-        return result
-    if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
-        result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
-        _metals_demo_manager_worker_last_result = result
-        return result
-
-    # Reconciliation parity is broker-state maintenance, not a strategy decision.
-    # If broker/local OPEN counts diverge (e.g. 47 broker vs 49 local after closes),
-    # prove the missing broker IDs closed and retire only those local ghosts.
-    try:
-        with get_conn() as conn:
-            local_row = conn.execute(
-                "SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE status='OPEN'"
-            ).fetchone()
-            local_open_count = int(local_row["c"] if local_row else 0)
-
-        open_resp = metals_demo_request(
-            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades",
-            "GET",
-        )
-        if open_resp.get("ok"):
-            broker_rows = [
-                t for t in ((open_resp.get("data") or {}).get("trades") or [])
-                if safe_str(t.get("instrument")).upper() in set(METALS_DEMO_ALLOWED_INSTRUMENTS)
-            ]
-            broker_open_count = len(broker_rows)
-            result["open_parity_before"] = {
-                "local_open": local_open_count,
-                "broker_open": broker_open_count,
-                "match": local_open_count == broker_open_count,
-            }
-            if local_open_count != broker_open_count:
-                result["ghost_cleanup"] = metals_demo_reconcile_local_ghosts()
-        else:
-            result["open_parity_before"] = {
-                "local_open": local_open_count,
-                "broker_open": None,
-                "match": None,
-                "error": open_resp.get("error"),
-            }
-    except Exception as e:
-        result["ok"] = False
-        result["ghost_cleanup_error"] = f"{type(e).__name__}: {e}"
-
-    for asset in ["XAUUSD", "XAGUSD"]:
-        check = _metals_demo_asset_reconcile_needed(asset)
-        asset_result: Dict[str, Any] = {"check": check, "reconciled": False}
-        if check.get("needed"):
-            try:
-                asset_result["result"] = metals_demo_reconcile_and_close(asset)
-                asset_result["reconciled"] = True
-            except Exception as e:
-                result["ok"] = False
-                asset_result["error"] = f"{type(e).__name__}: {e}"
-        result["assets"][asset] = asset_result
-
-    _metals_demo_manager_worker_last_result = result
-    if not result.get("ok"):
-        try:
-            log_system_event("metals_demo_manager_worker_warning", json.dumps(result, default=str)[:1800])
-        except Exception:
-            pass
-    return result
-
-def metals_demo_manager_background_loop() -> None:
-    global _metals_demo_manager_worker_last_heartbeat_utc
-    try:
-        log_system_event(
-            "metals_demo_manager_worker_started",
-            f"Metals manager maintenance started; interval={METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS}s; decisions remain new-signal-only",
-        )
-    except Exception:
-        pass
-    while True:
-        _metals_demo_manager_worker_last_heartbeat_utc = now_utc_iso()
-        try:
-            acquired = _metals_demo_manager_worker_lock.acquire(blocking=False)
-            if acquired:
-                try:
-                    run_metals_demo_manager_maintenance_tick("background_worker")
-                finally:
-                    _metals_demo_manager_worker_lock.release()
-        except Exception as e:
-            try:
-                log_system_event("metals_demo_manager_worker_error", safe_str(e)[:1800])
-            except Exception:
-                pass
-        _metals_demo_manager_worker_last_heartbeat_utc = now_utc_iso()
-        time.sleep(METALS_DEMO_MANAGER_BACKGROUND_INTERVAL_SECONDS)
-
-
-def start_metals_demo_manager_background_worker() -> None:
-    global _metals_demo_manager_worker_started, _metals_demo_manager_worker_thread
-    if not METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED:
-        try:
-            log_system_event("metals_demo_manager_worker_disabled", "METALS_DEMO_MANAGER_BACKGROUND_WORKER_ENABLED=false")
-        except Exception:
-            pass
-        return
-    if _metals_demo_manager_worker_thread is not None and _metals_demo_manager_worker_thread.is_alive():
-        _metals_demo_manager_worker_started = True
-        return
-    _metals_demo_manager_worker_started = True
-    _metals_demo_manager_worker_thread = threading.Thread(
-        target=metals_demo_manager_background_loop,
-        name="metals-demo-manager-maintenance",
-        daemon=True,
-    )
-    _metals_demo_manager_worker_thread.start()
-    try:
-        log_system_event("metals_demo_manager_worker_thread_started", json.dumps(metals_demo_manager_worker_status(), default=str)[:1200])
-    except Exception:
-        pass
-
-
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -10490,11 +10302,13 @@ def startup() -> None:
     except Exception:
         pass
     try:
-        # Starts with an immediate maintenance tick, so existing OPEN metals
-        # trades are backfilled/reviewed after a deploy without waiting for Monday's next signal.
-        start_metals_demo_manager_background_worker()
-    except Exception:
-        pass
+        if PROJECT_SCOPE == "METALS_ONLY":
+            start_metals_demo_manager_maintenance_worker()
+    except Exception as exc:
+        try:
+            log_system_event("metals_manager_worker_start_warning", f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -17290,6 +17104,9 @@ def health() -> Dict[str, Any]:
         "latest_live_signal_pipeline": dict(latest_pipeline) if latest_pipeline else None,
         "signal_processing_worker": signal_processing_worker_status(),
         "broker_retry_worker": broker_retry_worker_status(),
+        "metals_manager_worker": metals_demo_manager_worker_status() if PROJECT_SCOPE == "METALS_ONLY" else {},
+        "metals_app_version": globals().get("METALS_APP_VERSION", ""),
+        "metals_build_baseline": globals().get("METALS_BUILD_BASELINE", ""),
         "cross_index_confirmation_enabled": bool(CROSS_INDEX_CONFIRMATION_ENABLED),
         "cross_index_confirmation_env_requested": bool(CROSS_INDEX_CONFIRMATION_ENV_REQUESTED),
         "cross_index_confirmation_mode": CROSS_INDEX_CONFIRMATION_MODE,
@@ -23666,47 +23483,124 @@ def _metals_runtime_set(conn: Any, key: str, value: Any) -> None:
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
     """, (key, safe_str(value), now))
 
+
+# ============================================================
+# v1.6.9 — METALS MAINTENANCE / HWM CONTINUITY
+# ============================================================
 _METALS_MARKET_STATE_LOCK = threading.Lock()
 _METALS_MARKET_STATE_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
 
-def _metals_demo_market_state(force: bool = False) -> Dict[str, Any]:
-    """Read the latest OANDA Metals quote state without placing any order.
+_METALS_MANAGER_MAINT_LOCK = threading.Lock()
+_METALS_MANAGER_WORKER_STOP = threading.Event()
+_METALS_MANAGER_WORKER_THREAD: Optional[threading.Thread] = None
+_METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC = ""
+_METALS_MANAGER_WORKER_LAST_RESULT: Dict[str, Any] = {}
 
-    The quote timestamp is used for high-water timestamps. This matters over a
-    weekend: a Saturday dashboard refresh must not make a Friday price look like
-    a new Saturday market high-water merely because the app was redeployed.
+
+def ensure_metals_hwm_history_table() -> None:
+    """Immutable audit trail for HWM repairs/new highs going forward."""
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_hwm_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                observed_at_utc TEXT,
+                event_type TEXT NOT NULL,
+                open_count INTEGER,
+                current_gbp REAL,
+                current_r REAL,
+                high_water_gbp REAL,
+                high_water_r REAL,
+                source TEXT,
+                raw_json TEXT
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metals_hwm_events_time "
+            "ON metals_demo_hwm_events(created_at_utc)"
+        )
+        conn.commit()
+
+
+def _record_metals_hwm_event(
+    conn: Any,
+    event_type: str,
+    observed_at: str,
+    open_count: int,
+    current_gbp: float,
+    current_r: float,
+    high_water_gbp: float,
+    high_water_r: float,
+    source: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        ensure_metals_hwm_history_table()
+        # Use the caller connection where possible to keep state/event atomic.
+        conn.execute("""
+            INSERT INTO metals_demo_hwm_events(
+                created_at_utc,observed_at_utc,event_type,open_count,
+                current_gbp,current_r,high_water_gbp,high_water_r,source,raw_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_utc_iso(), safe_str(observed_at), safe_str(event_type),
+            int(open_count or 0), float(current_gbp or 0.0), float(current_r or 0.0),
+            float(high_water_gbp or 0.0), float(high_water_r or 0.0),
+            safe_str(source), json.dumps(details or {}, default=str),
+        ))
+    except Exception:
+        # Audit failure must never affect trading/HWM state.
+        pass
+
+
+def _metals_demo_market_state(force: bool = False) -> Dict[str, Any]:
+    """Read latest OANDA XAU/XAG quote state, cached briefly.
+
+    The returned price timestamp is market time. It prevents a Saturday deploy
+    or dashboard refresh from manufacturing a Saturday HWM timestamp.
     """
-    import time as _time
     with _METALS_MARKET_STATE_LOCK:
         cached = _METALS_MARKET_STATE_CACHE.get("result")
-        if not force and cached is not None and (_time.time() - float(_METALS_MARKET_STATE_CACHE.get("at") or 0.0)) < 30.0:
+        age = time.time() - float(_METALS_MARKET_STATE_CACHE.get("at") or 0.0)
+        if not force and cached is not None and age < 30.0:
             return dict(cached)
 
     cfg = metals_demo_config_status()
     if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
-        result = {"ok": False, "tradeable": None, "latest_price_time": "", "reason": "config_not_ready"}
+        result = {
+            "ok": False, "tradeable": None, "latest_price_time": "",
+            "reason": "config_not_ready",
+        }
     else:
-        instruments = ",".join(sorted({"XAU_USD", "XAG_USD"} & set(METALS_DEMO_ALLOWED_INSTRUMENTS)))
+        instruments = ",".join(
+            sorted({"XAU_USD", "XAG_USD"}.intersection(METALS_DEMO_ALLOWED_INSTRUMENTS))
+        )
         resp = metals_demo_request(
-            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(instruments)}",
-            "GET",
+            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/pricing"
+            f"?instruments={urllib.parse.quote(instruments)}"
         )
         prices = ((resp.get("data") or {}).get("prices") or []) if resp.get("ok") else []
-        times = [safe_str(p.get("time")) for p in prices if safe_str(p.get("time"))]
-        latest_time = ""
-        parsed = [(parse_dt(t), t) for t in times]
-        parsed = [(dt, raw) for dt, raw in parsed if dt is not None]
-        if parsed:
-            latest_time = max(parsed, key=lambda x: x[0])[1]
+        parsed_times = []
+        for p in prices:
+            raw_t = safe_str(p.get("time"))
+            dt = parse_dt(raw_t)
+            if dt is not None:
+                parsed_times.append((dt, raw_t))
+        latest_price_time = (
+            max(parsed_times, key=lambda x: x[0])[1] if parsed_times else ""
+        )
         result = {
             "ok": bool(resp.get("ok")),
-            "tradeable": any(parse_bool(p.get("tradeable"), False) for p in prices) if prices else None,
-            "latest_price_time": latest_time,
+            "tradeable": (
+                any(parse_bool(p.get("tradeable"), False) for p in prices)
+                if prices else None
+            ),
+            "latest_price_time": latest_price_time,
             "prices": [
                 {
                     "instrument": safe_str(p.get("instrument")),
-                    "tradeable": parse_bool(p.get("tradeable"), False),
                     "time": safe_str(p.get("time")),
+                    "tradeable": parse_bool(p.get("tradeable"), False),
                     "status": safe_str(p.get("status")),
                 }
                 for p in prices
@@ -23715,11 +23609,35 @@ def _metals_demo_market_state(force: bool = False) -> Dict[str, Any]:
         }
 
     with _METALS_MARKET_STATE_LOCK:
-        _METALS_MARKET_STATE_CACHE["at"] = _time.time()
+        _METALS_MARKET_STATE_CACHE["at"] = time.time()
         _METALS_MARKET_STATE_CACHE["result"] = dict(result)
     return result
 
-def _metals_highwater_observation_time() -> str:
+
+def _metals_latest_signal_observation_time(conn: Optional[Any] = None) -> str:
+    """Latest actual Metals signal receipt time; safe fallback for market timestamp."""
+    owns_conn = conn is None
+    c = conn or get_conn()
+    try:
+        row = c.execute("""
+            SELECT received_at_utc,timestamp_readable
+            FROM raw_signals
+            WHERE UPPER(pair) IN ('XAUUSD','XAU','XAGUSD','XAG')
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+        if not row:
+            return ""
+        return safe_str(row["received_at_utc"]) or safe_str(row["timestamp_readable"])
+    finally:
+        if owns_conn:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def _metals_hwm_observation_time(conn: Optional[Any] = None) -> str:
     """Best market-time timestamp for a broker HWM observation."""
     try:
         market = _metals_demo_market_state()
@@ -23727,116 +23645,370 @@ def _metals_highwater_observation_time() -> str:
             return safe_str(market.get("latest_price_time"))
     except Exception:
         pass
+    sig_time = _metals_latest_signal_observation_time(conn)
+    return sig_time or now_utc_iso()
 
-    # Fallback to the last actually received XAU/XAG signal, not wall-clock time.
+
+def _metals_current_cycle_boundary(conn: Any) -> Dict[str, Any]:
+    """Best persisted flat boundary for the currently active local Metals cycle."""
     try:
-        with get_conn() as conn:
-            row = conn.execute("""
-                SELECT received_at_utc,timestamp_readable
-                FROM raw_signals
-                WHERE UPPER(pair) IN ('XAUUSD','XAU','XAGUSD','XAG')
-                ORDER BY id DESC
-                LIMIT 1
-            """).fetchone()
+        row = conn.execute("""
+            SELECT id,review_signal_id,created_at_utc
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              AND COALESCE(open_count,0)=0
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+    except Exception:
+        row = None
+    if row:
+        return {
+            "snapshot_id": int(row["id"]),
+            "review_signal_id": int(safe_float(row["review_signal_id"]) or 0),
+            "created_at_utc": safe_str(row["created_at_utc"]),
+        }
+
+    # If there is no explicit flat snapshot, the earliest currently-open link is
+    # the safest lower-bound start for the active cycle.
+    try:
+        row = conn.execute("""
+            SELECT MIN(id) AS min_id, MIN(raw_signal_id) AS min_raw_signal_id,
+                   MIN(created_at_utc) AS created_at_utc
+            FROM metals_demo_trade_links
+            WHERE status='OPEN'
+        """).fetchone()
+    except Exception:
+        row = None
+    return {
+        "snapshot_id": None,
+        "review_signal_id": int(safe_float(row["min_raw_signal_id"] if row else None) or 0),
+        "created_at_utc": safe_str(row["created_at_utc"] if row else ""),
+    }
+
+
+def _metals_hwm_recovery_evidence(conn: Any) -> Dict[str, Any]:
+    """Find conservative persisted evidence for the current basket's prior HWM.
+
+    Sources are intentionally limited to data already produced by this known-good
+    build. No outside price assumptions are invented:
+      1) family basket cash HWM snapshots after the last flat boundary;
+      2) point-in-time manager-review cash reconstruction (R × locked risk);
+      3) optional explicit operator floor from Railway.
+    """
+    boundary = _metals_current_cycle_boundary(conn)
+    boundary_signal_id = int(boundary.get("review_signal_id") or 0)
+    boundary_time = safe_str(boundary.get("created_at_utc"))
+    candidates: List[Dict[str, Any]] = []
+
+    # Family snapshot evidence.
+    try:
+        params: List[Any] = []
+        clause = ""
+        if boundary.get("snapshot_id"):
+            clause = " AND id>?"
+            params.append(int(boundary["snapshot_id"]))
+        row = conn.execute(f"""
+            SELECT id,high_water_pnl_gbp,high_water_r,high_water_seen_at,created_at_utc
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              {clause}
+              AND COALESCE(high_water_pnl_gbp,0)>0
+            ORDER BY high_water_pnl_gbp DESC,id DESC
+            LIMIT 1
+        """, tuple(params)).fetchone()
         if row:
-            return safe_str(row["received_at_utc"]) or safe_str(row["timestamp_readable"])
+            candidates.append({
+                "gbp": float(safe_float(row["high_water_pnl_gbp"]) or 0.0),
+                "r": float(safe_float(row["high_water_r"]) or 0.0),
+                "seen_at": safe_str(row["high_water_seen_at"] or row["created_at_utc"]),
+                "source": f"family_snapshot:{int(row['id'])}",
+            })
     except Exception:
         pass
 
-    return now_utc_iso()
+    # Manager-review reconstruction. Deduplicate each link at each review signal,
+    # then sum current_R × the trade's locked effective risk.
+    try:
+        params = []
+        clause = ""
+        if boundary_signal_id > 0:
+            clause = " AND mr.review_signal_id>?"
+            params.append(boundary_signal_id)
+        rows = conn.execute(f"""
+            SELECT mr.id,mr.review_signal_id,mr.link_id,mr.current_r,mr.created_at_utc,
+                   l.estimated_risk_amount,l.requested_risk_amount,l.asset
+            FROM metals_demo_manager_reviews mr
+            JOIN metals_demo_trade_links l ON l.id=mr.link_id
+            WHERE mr.review_signal_id IS NOT NULL
+              AND mr.current_r IS NOT NULL
+              {clause}
+            ORDER BY mr.id ASC
+        """, tuple(params)).fetchall()
 
-def _metals_historical_family_hwm_seed(conn: Any) -> Dict[str, Any]:
-    """Recover the best persisted family HWM for the current continuous basket.
+        latest_per_pair: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for rr in rows:
+            d = dict(rr)
+            key = (int(d.get("review_signal_id") or 0), int(d.get("link_id") or 0))
+            latest_per_pair[key] = d
 
-    Important migration detail:
-    v1.6.4 could write a NEW lower HWM snapshot after deployment. Therefore
-    reading only the latest METALS_BASKET row is not enough to repair history.
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for (review_id, _link_id), d in latest_per_pair.items():
+            risk = (
+                safe_float(d.get("estimated_risk_amount"))
+                or safe_float(d.get("requested_risk_amount"))
+                or _metals_demo_risk(d.get("asset"))
+            )
+            cash = float(safe_float(d.get("current_r")) or 0.0) * float(risk or 0.0)
+            g = grouped.setdefault(
+                review_id,
+                {"gbp": 0.0, "r": 0.0, "seen_at": safe_str(d.get("created_at_utc"))},
+            )
+            g["gbp"] += cash
+            g["r"] += float(safe_float(d.get("current_r")) or 0.0)
+            if safe_str(d.get("created_at_utc")):
+                g["seen_at"] = safe_str(d.get("created_at_utc"))
 
-    We identify the current continuous basket using the latest FAMILY snapshot
-    whose open_count was zero. Within rows after that flat boundary, we select
-    the largest persisted cash high-water. If there is no flat boundary in the
-    retained data, we use the best recorded family HWM available.
+        if grouped:
+            best_id, best = max(grouped.items(), key=lambda kv: kv[1]["gbp"])
+            if best["gbp"] > 0:
+                candidates.append({
+                    **best,
+                    "source": f"manager_review_reconstruction:{best_id}",
+                })
+    except Exception:
+        pass
 
-    This is read-only historical recovery. It does not change strategy logic.
-    """
-    last_flat = conn.execute("""
-        SELECT id, created_at_utc
-        FROM metals_demo_basket_snapshots
-        WHERE basket_key='METALS_BASKET'
-          AND scope='FAMILY'
-          AND COALESCE(open_count,0)=0
-        ORDER BY id DESC
-        LIMIT 1
-    """).fetchone()
+    # Explicit operator floor (never active unless deliberately configured).
+    if METALS_HWM_RECOVERY_FLOOR_GBP > 0:
+        candidates.append({
+            "gbp": float(METALS_HWM_RECOVERY_FLOOR_GBP),
+            "r": 0.0,
+            "seen_at": (
+                METALS_HWM_RECOVERY_FLOOR_SEEN_AT
+                or _metals_latest_signal_observation_time(conn)
+            ),
+            "source": "operator_recovery_floor",
+        })
 
-    boundary_id = int(last_flat["id"]) if last_flat else 0
-
-    row = conn.execute("""
-        SELECT
-            id,
-            created_at_utc,
-            review_signal_id,
-            open_count,
-            basket_r,
-            basket_pnl_gbp,
-            high_water_r,
-            high_water_pnl_gbp,
-            high_water_seen_at
-        FROM metals_demo_basket_snapshots
-        WHERE basket_key='METALS_BASKET'
-          AND scope='FAMILY'
-          AND id > ?
-          AND (
-                COALESCE(high_water_pnl_gbp,0) > 0
-                OR COALESCE(basket_pnl_gbp,0) > 0
-              )
-        ORDER BY
-            CASE
-                WHEN COALESCE(high_water_pnl_gbp,0) > COALESCE(basket_pnl_gbp,0)
-                THEN COALESCE(high_water_pnl_gbp,0)
-                ELSE COALESCE(basket_pnl_gbp,0)
-            END DESC,
-            id DESC
-        LIMIT 1
-    """, (boundary_id,)).fetchone()
-
-    if not row:
-        return {
-            "high_water_gbp": 0.0,
-            "high_water_r": 0.0,
-            "high_water_seen_at": "",
-            "source": "none",
-            "snapshot_id": None,
-            "boundary_flat_snapshot_id": boundary_id or None,
-        }
-
-    stored_hwm_gbp = safe_float(row["high_water_pnl_gbp"])
-    basket_gbp = safe_float(row["basket_pnl_gbp"])
-    high_water_gbp = max(
-        float(stored_hwm_gbp or 0.0),
-        float(basket_gbp or 0.0),
-    )
-
-    # Prefer the persisted HWM R. If that field is absent, the basket R on the
-    # selected peak row is still a better continuity seed than resetting to zero.
-    high_water_r = float(
-        safe_float(row["high_water_r"])
-        or safe_float(row["basket_r"])
-        or 0.0
-    )
-
-    seen = safe_str(row["high_water_seen_at"])
-    if not seen:
-        seen = safe_str(row["created_at_utc"])
-
+    best = max(candidates, key=lambda x: float(x.get("gbp") or 0.0), default=None)
     return {
-        "high_water_gbp": high_water_gbp,
-        "high_water_r": high_water_r,
-        "high_water_seen_at": seen,
-        "source": "best_current_cycle_family_hwm",
-        "snapshot_id": int(row["id"]),
-        "boundary_flat_snapshot_id": boundary_id or None,
+        "best": best or {},
+        "candidates": candidates,
+        "boundary": boundary,
+        "boundary_time": boundary_time,
     }
+
+
+def _metals_pending_close_retry_tick(limit: int = 25) -> Dict[str, Any]:
+    """Retry only already-durable close requests; does not create new decisions."""
+    with get_conn() as conn:
+        rows = [
+            dict(r) for r in conn.execute("""
+                SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,
+                       l.asset,l.instrument,l.status AS link_status
+                FROM metals_demo_action_queue q
+                JOIN metals_demo_trade_links l ON l.id=q.link_id
+                WHERE q.action='CLOSE'
+                  AND q.status IN ('PENDING','RETRY')
+                  AND l.status='OPEN'
+                ORDER BY q.id
+                LIMIT ?
+            """, (max(1, min(int(limit), 100)),)).fetchall()
+        ]
+    results = []
+    for q in rows:
+        link = dict(q)
+        link["id"] = q.get("link_id")
+        results.append({
+            "queue_id": q.get("id"),
+            "link_id": q.get("link_id"),
+            "result": _metals_demo_close(link, int(q["id"])),
+        })
+    return {"ok": True, "checked": len(rows), "results": results}
+
+
+def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
+    """Self-heal manager/reconciliation state without inventing extra decisions.
+
+    - Always reconciles proven local ghosts.
+    - A full strategy review only occurs when a newer stored hourly signal has
+      not yet been reviewed.
+    - If the signal is stale / market is closed, the catch-up is state-only:
+      metrics/fixed-48h/snapshots are refreshed, but NEW close/stop/defence
+      actions are suppressed. The next fresh signal resumes normal authority.
+    - Existing durable CLOSE retries are retried only while OANDA says the
+      Metals market is tradeable.
+    """
+    global _METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC, _METALS_MANAGER_WORKER_LAST_RESULT
+
+    if not METALS_DEMO_MANAGER_MAINTENANCE_ENABLED and not force:
+        result = {"ok": True, "enabled": False, "skipped": True, "reason": "disabled"}
+        _METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC = now_utc_iso()
+        _METALS_MANAGER_WORKER_LAST_RESULT = result
+        return result
+
+    if not _METALS_MANAGER_MAINT_LOCK.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "maintenance_already_running"}
+
+    try:
+        result: Dict[str, Any] = {
+            "ok": True,
+            "enabled": True,
+            "time_utc": now_utc_iso(),
+            "assets": {},
+        }
+        cfg = metals_demo_config_status()
+        if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
+            result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
+            return result
+
+        market = _metals_demo_market_state(force=force)
+        result["market"] = market
+
+        # Broker/local parity repair is not a strategy decision.
+        try:
+            result["ghost_reconciliation"] = metals_demo_reconcile_local_ghosts()
+        except Exception as exc:
+            result["ok"] = False
+            result["ghost_reconciliation"] = {
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"
+            }
+
+        now_dt = now_utc()
+        for asset in ("XAUUSD", "XAGUSD"):
+            with get_conn() as conn:
+                latest = _metals_demo_latest_signal_row(conn, asset)
+                open_rows = [
+                    dict(r) for r in conn.execute("""
+                        SELECT id,manager_last_review_signal_id,status
+                        FROM metals_demo_trade_links
+                        WHERE status='OPEN' AND asset=?
+                        ORDER BY id
+                    """, (asset,)).fetchall()
+                ]
+
+            latest_id = int(latest["id"]) if latest else 0
+            latest_received = safe_str(latest["received_at_utc"]) if latest else ""
+            latest_dt = parse_dt(latest_received)
+            signal_age_seconds = (
+                (now_dt - latest_dt).total_seconds() if latest_dt is not None else None
+            )
+            needs_review = bool(
+                latest_id > 0
+                and open_rows
+                and any(
+                    int(safe_float(r.get("manager_last_review_signal_id")) or 0) < latest_id
+                    for r in open_rows
+                )
+            )
+
+            fresh_signal = bool(
+                signal_age_seconds is not None
+                and signal_age_seconds <= METALS_DEMO_MANAGER_FRESH_SIGNAL_SECONDS
+            )
+            market_tradeable = market.get("tradeable") is True
+            allow_actions = bool(fresh_signal and market_tradeable)
+
+            asset_result: Dict[str, Any] = {
+                "latest_raw_signal_id": latest_id or None,
+                "latest_received_at_utc": latest_received,
+                "signal_age_seconds": signal_age_seconds,
+                "open_local_count": len(open_rows),
+                "needs_review": needs_review,
+                "allow_new_manager_actions": allow_actions,
+            }
+            if needs_review:
+                try:
+                    asset_result["reconcile"] = metals_demo_reconcile_and_close(
+                        asset,
+                        allow_actions=allow_actions,
+                        source="maintenance_worker",
+                    )
+                except Exception as exc:
+                    result["ok"] = False
+                    asset_result["reconcile"] = {
+                        "ok": False, "error": f"{type(exc).__name__}: {exc}"
+                    }
+            result["assets"][asset] = asset_result
+
+        # Persistent close-until-flat retries are allowed only while tradeable.
+        if market.get("tradeable") is True:
+            try:
+                result["close_retry"] = _metals_pending_close_retry_tick()
+            except Exception as exc:
+                result["ok"] = False
+                result["close_retry"] = {
+                    "ok": False, "error": f"{type(exc).__name__}: {exc}"
+                }
+        else:
+            result["close_retry"] = {
+                "ok": True, "skipped": True, "reason": "metals_market_not_tradeable"
+            }
+
+        return result
+    finally:
+        _METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC = now_utc_iso()
+        try:
+            _METALS_MANAGER_WORKER_LAST_RESULT = dict(locals().get("result") or {})
+        except Exception:
+            _METALS_MANAGER_WORKER_LAST_RESULT = {}
+        _METALS_MANAGER_MAINT_LOCK.release()
+
+
+def metals_demo_manager_worker_status() -> Dict[str, Any]:
+    thread = _METALS_MANAGER_WORKER_THREAD
+    return {
+        "enabled": bool(METALS_DEMO_MANAGER_MAINTENANCE_ENABLED),
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+        "interval_seconds": METALS_DEMO_MANAGER_MAINTENANCE_INTERVAL_SECONDS,
+        "fresh_signal_seconds": METALS_DEMO_MANAGER_FRESH_SIGNAL_SECONDS,
+        "last_heartbeat_utc": _METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC,
+        "last_result": _METALS_MANAGER_WORKER_LAST_RESULT,
+    }
+
+
+def _metals_demo_manager_maintenance_loop() -> None:
+    # Immediate startup repair so a restart does not wait an hour/new signal.
+    try:
+        metals_demo_manager_maintenance_tick(force=True)
+    except Exception as exc:
+        try:
+            log_system_event(
+                "metals_manager_worker_error",
+                f"startup tick: {type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+
+    while not _METALS_MANAGER_WORKER_STOP.wait(
+        METALS_DEMO_MANAGER_MAINTENANCE_INTERVAL_SECONDS
+    ):
+        try:
+            metals_demo_manager_maintenance_tick(force=False)
+        except Exception as exc:
+            try:
+                log_system_event(
+                    "metals_manager_worker_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+
+def start_metals_demo_manager_maintenance_worker() -> None:
+    global _METALS_MANAGER_WORKER_THREAD
+    if not METALS_DEMO_MANAGER_MAINTENANCE_ENABLED:
+        return
+    if _METALS_MANAGER_WORKER_THREAD is not None and _METALS_MANAGER_WORKER_THREAD.is_alive():
+        return
+    _METALS_MANAGER_WORKER_STOP.clear()
+    _METALS_MANAGER_WORKER_THREAD = threading.Thread(
+        target=_metals_demo_manager_maintenance_loop,
+        name="metals-manager-maintenance",
+        daemon=True,
+    )
+    _METALS_MANAGER_WORKER_THREAD.start()
 
 def _metals_tx_instrument(tx: Dict[str, Any]) -> str:
     instrument = safe_str(tx.get("instrument")).upper()
@@ -24076,7 +24248,7 @@ def metals_demo_reconcile_local_ghosts_endpoint():
     return metals_demo_reconcile_local_ghosts()
 
 
-def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
+def metals_demo_reconcile_and_close(asset: str = "", allow_actions: bool = True, source: str = "signal_or_manual") -> Dict[str, Any]:
     cfg=metals_demo_config_status()
     ghost_sweep = metals_demo_reconcile_local_ghosts(asset)
     if cfg["missing"] or METALS_DEMO_OANDA_ENV not in {"practice","live"}: return {"ok":False,"skipped":True,"reason":"config_not_ready"}
@@ -24101,20 +24273,25 @@ def metals_demo_reconcile_and_close(asset: str = "") -> Dict[str, Any]:
             conn.execute("""UPDATE metals_demo_trade_links SET updated_at_utc=?,last_known_price=?,last_known_unrealized_pl=?,manager_current_r=?,manager_high_water_r=?,manager_mfe_r=?,manager_mae_r=?,manager_last_review_signal_id=?,manager_last_review_candles=?,manager_last_decision=?,manager_last_reason=?,fixed_48h_price=COALESCE(fixed_48h_price,?),fixed_48h_r=COALESCE(fixed_48h_r,?),fixed_48h_recorded_at_utc=CASE WHEN fixed_48h_r IS NULL AND ? IS NOT NULL THEN ? ELSE fixed_48h_recorded_at_utc END WHERE id=?""",(now_utc_iso(),m.get("current_price"),upl,m.get("current_r"),m.get("high_water_r"),m.get("mfe_r"),m.get("mae_r"),m.get("latest_signal_id"),hold,d.get("decision"),d.get("reason"),m.get("fixed_48h_price"),m.get("fixed_48h_r"),m.get("fixed_48h_r"),now_utc_iso(),int(link["id"]))); conn.commit()
         link.update({"manager_current_r":m.get("current_r"),"manager_high_water_r":m.get("high_water_r"),"manager_last_review_candles":hold})
         stop_result={"status":"NO_UPDATE"}; close_status=""
-        if METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED:
+        if allow_actions and METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED:
             if safe_str(d.get("decision")).startswith("CLOSE"):
                 q=_metals_demo_queue_close(link,safe_str(d.get("reason")),m.get("latest_signal_id")); cr=_metals_demo_close(link,q); close_status=safe_str(cr.get("status"))
             elif d.get("decision")=="EXTEND": stop_result=_metals_demo_update_stop(link,_metals_demo_stop_candidate(link,m))
+        elif not allow_actions:
+            stop_result={"status":"SUPPRESSED_STALE_MAINTENANCE_CATCHUP"}
+            close_status="SUPPRESSED_STALE_MAINTENANCE_CATCHUP"
         with get_conn() as conn:
             conn.execute("INSERT INTO metals_demo_manager_reviews (created_at_utc,link_id,raw_signal_id,review_signal_id,asset,instrument,side,hold_candles,current_price,current_r,mfe_r,mae_r,high_water_r,giveback_pct,direction_support,adverse_reversal,manager_phase,decision,reason,proposed_stop_price,stop_update_status,close_queue_status,fixed_48h_price,fixed_48h_r,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_utc_iso(),int(link["id"]),int(link.get("raw_signal_id") or 0),m.get("latest_signal_id"),link.get("asset"),link.get("instrument"),link.get("side"),hold,m.get("current_price"),m.get("current_r"),m.get("mfe_r"),m.get("mae_r"),m.get("high_water_r"),m.get("giveback_pct"),1 if m.get("direction_support") else 0,1 if m.get("adverse_reversal") else 0,d.get("phase"),d.get("decision"),d.get("reason"),stop_result.get("stop_price"),stop_result.get("status"),close_status,m.get("fixed_48h_price"),m.get("fixed_48h_r"),json.dumps({"metrics":m,"decision":d,"stop":stop_result},default=str))); conn.commit()
         results.append({"link_id":link["id"],"asset":link.get("asset"),"side":link.get("side"),"hold_candles":hold,"current_r":m.get("current_r"),"high_water_r":m.get("high_water_r"),"giveback_pct":m.get("giveback_pct"),"fixed_48h_r":m.get("fixed_48h_r"),"decision":d,"stop_result":stop_result,"close_queue_status":close_status,"unrealized_pl":upl})
-    snaps=_metals_demo_snapshot_baskets(review_signal_id); defence=_metals_demo_apply_basket_defence(asset,review_signal_id) if asset and METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED else []
+    snaps=_metals_demo_snapshot_baskets(review_signal_id)
+    defence=_metals_demo_apply_basket_defence(asset,review_signal_id) if allow_actions and asset and METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED else []
     retries=[]
-    with get_conn() as conn: queued=[dict(r) for r in conn.execute("SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,l.status AS link_status FROM metals_demo_action_queue q JOIN metals_demo_trade_links l ON l.id=q.link_id WHERE q.action='CLOSE' AND q.status IN ('PENDING','RETRY') AND l.status='OPEN' ORDER BY q.id LIMIT 25").fetchall()]
-    for q in queued:
-        l=dict(q); l["id"]=q.get("link_id"); retries.append({"queue_id":q.get("id"),"link_id":q.get("link_id"),"result":_metals_demo_close(l,int(q["id"]))})
+    if allow_actions:
+        with get_conn() as conn: queued=[dict(r) for r in conn.execute("SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,l.status AS link_status FROM metals_demo_action_queue q JOIN metals_demo_trade_links l ON l.id=q.link_id WHERE q.action='CLOSE' AND q.status IN ('PENDING','RETRY') AND l.status='OPEN' ORDER BY q.id LIMIT 25").fetchall()]
+        for q in queued:
+            l=dict(q); l["id"]=q.get("link_id"); retries.append({"queue_id":q.get("id"),"link_id":q.get("link_id"),"result":_metals_demo_close(l,int(q["id"]))})
     tx_sync=metals_demo_sync_broker_transactions(force=True)
-    return {"ok":True,"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync,"ghost_reconciliation":ghost_sweep}
+    return {"ok":True,"source":source,"allow_actions":bool(allow_actions),"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync,"ghost_reconciliation":ghost_sweep}
 
 
 def metals_demo_summary() -> Dict[str, Any]:
@@ -24140,23 +24317,29 @@ def metals_demo_summary() -> Dict[str, Any]:
     broker_realized=metals_demo_broker_realized_summary()
     actual_closed=float(safe_float(broker_realized.get("net_realized_gbp")) or 0.0)
     fixed=[safe_float(r.get("fixed_48h_r")) for r in links]; fixed=[float(v) for v in fixed if v is not None]
-    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review. Background maintenance self-heals missed/restart reconciliation without adding intra-hour decisions.","manager_worker":metals_demo_manager_worker_status(),"recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    risk_visibility={}
+    for asset in ["XAUUSD","XAGUSD"]:
+        vals=[float(safe_float(r.get("estimated_risk_amount")) or 0.0) for r in open_links if _metals_demo_asset(r.get("asset"))==asset and safe_float(r.get("estimated_risk_amount")) is not None]
+        p=previews.get(f"{asset}_LONG") or {}
+        risk_visibility[asset]={
+            "requested_risk_gbp":float(_metals_demo_risk(asset)),
+            "average_open_effective_risk_gbp":(sum(vals)/len(vals) if vals else None),
+            "current_preview_effective_risk_gbp":safe_float(p.get("estimated_risk_gbp")),
+            "minimum_size_applied":bool(p.get("minimum_size_applied")),
+        }
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"risk_visibility":risk_visibility,"manager_worker":metals_demo_manager_worker_status(),"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
     except Exception as e: return f'<details class="priority"><summary>Metals Demo Basket Manager</summary><div class="section-note warn">Unavailable: {esc(e)}</div></details>'
     cfg=snap["config"]; state="ENABLED" if cfg.get("orders_allowed") else "DISABLED / PREVIEW"; lane_class="status_green" if cfg.get("orders_allowed") else "status_amber"
-    worker=snap.get("manager_worker") or {}; worker_state="ALIVE" if worker.get("thread_alive") else ("DISABLED" if not worker.get("enabled") else "NOT RUNNING")
-    xau_prev=(snap.get("previews") or {}).get("XAUUSD_LONG") or {}; xag_prev=(snap.get("previews") or {}).get("XAGUSD_LONG") or {}
-    xau_req=safe_float(xau_prev.get("requested_risk_gbp")); xau_eff=safe_float(xau_prev.get("estimated_risk_gbp")); xag_req=safe_float(xag_prev.get("requested_risk_gbp")); xag_eff=safe_float(xag_prev.get("estimated_risk_gbp"))
-    risk_visibility=(f"XAU requested {money(xau_req,'GBP')} → effective {money(xau_eff,'GBP')}" if xau_eff is not None else f"XAU requested {money(xau_req,'GBP')} → effective n/a") + " | " + (f"XAG requested {money(xag_req,'GBP')} → effective {money(xag_eff,'GBP')}" if xag_eff is not None else f"XAG requested {money(xag_req,'GBP')} → effective n/a")
     sig=""
     for asset in ["XAUUSD","XAGUSD"]:
         item=snap["latest"].get(asset,{}); lc=item.get("long") or {}; sc=item.get("short_v2") or {}; sel=item.get("selected_demo_candidate") or {}; sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td><strong>{esc(sel.get('demo_side') or '-')}</strong></td></tr>"
     opens=""
     for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
     opens=opens or '<tr><td colspan="10">No open metals demo trades.</td></tr>'
-    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'} | Worker: {esc(worker_state)}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><div class='section-note small'><strong>Effective risk at current OANDA minimum size:</strong> {esc(risk_visibility)}. Any minimum-size overage is explicitly demo-only and is retained in audit/export data.</div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
+    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
 
 
 @app.get("/metals-short-shadow-v2")
@@ -24184,12 +24367,6 @@ def export_metals_short_shadow_v2_summary(limit: int = RESEARCH_ROW_EXPORT_LIMIT
 
 @app.get("/broker/metals-demo/status")
 def metals_demo_status_route() -> Dict[str, Any]: return metals_demo_summary()
-
-@app.get("/broker/metals-demo/manager-worker-status")
-def metals_demo_manager_worker_status_route() -> Dict[str, Any]: return metals_demo_manager_worker_status()
-
-@app.post("/broker/metals-demo/manager-maintenance")
-def metals_demo_manager_maintenance_route() -> Dict[str, Any]: return run_metals_demo_manager_maintenance_tick("manual_route")
 
 @app.get("/broker/metals-demo/preview/{asset}")
 def metals_demo_preview_route(asset: str, side: str = "short") -> Dict[str, Any]: return metals_demo_sizing_preview(asset, side)
@@ -24317,12 +24494,22 @@ def export_metals_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT) -> Resp
                 demo_manager_reviews = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_manager_reviews ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
                 demo_basket_snapshots = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_basket_snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
                 demo_action_queue = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+                demo_broker_transactions = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_broker_transactions ORDER BY transaction_time DESC LIMIT ?", (limit,)).fetchall()]
+                demo_runtime_state = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_runtime_state ORDER BY key").fetchall()]
+                try:
+                    ensure_metals_hwm_history_table()
+                    demo_hwm_events = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_hwm_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+                except Exception:
+                    demo_hwm_events = []
                 demo_open = [r for r in demo_links if safe_str(r.get("status")).upper() == "OPEN"]
             _write_zip_csv(zf, "metals-demo-broker-links.csv", demo_links, ["id"]); files.append("metals-demo-broker-links.csv")
             _write_zip_csv(zf, "metals-demo-execution-audit.csv", demo_audit, ["id"]); files.append("metals-demo-execution-audit.csv")
             _write_zip_csv(zf, "metals-demo-manager-reviews.csv", demo_manager_reviews, ["id"]); files.append("metals-demo-manager-reviews.csv")
             _write_zip_csv(zf, "metals-demo-basket-snapshots.csv", demo_basket_snapshots, ["id"]); files.append("metals-demo-basket-snapshots.csv")
             _write_zip_csv(zf, "metals-demo-action-queue.csv", demo_action_queue, ["id"]); files.append("metals-demo-action-queue.csv")
+            _write_zip_csv(zf, "metals-demo-broker-transactions.csv", demo_broker_transactions, ["transaction_id"]); files.append("metals-demo-broker-transactions.csv")
+            _write_zip_csv(zf, "metals-demo-runtime-state.csv", demo_runtime_state, ["key"]); files.append("metals-demo-runtime-state.csv")
+            _write_zip_csv(zf, "metals-demo-hwm-events.csv", demo_hwm_events, ["id"]); files.append("metals-demo-hwm-events.csv")
             _write_zip_csv(zf, "metals-demo-open-trades.csv", demo_open, ["id"]); files.append("metals-demo-open-trades.csv")
             _write_zip_json(zf, "metals-demo-summary.json", metals_demo_summary()); files.append("metals-demo-summary.json")
         except Exception as e:
@@ -30741,240 +30928,6 @@ def capture_ai_regime_snapshot(raw_signal_id):
     q=enqueue_ai_regime_observer(raw_signal_id) if api_eligible else {"queued":False,"reason":"event_driven_capture_only"}
     return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,"queue":q,"research_only":True}
 
-
-# ============================================================
-# METALS — 8H REGIME AGE RESEARCH
-# Research-only. No execution/manager authority.
-# ============================================================
-METALS_REGIME_AGE_BUCKETS = (
-    (0.0, 8.0, "0-8h"),
-    (8.0, 16.0, "8-16h"),
-    (16.0, 24.0, "16-24h"),
-    (24.0, 32.0, "24-32h"),
-    (32.0, 48.0, "32-48h"),
-    (48.0, 10**9, "48h+"),
-)
-
-def _metals_regime_age_bucket(hours_value):
-    h = float(safe_float(hours_value) or 0.0)
-    for lo, hi, label in METALS_REGIME_AGE_BUCKETS:
-        if lo <= h < hi:
-            return label
-    return "48h+"
-
-def ensure_metals_regime_age_table():
-    with get_conn() as conn:
-        id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS metals_regime_age_research (
-                id {id_type},
-                created_at_utc TEXT NOT NULL,
-                raw_signal_id BIGINT NOT NULL UNIQUE,
-                pair TEXT NOT NULL,
-                signal_time TEXT,
-                regime_8h TEXT,
-                regime_start_time TEXT,
-                regime_age_h REAL,
-                regime_age_bucket TEXT,
-                long_candidate INTEGER DEFAULT 0,
-                short_candidate INTEGER DEFAULT 0,
-                selected_side TEXT,
-                selected_candidate INTEGER DEFAULT 0,
-                source_note TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_regime_age_pair_time ON metals_regime_age_research(pair, signal_time)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_regime_age_regime ON metals_regime_age_research(pair, regime_8h, regime_age_bucket)")
-        conn.commit()
-
-def _metals_context8_from_raw(raw):
-    contexts = raw.get("contexts") or []
-    if isinstance(contexts, list):
-        for c in contexts:
-            if isinstance(c, dict) and safe_str(c.get("context_tf")).strip().upper() == "8H":
-                return c
-    return {"ctx_trend_state": raw.get("ctx_trend_state"), "context_tf": raw.get("context_tf")}
-
-def _metals_regime8_value(raw):
-    ctx8 = _metals_context8_from_raw(raw)
-    s = safe_str(ctx8.get("ctx_trend_state")).strip().upper()
-    if "BULL" in s: return "BULL"
-    if "BEAR" in s: return "BEAR"
-    if s in {"UP","LONG"}: return "BULL"
-    if s in {"DOWN","SHORT"}: return "BEAR"
-    return s or "UNKNOWN"
-
-def _metals_signal_time_from_row(row):
-    return safe_str(row.get("timestamp_readable") or row.get("timestamp") or row.get("created_at_utc"))
-
-def _metals_raw_from_row_for_regime_age(row):
-    try:
-        return _raw_signal_json(row)
-    except Exception:
-        try:
-            return json.loads(safe_str(row.get("raw_json")) or "{}")
-        except Exception:
-            return {}
-
-def _metals_compute_regime_age(conn, raw_signal_id, pair, regime_8h, signal_time):
-    current_dt = parse_dt(signal_time)
-    if current_dt is None:
-        return {"regime_start_time": signal_time, "regime_age_h": 0.0, "regime_age_bucket": "0-8h"}
-
-    rows = conn.execute(
-        "SELECT * FROM raw_signals WHERE pair=? AND id<=? ORDER BY id DESC LIMIT 500",
-        (pair, int(raw_signal_id))
-    ).fetchall()
-
-    start_dt = current_dt
-    for rr in rows:
-        d = dict(rr)
-        raw = _metals_raw_from_row_for_regime_age(d)
-        rr_regime = _metals_regime8_value(raw)
-        rr_dt = parse_dt(_metals_signal_time_from_row(d))
-        if rr_regime != regime_8h:
-            break
-        if rr_dt is not None:
-            start_dt = rr_dt
-
-    age_h = max(0.0, (current_dt - start_dt).total_seconds() / 3600.0)
-    return {
-        "regime_start_time": start_dt.isoformat(),
-        "regime_age_h": age_h,
-        "regime_age_bucket": _metals_regime_age_bucket(age_h),
-    }
-
-def record_metals_regime_age_research(raw_signal_id):
-    ensure_metals_regime_age_table()
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT * FROM metals_regime_age_research WHERE raw_signal_id=? LIMIT 1",
-            (int(raw_signal_id),)
-        ).fetchone()
-        if existing:
-            return dict(existing)
-
-        row = conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1", (int(raw_signal_id),)).fetchone()
-        if not row:
-            return {"ok": False, "reason": "raw_signal_missing"}
-        row = dict(row)
-        raw = _metals_raw_from_row_for_regime_age(row)
-
-        pair = _project_scope_pair(row.get("pair") or raw.get("pair"))
-        signal_time = _metals_signal_time_from_row(row)
-        regime_8h = _metals_regime8_value(raw)
-        age = _metals_compute_regime_age(conn, int(raw_signal_id), pair, regime_8h, signal_time)
-
-        try:
-            selected = metals_demo_candidate_for_row(raw, row)
-        except Exception:
-            selected = {}
-
-        selected_candidate = 1 if int(safe_float(selected.get("demo_candidate")) or 0) == 1 else 0
-        selected_side = safe_str(selected.get("demo_side")).lower()
-
-        long_candidate = 1 if (
-            truthy(raw.get("metal_long_candidate"))
-            if "truthy" in globals() else bool(raw.get("metal_long_candidate"))
-        ) else 0
-        short_candidate = 1 if (
-            truthy(raw.get("metal_short_candidate"))
-            if "truthy" in globals() else bool(raw.get("metal_short_candidate"))
-        ) else 0
-
-        if selected_candidate and selected_side == "long":
-            long_candidate = 1
-        if selected_candidate and selected_side == "short":
-            short_candidate = 1
-
-        conn.execute("""
-            INSERT INTO metals_regime_age_research(
-                created_at_utc, raw_signal_id, pair, signal_time,
-                regime_8h, regime_start_time, regime_age_h, regime_age_bucket,
-                long_candidate, short_candidate, selected_side, selected_candidate,
-                source_note
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            now_utc_iso(), int(raw_signal_id), pair, signal_time,
-            regime_8h, age["regime_start_time"], float(age["regime_age_h"]),
-            age["regime_age_bucket"], long_candidate, short_candidate,
-            selected_side, selected_candidate,
-            "research_only_point_in_time_8h_regime_age"
-        ))
-        conn.commit()
-
-        return {
-            "ok": True,
-            "raw_signal_id": int(raw_signal_id),
-            "pair": pair,
-            "regime_8h": regime_8h,
-            "regime_start_time": age["regime_start_time"],
-            "regime_age_h": float(age["regime_age_h"]),
-            "regime_age_bucket": age["regime_age_bucket"],
-            "selected_side": selected_side,
-            "selected_candidate": bool(selected_candidate),
-            "research_only": True,
-        }
-
-def build_metals_regime_age_research_html():
-    ensure_metals_regime_age_table()
-    with get_conn() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM metals_regime_age_research ORDER BY id DESC LIMIT 100"
-        ).fetchall()]
-    if not rows:
-        return '<div class="section-note small">No 8H regime-age research rows yet. The next Metals signal will start prospective logging.</div>'
-
-    trs = ""
-    for r in rows:
-        side = "LONG" if int(safe_float(r.get("long_candidate")) or 0) else ("SHORT" if int(safe_float(r.get("short_candidate")) or 0) else "—")
-        trs += f"""<tr>
-          <td>{esc(r.get('signal_time'))}</td>
-          <td><strong>{esc(r.get('pair'))}</strong></td>
-          <td><strong>{esc(r.get('regime_8h'))}</strong></td>
-          <td>{float(safe_float(r.get('regime_age_h')) or 0.0):.1f}h</td>
-          <td>{esc(r.get('regime_age_bucket'))}</td>
-          <td>{side}</td>
-          <td>{'YES' if int(safe_float(r.get('selected_candidate')) or 0) else 'NO'}</td>
-        </tr>"""
-
-    return f"""
-      <div class="section-note small">
-        <strong>Research only.</strong> Prospective age of the current confirmed 8H regime.
-        It has no entry, exit, sizing, stop, peer-confirmation or manager authority.
-      </div>
-      <div class="table-scroll"><table>
-        <thead><tr><th>Candle</th><th>Asset</th><th>8H Regime</th><th>Regime Age</th><th>Age Bucket</th><th>Candidate Side</th><th>Selected</th></tr></thead>
-        <tbody>{trs}</tbody>
-      </table></div>
-      <div class="section-note small"><a href="/export/metals-regime-age.csv">Export Metals 8H Regime Age CSV</a></div>
-    """
-
-@app.get("/export/metals-regime-age.csv")
-def export_metals_regime_age_csv(limit: int = 50000):
-    ensure_metals_regime_age_table()
-    limit = max(1, min(int(limit), 100000))
-    with get_conn() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM metals_regime_age_research ORDER BY id DESC LIMIT ?",
-            (limit,)
-        ).fetchall()]
-    out = io.StringIO()
-    if rows:
-        fields = []
-        for r in rows:
-            for k in r:
-                if k not in fields: fields.append(k)
-        w = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
-        w.writeheader(); w.writerows(rows)
-    else:
-        out.write("note\nNo Metals regime-age research rows yet\n")
-    return Response(
-        content=out.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="metals-regime-age.csv"'}
-    )
-
 # ============================================================
 # WEBHOOK
 # ============================================================
@@ -31094,12 +31047,6 @@ async def tradingview_webhook(
             },
         )
 
-    # Record prospective 8H regime-age research BEFORE deterministic processing.
-    try:
-        regime_age_research = record_metals_regime_age_research(int(new_id))
-    except Exception as _regage_exc:
-        regime_age_research = {"ok":False,"research_only":True,"error":f"{type(_regage_exc).__name__}: {_regage_exc}"}
-
     # Freeze AI regime-observer evidence BEFORE deterministic signal/broker processing.
     try:
         ai_regime_observer = capture_ai_regime_snapshot(int(new_id))
@@ -31130,7 +31077,6 @@ async def tradingview_webhook(
         "received_at_utc": received_at,
         "broker_auto_maintenance": broker_auto_maintenance,
         "ai_regime_observer": ai_regime_observer,
-        "regime_age_research": regime_age_research,
     }
 
 
@@ -32318,7 +32264,6 @@ def _mf_table(title,rows,cols):
 
 def build_metals_focused_research_html():
     return '<div class="section-note small"><strong>Focused Metals research.</strong> Same evidence themes as the Indices master plus the event-driven AI Regime Observer. All AI output is research-only with zero execution authority.</div>' + \
-      '<details class="research-inner"><summary>8H Regime Age — Prospective Research</summary><div class="research-inner-body">' + build_metals_regime_age_research_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
@@ -32533,144 +32478,152 @@ def _metals_broker_basket_r(broker: Dict[str, Any]) -> Dict[str, Any]:
 
 def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Persistent broker-authoritative Metals high-water with historical self-repair.
+    Persistent broker-authoritative Metals high-water.
 
-    v1.6.6 guarantees:
-      - failed broker reads never reset high-water;
-      - a deployment/restart cannot redefine an already-active basket's HWM;
-      - an HWM incorrectly reset by v1.6.4/v1.6.5 is repaired upward from the
-        best persisted HWM in the current continuous basket;
-      - genuine flat OANDA Metals state resets the cycle;
-      - new HWM timestamps use market/signal observation time, not arbitrary
-        Saturday/dashboard wall-clock time.
+    v1.6.9 continuity rules:
+      - a failed/partial OANDA read can NEVER reset HWM;
+      - HWM resets only after a successful broker read proves XAU/XAG open-count=0;
+      - while a basket is active HWM is monotonic;
+      - stored family/manager evidence can repair an accidentally lowered runtime HWM;
+      - timestamps use OANDA quote / latest signal market time, not deploy wall-clock;
+      - optional operator recovery floor is explicit and defaults to zero.
     """
+    ensure_metals_hwm_history_table()
+
     broker_ok = bool(broker.get("ok"))
     current_gbp = float(safe_float(broker.get("owned_unrealized_pl")) or 0.0)
     open_count = int(broker.get("owned_open_count") or 0)
-    r_state = _metals_broker_basket_r(broker) if broker_ok else {
-        "basket_r": 0.0, "linked_count": 0, "unlinked_broker_count": 0, "details": []
-    }
-    current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
 
     with get_conn() as conn:
         old_open = int(safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0)
         old_hwm_gbp = float(safe_float(_metals_runtime_get(conn, "broker_hwm_gbp", "0")) or 0.0)
         old_hwm_r = float(safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0)
         old_seen = _metals_runtime_get(conn, "broker_hwm_seen_at", "")
-        old_source = _metals_runtime_get(conn, "broker_hwm_source", "")
+        old_source = _metals_runtime_get(conn, "broker_hwm_source", "legacy_runtime_state")
 
-        # A failed read is NEVER evidence that the basket is flat.
+        # Never treat an API failure as a flat basket.
         if not broker_ok:
-            giveback_gbp = max(0.0, old_hwm_gbp - current_gbp)
-            giveback_r = max(0.0, old_hwm_r - current_r)
             return {
                 "current_gbp": current_gbp,
-                "current_r": current_r,
+                "current_r": 0.0,
                 "high_water_gbp": old_hwm_gbp,
                 "high_water_r": old_hwm_r,
                 "high_water_seen_at": old_seen,
-                "giveback_gbp": giveback_gbp,
-                "giveback_r": giveback_r,
-                "giveback_pct": (giveback_gbp / old_hwm_gbp * 100.0) if old_hwm_gbp > 0 else 0.0,
+                "giveback_gbp": max(0.0, old_hwm_gbp - current_gbp),
+                "giveback_r": 0.0,
+                "giveback_pct": (
+                    max(0.0, old_hwm_gbp - current_gbp) / old_hwm_gbp * 100.0
+                    if old_hwm_gbp > 0 else 0.0
+                ),
                 "open_count": old_open,
-                "linked_r_count": r_state.get("linked_count", 0),
-                "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
-                "r_details": r_state.get("details", []),
-                "source": old_source or "stored_runtime_broker_read_failed",
+                "linked_r_count": 0,
+                "unlinked_broker_count": 0,
+                "r_details": [],
+                "source": old_source or "stored_state_broker_read_failed",
+                "broker_read_ok": False,
                 "historical_repair": False,
             }
 
-        # Genuine OANDA Metals flat closes the basket cycle.
+        r_state = _metals_broker_basket_r(broker)
+        current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
+        observed_at = _metals_hwm_observation_time(conn)
+
+        # Only a successful broker read proving flat may reset the cycle.
         if open_count == 0:
+            if old_open > 0 or old_hwm_gbp > 0 or old_hwm_r > 0:
+                _record_metals_hwm_event(
+                    conn, "FLAT_RESET", observed_at, 0, 0.0, 0.0, 0.0, 0.0,
+                    "successful_oanda_flat",
+                    {"previous_hwm_gbp": old_hwm_gbp, "previous_hwm_r": old_hwm_r},
+                )
             _metals_runtime_set(conn, "broker_hwm_open_count", 0)
             _metals_runtime_set(conn, "broker_hwm_gbp", 0.0)
             _metals_runtime_set(conn, "broker_hwm_r", 0.0)
             _metals_runtime_set(conn, "broker_hwm_seen_at", "")
-            _metals_runtime_set(conn, "broker_hwm_v165_initialized", "1")
-            _metals_runtime_set(conn, "broker_hwm_v166_repair_checked", "1")
-            _metals_runtime_set(conn, "broker_hwm_source", "flat_reset")
+            _metals_runtime_set(conn, "broker_hwm_source", "successful_oanda_flat")
             conn.commit()
             return {
-                "current_gbp": 0.0,
-                "current_r": 0.0,
-                "high_water_gbp": 0.0,
-                "high_water_r": 0.0,
+                "current_gbp": 0.0, "current_r": 0.0,
+                "high_water_gbp": 0.0, "high_water_r": 0.0,
                 "high_water_seen_at": "",
-                "giveback_gbp": 0.0,
-                "giveback_r": 0.0,
+                "giveback_gbp": 0.0, "giveback_r": 0.0,
                 "giveback_pct": 0.0,
                 "open_count": 0,
                 "linked_r_count": r_state.get("linked_count", 0),
                 "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
                 "r_details": r_state.get("details", []),
-                "source": "flat_reset",
+                "source": "successful_oanda_flat",
+                "broker_read_ok": True,
                 "historical_repair": False,
             }
 
-        # Every ACTIVE basket checks its persisted cycle history. This is cheap
-        # and makes the system resilient even if a previous migration marker was
-        # already set after a bad deployment.
-        hist = _metals_historical_family_hwm_seed(conn)
-        hist_gbp = float(safe_float(hist.get("high_water_gbp")) or 0.0)
-        hist_r = float(safe_float(hist.get("high_water_r")) or 0.0)
-        hist_seen = safe_str(hist.get("high_water_seen_at"))
+        evidence = _metals_hwm_recovery_evidence(conn)
+        best = evidence.get("best") or {}
+        evidence_gbp = float(safe_float(best.get("gbp")) or 0.0)
+        evidence_r = float(safe_float(best.get("r")) or 0.0)
+        evidence_seen = safe_str(best.get("seen_at"))
+        evidence_source = safe_str(best.get("source"))
 
-        # Starting candidates. High-water may only move UP while the basket is active.
-        hwm_gbp = max(old_hwm_gbp, current_gbp)
-        hwm_r = max(old_hwm_r, current_r)
+        hwm_gbp = max(old_hwm_gbp, current_gbp, evidence_gbp)
+        hwm_r = max(old_hwm_r, current_r, evidence_r)
         seen = old_seen
-        source = old_source or "persistent_broker_hwm"
+        source = old_source or "legacy_runtime_state"
         historical_repair = False
 
-        # Repair a bad v1.6.4/v1.6.5 reset using the prior persisted active-cycle HWM.
-        if hist_gbp > hwm_gbp + 0.005:
-            hwm_gbp = hist_gbp
-            if hist_r > hwm_r:
-                hwm_r = hist_r
-            seen = hist_seen or seen
-            source = f"historical_hwm_repair:snapshot_{hist.get('snapshot_id')}"
+        if evidence_gbp > max(old_hwm_gbp, current_gbp) + 0.005:
+            seen = evidence_seen or observed_at
+            source = f"historical_repair:{evidence_source}"
             historical_repair = True
-
-        # If there was genuinely no prior active runtime state and no higher
-        # historical HWM, seed the current active basket from current broker UPL.
-        if hwm_gbp <= 0 and current_gbp > 0:
-            hwm_gbp = current_gbp
-            hwm_r = max(hwm_r, current_r)
-            seen = _metals_highwater_observation_time()
-            source = "current_broker_seed"
-
-        # Normal new high after continuity repair.
-        if current_gbp > hwm_gbp + 0.005:
-            hwm_gbp = current_gbp
-            seen = _metals_highwater_observation_time()
+        elif current_gbp > old_hwm_gbp + 0.005 and current_gbp >= evidence_gbp:
+            seen = observed_at
             source = "broker_cash_new_high"
-        if current_r > hwm_r + 0.000001:
-            hwm_r = current_r
+        elif not seen and hwm_gbp > 0:
+            seen = evidence_seen or observed_at
+            source = evidence_source or "active_basket_seed"
 
-        # If the historical record wins and its timestamp is known, never replace
-        # it with deployment wall-clock time.
-        if not seen and hwm_gbp > 0:
-            seen = hist_seen or _metals_highwater_observation_time()
+        # Repair an impossible post-market timestamp created by a deployment
+        # without ever lowering the cash HWM.
+        latest_signal_seen = _metals_latest_signal_observation_time(conn)
+        old_seen_dt = parse_dt(seen)
+        last_signal_dt = parse_dt(latest_signal_seen)
+        timestamp_repaired = False
+        if (
+            old_seen_dt is not None
+            and last_signal_dt is not None
+            and old_seen_dt > last_signal_dt + timedelta(hours=2)
+        ):
+            market = _metals_demo_market_state()
+            quote_dt = parse_dt(market.get("latest_price_time"))
+            cap_dt = quote_dt or last_signal_dt
+            if cap_dt is not None and old_seen_dt > cap_dt + timedelta(hours=2):
+                seen = safe_str(market.get("latest_price_time")) or latest_signal_seen
+                source = source + ":timestamp_repaired"
+                timestamp_repaired = True
 
+        previous_gbp = old_hwm_gbp
+        previous_seen = old_seen
         _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
         _metals_runtime_set(conn, "broker_hwm_gbp", hwm_gbp)
         _metals_runtime_set(conn, "broker_hwm_r", hwm_r)
         _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
-        _metals_runtime_set(conn, "broker_hwm_v165_initialized", "1")
-        _metals_runtime_set(conn, "broker_hwm_v166_repair_checked", "1")
         _metals_runtime_set(conn, "broker_hwm_source", source)
+
         if historical_repair:
-            _metals_runtime_set(
-                conn,
-                "broker_hwm_v166_last_repair",
-                json.dumps({
-                    "repaired_at_utc": now_utc_iso(),
-                    "old_hwm_gbp": old_hwm_gbp,
-                    "recovered_hwm_gbp": hwm_gbp,
-                    "historical_snapshot_id": hist.get("snapshot_id"),
-                    "historical_seen_at": hist_seen,
-                    "flat_boundary_snapshot_id": hist.get("boundary_flat_snapshot_id"),
-                }),
+            _record_metals_hwm_event(
+                conn, "HISTORICAL_REPAIR", seen, open_count,
+                current_gbp, current_r, hwm_gbp, hwm_r, source,
+                {"previous_hwm_gbp": previous_gbp, "evidence": evidence},
+            )
+        elif current_gbp > previous_gbp + 0.005:
+            _record_metals_hwm_event(
+                conn, "NEW_HIGH", seen, open_count,
+                current_gbp, current_r, hwm_gbp, hwm_r, source,
+            )
+        elif timestamp_repaired and previous_seen != seen:
+            _record_metals_hwm_event(
+                conn, "TIMESTAMP_REPAIR", seen, open_count,
+                current_gbp, current_r, hwm_gbp, hwm_r, source,
+                {"previous_seen_at": previous_seen},
             )
         conn.commit()
 
@@ -32692,9 +32645,11 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         "unlinked_broker_count": r_state.get("unlinked_broker_count", 0),
         "r_details": r_state.get("details", []),
         "source": source,
+        "broker_read_ok": True,
         "historical_repair": historical_repair,
-        "historical_seed": hist,
+        "historical_evidence": evidence,
     }
+
 
 def _metals_trade_age_hours(link: Dict[str, Any], broker_trade: Optional[Dict[str, Any]] = None) -> int:
     """
@@ -32844,7 +32799,7 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "giveback_pct": giveback_pct,
             "high_water_source": safe_str(broker_hwm.get("source") or "OANDA_XAU_XAG_OPEN_PNL"),
             "high_water_historical_repair": bool(broker_hwm.get("historical_repair")),
-            "high_water_historical_seed": broker_hwm.get("historical_seed") or {},
+            "high_water_broker_read_ok": bool(broker_hwm.get("broker_read_ok", True)),
             "broker_r_linked_count": int(broker_hwm.get("linked_r_count") or 0),
             "broker_r_unlinked_count": int(broker_hwm.get("unlinked_broker_count") or 0),
             "basket_state": safe_str(
@@ -32854,6 +32809,8 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "orders_allowed": bool(cfg.get("orders_allowed")),
             "broker_margin_used": safe_float(broker.get("owned_margin_used")) or 0.0,
             "broker_account_open_count": int(broker.get("account_open_count") or 0),
+            "manager_worker": metals_demo_manager_worker_status(),
+            "risk_visibility": snap.get("risk_visibility") or {},
         },
         "signals": {
             "received_assets": signal_count,
@@ -33502,6 +33459,64 @@ def _metals_std_placeholder(key: str, title: str, note: str = "") -> str:
     """
 
 
+
+@app.get("/broker/metals-demo/highwater-recovery-preview")
+def metals_hwm_recovery_preview() -> Dict[str, Any]:
+    """Read-only HWM repair evidence. Never changes broker or strategy state."""
+    init_db()
+    broker = metals_demo_live_broker_snapshot()
+    with get_conn() as conn:
+        evidence = _metals_hwm_recovery_evidence(conn)
+        stored = {
+            "open_count": int(safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0),
+            "high_water_gbp": float(safe_float(_metals_runtime_get(conn, "broker_hwm_gbp", "0")) or 0.0),
+            "high_water_r": float(safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0),
+            "seen_at": _metals_runtime_get(conn, "broker_hwm_seen_at", ""),
+            "source": _metals_runtime_get(conn, "broker_hwm_source", ""),
+        }
+    return {
+        "status": "ok",
+        "read_only": True,
+        "stored_runtime_hwm": stored,
+        "current_broker_metals_upl": safe_float(broker.get("owned_unrealized_pl")),
+        "current_broker_open_count": int(broker.get("owned_open_count") or 0),
+        "recovery_evidence": evidence,
+        "operator_floor_gbp": METALS_HWM_RECOVERY_FLOOR_GBP,
+        "operator_floor_seen_at": METALS_HWM_RECOVERY_FLOOR_SEEN_AT,
+        "note": "Active HWM can only repair upward; automatic code never invents a historical value.",
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/build-integrity")
+def metals_build_integrity() -> Dict[str, Any]:
+    """Runtime proof that critical cumulative Metals components are present."""
+    critical = [
+        "execute_metals_demo_candidate",
+        "metals_demo_reconcile_and_close",
+        "metals_demo_reconcile_local_ghosts",
+        "metals_demo_manager_maintenance_tick",
+        "start_metals_demo_manager_maintenance_worker",
+        "record_metals_focused_research",
+        "build_metals_focused_research_html",
+        "build_ai_regime_observer_html",
+        "build_metals_short_shadow_v2_outcomes",
+        "export_metals_research_zip",
+        "export_metals_focused_research_zip",
+        "_metals_broker_highwater_state",
+        "metals_standard_dashboard",
+    ]
+    present = {name: callable(globals().get(name)) for name in critical}
+    return {
+        "status": "ok" if all(present.values()) else "warning",
+        "version": METALS_APP_VERSION,
+        "baseline": METALS_BUILD_BASELINE,
+        "critical_components": present,
+        "all_critical_present": all(present.values()),
+        "time_utc": now_utc_iso(),
+    }
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def metals_standard_dashboard() -> str:
     sections = "".join([
@@ -33542,7 +33557,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">{esc(METALS_APP_VERSION)} 8H Regime Age Research · XAU + XAG · OANDA practice only</div>
+<div class="sub">{esc(METALS_APP_VERSION)} · cumulative from known-good v1.6.2 · XAU + XAG · OANDA practice only</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -33572,10 +33587,11 @@ ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA Metals · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
-<div class="cards three">
+<div class="cards four">
 ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,'Latest XAU/XAG received',Number(g.received_assets||0)===2?'pos':'warn')}}
-${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,Number(g.received_assets||0)===2?'Missing none':'Waiting')}}
-${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}</div>`;
+${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}
+${{card('Manager Worker',(s.manager_worker&&s.manager_worker.thread_alive)?'ALIVE':'CHECK',`60s self-heal · ${{eh((s.manager_worker||{{}}).last_heartbeat_utc||'no heartbeat yet')}}`,(s.manager_worker&&s.manager_worker.thread_alive)?'pos':'warn')}}
+${{card('Risk Sizing',`XAU £${{Number((((s.risk_visibility||{{}}).XAUUSD||{{}}).requested_risk_gbp)||0).toFixed(0)}} · XAG £${{Number((((s.risk_visibility||{{}}).XAGUSD||{{}}).requested_risk_gbp)||0).toFixed(0)}}`,`Effective open avg XAU ${{money((((s.risk_visibility||{{}}).XAUUSD||{{}}).average_open_effective_risk_gbp))}} · XAG ${{money((((s.risk_visibility||{{}}).XAGUSD||{{}}).average_open_effective_risk_gbp))}}`,'warn')}}</div>`;
   st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`;
  }}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}
 }}
@@ -33593,7 +33609,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": METALS_APP_VERSION,
+        "version": "v1.6.2",
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
@@ -33610,49 +33626,3 @@ def metals_standard_status() -> Dict[str, Any]:
         },
         "time_utc": now_utc_iso(),
     }
-
-# ============================================================
-# v1.6.8 — CUMULATIVE RELEASE INTEGRITY GUARD
-# ============================================================
-_METALS_CRITICAL_CUMULATIVE_SYMBOLS = [
-    "build_metals_focused_research_html",
-    "record_metals_focused_research",
-    "build_metals_regime_age_research_html",
-    "build_ai_regime_observer_html",
-    "capture_ai_regime_snapshot",
-    "metals_demo_manager_worker_status",
-    "run_metals_demo_manager_maintenance_tick",
-    "start_metals_demo_manager_background_worker",
-    "metals_demo_reconcile_local_ghosts",
-    "metals_demo_reconcile_and_close",
-    "metals_demo_live_broker_snapshot",
-    "export_metals_research_zip",
-    "export_metals_focused_research_zip",
-    "metals_short_shadow_v2_route",
-    "tradingview_webhook",
-]
-
-@app.get("/build-integrity")
-def metals_build_integrity() -> Dict[str, Any]:
-    symbols = {name: callable(globals().get(name)) for name in _METALS_CRITICAL_CUMULATIVE_SYMBOLS}
-    route_paths = sorted({safe_str(getattr(r, "path", "")) for r in app.routes if safe_str(getattr(r, "path", ""))})
-    required_routes = [
-        "/dashboard", "/dashboard-full", "/dashboard/top",
-        "/broker/metals-demo/status", "/broker/metals-demo/reconcile",
-        "/broker/metals-demo/manager-worker-status", "/broker/metals-demo/manager-maintenance",
-        "/export/metals-research.zip", "/export/metals-focused-research.zip",
-        "/export/metals-regime-age.csv", "/export/ai-regime-observer.csv",
-        "/webhook/tradingview",
-    ]
-    routes = {path: path in route_paths for path in required_routes}
-    ok = all(symbols.values()) and all(routes.values())
-    return {
-        "status": "PASS" if ok else "FAIL",
-        "version": METALS_APP_VERSION,
-        "lineage": METALS_BUILD_LINEAGE,
-        "critical_symbols": symbols,
-        "critical_routes": routes,
-        "route_count": len(route_paths),
-        "time_utc": now_utc_iso(),
-    }
-
