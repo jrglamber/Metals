@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.10"
+METALS_APP_VERSION = "v1.6.11"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Standardised Dashboard + Safe Maintenance"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Dashboard + Harvest Visibility Parity"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -33423,7 +33423,47 @@ def _metals_std_execution_html() -> str:
       </div>
     """
 
+
+# Dashboard/research checkpoints only. No Metals execution path consumes these values.
+METALS_HARVEST_RESEARCH_LEVELS_R = (50.0, 100.0, 150.0, 200.0)
+
+def _metals_latest_30_signals_html(limit: int = 30) -> str:
+    init_db(); limit=max(1,min(int(limit or 30),100))
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM raw_signals WHERE UPPER(pair) IN ('XAUUSD','XAGUSD','XAU','XAG') ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+    body=[]
+    for r in rows:
+        raw=_raw_signal_json(r)
+        try: selected=metals_demo_candidate_for_row(raw,r)
+        except Exception as exc: selected={'demo_candidate':0,'demo_side':'','demo_state':'ERROR','demo_blockers':str(exc)}
+        asset=_project_scope_pair(r.get('pair')); lc=bool(raw.get('metal_long_candidate')) if 'metal_long_candidate' in raw else is_true(r.get('forward_test_candidate')); sc=bool(raw.get('metal_short_candidate')) if 'metal_short_candidate' in raw else False
+        contexts=raw.get('contexts') or []; ctx8=next((x for x in contexts if isinstance(x,dict) and safe_str(x.get('context_tf')).upper()=='8H'),{}); regime=safe_str(ctx8.get('ctx_trend_state') or raw.get('ctx_trend_state') or '-'); atr=safe_float(ctx8.get('ctx_atr_pct') or raw.get('ctx_atr_pct')); cand=bool(int(safe_float(selected.get('demo_candidate')) or 0)); blockers=selected.get('demo_blockers'); blockers='; '.join(str(x) for x in blockers) if isinstance(blockers,(list,tuple)) else safe_str(blockers or '-')
+        body.append(f'''<tr><td>{esc(r.get('id'))}</td><td>{esc(display_candle_time(r.get('timestamp_readable') or r.get('timestamp')))}</td><td><strong>{esc(asset)}</strong></td><td>{'TRUE' if lc else 'FALSE'}</td><td>{'TRUE' if sc else 'FALSE'}</td><td class="{'pos' if cand else 'neg'}"><strong>{'TRUE' if cand else 'FALSE'}</strong></td><td>{esc(safe_str(selected.get('demo_side') or '-').upper())}</td><td>{esc(regime)}</td><td>{'—' if atr is None else format(atr,'.3f')+'%'}</td><td>{esc(selected.get('demo_state') or '-')}</td><td>{esc(blockers)}</td><td>{_metals_fmt(r.get('exec_close'),3)}</td><td>{esc(r.get('signal_id'))}</td><td>{esc(r.get('received_at_utc'))}</td></tr>''')
+    if not body: return '<div class="section-note">No Metals signals stored yet.</div>'
+    return f'''<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> XAU/XAG long, short and final selected candidate state from the current deterministic selector.</div><div class="table-scroll"><table><thead><tr><th>ID</th><th>Candle</th><th>Asset</th><th>Long</th><th>Short</th><th>Selected Candidate</th><th>Side</th><th>8H Regime</th><th>8H ATR</th><th>State</th><th>Blockers</th><th>Price</th><th>Signal ID</th><th>Received UTC</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+
+def _metals_recently_closed_trades_html(limit: int = 30) -> str:
+    init_db(); limit=max(1,min(int(limit or 30),100))
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links WHERE UPPER(COALESCE(status,'')) <> 'OPEN' ORDER BY COALESCE(closed_at_utc,updated_at_utc,created_at_utc) DESC,id DESC LIMIT ?",(limit,)).fetchall()]
+    body=[]
+    for r in rows:
+        risk=safe_float(r.get('estimated_risk_amount')) or safe_float(r.get('requested_risk_amount')); pnl=safe_float(r.get('realized_pl')); rr=(pnl/risk) if pnl is not None and risk not in (None,0) else None; entry_dt=parse_dt(r.get('signal_time') or r.get('created_at_utc')); exit_dt=parse_dt(r.get('closed_at_utc') or r.get('updated_at_utc')); age_h=((exit_dt-entry_dt).total_seconds()/3600.0) if entry_dt and exit_dt else None
+        body.append(f'''<tr><td>{esc(r.get('closed_at_utc') or r.get('updated_at_utc'))}</td><td><strong>{esc(r.get('asset'))}</strong></td><td>{esc(safe_str(r.get('side')).upper())}</td><td>{esc(r.get('id'))}</td><td>{esc(r.get('broker_trade_id') or '-')}</td><td>{esc(r.get('signal_time') or r.get('created_at_utc'))}</td><td>{'—' if age_h is None else format(age_h,'.0f')+'h'}</td><td>{esc(r.get('close_reason') or r.get('status') or '-')}</td><td class="{pnl_class(pnl)}">{money(pnl,'GBP')}</td><td>{'—' if rr is None else format(rr,'.2f')+'R'}</td><td>{money(risk,'GBP')}</td><td>{_metals_fmt(r.get('entry_price'),3)}</td></tr>''')
+    if not body: return '<div class="section-note">No closed Metals broker-linked trades yet.</div>'
+    return f'''<div class="section-note small"><strong>Recently Closed Metals Trades.</strong> Latest 30 XAU/XAG broker-link closures with exact reason and realised result.</div><div class="table-scroll"><table><thead><tr><th>Closed</th><th>Asset</th><th>Side</th><th>Local ID</th><th>Broker ID</th><th>Entry Time</th><th>Age</th><th>Why Closed</th><th>Realised P&amp;L</th><th>Approx R</th><th>Effective Risk</th><th>Entry</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+
+def _metals_profit_harvesting_html() -> str:
+    broker=metals_demo_live_broker_snapshot(); hwm=_metals_broker_highwater_state(broker); realized=metals_demo_broker_realized_summary(); owned=broker.get('owned_open_trades') or []; profitable=[t for t in owned if float(safe_float(t.get('unrealizedPL')) or 0.0)>0]; pool=sum(float(safe_float(t.get('unrealizedPL')) or 0.0) for t in profitable); current_r=float(safe_float(hwm.get('current_r')) or 0.0); high_r=float(safe_float(hwm.get('high_water_r')) or 0.0); rows=[]
+    for level in METALS_HARVEST_RESEARCH_LEVELS_R:
+        reached=high_r>=level; rows.append(f'''<tr><td>{level:.0f}R</td><td class="{'pos' if reached else 'warn'}">{'OBSERVED / PASSED' if reached else 'NOT REACHED'}</td><td>RESEARCH ONLY</td><td>—</td><td>—</td><td>—</td><td>{'HWM has crossed this level' if reached else 'waiting'}</td></tr>''')
+    gb=float(safe_float(hwm.get('giveback_pct')) or 0.0); gbcls='neg' if gb>=50 else 'warn' if gb>=25 else 'pos'
+    return f'''<div class="section-note warn"><strong>Metals harvesting is NOT armed yet.</strong> Indices-style visibility while we finish choosing the live Metals ladder. Working research checkpoints: 50/100/150/200R. No percentage, broker close, stop change or stage execution is triggered here.</div><div class="metric-grid"><div class="mini-card"><div class="k">Current Basket P&amp;L</div><div class="v {pnl_class(hwm.get('current_gbp'))}">{money(hwm.get('current_gbp'),'GBP')}</div><div class="small">{current_r:.2f}R broker-derived</div></div><div class="mini-card"><div class="k">Protection High-Water</div><div class="v {pnl_class(hwm.get('high_water_gbp'))}">{money(hwm.get('high_water_gbp'),'GBP')}</div><div class="small">{high_r:.2f}R · {esc(hwm.get('high_water_seen_at') or 'time not recorded')}</div></div><div class="mini-card"><div class="k">Actual OANDA P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">Fresh XAU/XAG open-trade cash</div></div><div class="mini-card"><div class="k">Profitable Banking Pool</div><div class="v {pnl_class(pool)}">{money(pool,'GBP')}</div><div class="small">{len(profitable)} profitable trades</div></div><div class="mini-card"><div class="k">Giveback</div><div class="v {gbcls}">{money(hwm.get('giveback_gbp'),'GBP')} · {gb:.1f}%</div><div class="small">{float(safe_float(hwm.get('giveback_r')) or 0):.2f}R</div></div><div class="mini-card"><div class="k">Harvest Execution</div><div class="v warn">NOT ARMED</div><div class="small">Percentages not chosen yet</div></div><div class="mini-card"><div class="k">Open Metals Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">XAU/XAG only</div></div><div class="mini-card"><div class="k">Broker Realised</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">Accounting context only</div></div></div><h3>Working Metals Harvest Checkpoints — Decision Pending</h3><div class="table-scroll"><table><thead><tr><th>Level</th><th>Observed State</th><th>Execution State</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Note</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div><div class="section-note small"><strong>Next decision:</strong> after this reference basket completes, choose the bank percentages and whether the 50R-spaced ladder becomes executable.</div>'''
+
 _METALS_STD_SECTIONS = {
+    "latest-signals": ("Latest 30 Metals Signals", _metals_latest_30_signals_html),
+    "recent-closed": ("Recently Closed Metals Trades", _metals_recently_closed_trades_html),
+    "profit-harvesting": ("Profit Harvesting / Metals Protection Plan", _metals_profit_harvesting_html),
     "basket-manager": ("Basket Manager", _metals_std_basket_manager_html),
     "open-trades": ("Open Trades / Positions", _metals_std_open_trades_html),
     "broker": ("Broker / OANDA / Accounting", _metals_std_broker_html),
@@ -33504,6 +33544,9 @@ def metals_build_integrity() -> Dict[str, Any]:
         "export_metals_research_zip",
         "export_metals_focused_research_zip",
         "_metals_broker_highwater_state",
+        "_metals_latest_30_signals_html",
+        "_metals_recently_closed_trades_html",
+        "_metals_profit_harvesting_html",
         "metals_standard_dashboard",
     ]
     present = {name: callable(globals().get(name)) for name in critical}
@@ -33520,6 +33563,9 @@ def metals_build_integrity() -> Dict[str, Any]:
 @app.get("/dashboard", response_class=HTMLResponse)
 def metals_standard_dashboard() -> str:
     sections = "".join([
+        _metals_std_placeholder("latest-signals", "Latest 30 Metals Signals", "Actual XAU/XAG long, short, selected-candidate state and blockers."),
+        _metals_std_placeholder("recent-closed", "Recently Closed Metals Trades", "Latest 30 XAU/XAG closes with exact reason, realised GBP, approximate R and broker ID."),
+        _metals_std_placeholder("profit-harvesting", "Profit Harvesting / Metals Protection Plan", "Current basket/HWM/giveback plus 50/100/150/200R research checkpoints; execution remains unarmed pending ladder decision."),
         _metals_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48 reviews, protection milestones and close queue."),
         _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
         _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA practice lane and sizing previews."),
