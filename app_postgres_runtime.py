@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.11"
+METALS_APP_VERSION = "v1.6.12"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Dashboard + Harvest Visibility Parity"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Standardised Dashboard"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -33460,18 +33460,37 @@ def _metals_profit_harvesting_html() -> str:
     gb=float(safe_float(hwm.get('giveback_pct')) or 0.0); gbcls='neg' if gb>=50 else 'warn' if gb>=25 else 'pos'
     return f'''<div class="section-note warn"><strong>Metals harvesting is NOT armed yet.</strong> Indices-style visibility while we finish choosing the live Metals ladder. Working research checkpoints: 50/100/150/200R. No percentage, broker close, stop change or stage execution is triggered here.</div><div class="metric-grid"><div class="mini-card"><div class="k">Current Basket P&amp;L</div><div class="v {pnl_class(hwm.get('current_gbp'))}">{money(hwm.get('current_gbp'),'GBP')}</div><div class="small">{current_r:.2f}R broker-derived</div></div><div class="mini-card"><div class="k">Protection High-Water</div><div class="v {pnl_class(hwm.get('high_water_gbp'))}">{money(hwm.get('high_water_gbp'),'GBP')}</div><div class="small">{high_r:.2f}R · {esc(hwm.get('high_water_seen_at') or 'time not recorded')}</div></div><div class="mini-card"><div class="k">Actual OANDA P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">Fresh XAU/XAG open-trade cash</div></div><div class="mini-card"><div class="k">Profitable Banking Pool</div><div class="v {pnl_class(pool)}">{money(pool,'GBP')}</div><div class="small">{len(profitable)} profitable trades</div></div><div class="mini-card"><div class="k">Giveback</div><div class="v {gbcls}">{money(hwm.get('giveback_gbp'),'GBP')} · {gb:.1f}%</div><div class="small">{float(safe_float(hwm.get('giveback_r')) or 0):.2f}R</div></div><div class="mini-card"><div class="k">Harvest Execution</div><div class="v warn">NOT ARMED</div><div class="small">Percentages not chosen yet</div></div><div class="mini-card"><div class="k">Open Metals Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">XAU/XAG only</div></div><div class="mini-card"><div class="k">Broker Realised</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">Accounting context only</div></div></div><h3>Working Metals Harvest Checkpoints — Decision Pending</h3><div class="table-scroll"><table><thead><tr><th>Level</th><th>Observed State</th><th>Execution State</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Note</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div><div class="section-note small"><strong>Next decision:</strong> after this reference basket completes, choose the bank percentages and whether the 50R-spaced ladder becomes executable.</div>'''
 
+
+def _metals_standard_latest_signals_combined_html():
+    return _metals_latest_30_signals_html() + """
+      <details><summary>Current Signal State / Recent Signal Detail</summary>
+      <div class="research-inner-body">""" + _metals_std_signal_state_html() + """</div></details>"""
+
+
+def _metals_standard_broker_combined_html():
+    return _metals_std_broker_html() + """
+      <details><summary>Execution / Reconciliation</summary>
+      <div class="research-inner-body">""" + _metals_std_execution_html() + """</div></details>"""
+
+
+def _metals_standard_manager_protection_html():
+    return _metals_std_basket_manager_html() + """
+      <details open><summary>Profit Harvesting / Metals Protection Plan</summary>
+      <div class="research-inner-body">""" + _metals_profit_harvesting_html() + """</div></details>"""
+
+
 _METALS_STD_SECTIONS = {
-    "latest-signals": ("Latest 30 Metals Signals", _metals_latest_30_signals_html),
+    "latest-signals": ("Latest 30 Metals Signals", _metals_standard_latest_signals_combined_html),
     "recent-closed": ("Recently Closed Metals Trades", _metals_recently_closed_trades_html),
+    "open-trades": ("Open Trades / Positions", _metals_std_open_trades_html),
+    "broker": ("Broker / OANDA / Accounting", _metals_standard_broker_combined_html),
+    "manager-protection": ("Basket Manager / Profit Protection", _metals_standard_manager_protection_html),
+    "research": ("Metals Research / Evidence Lab", build_metals_focused_research_html),
     "profit-harvesting": ("Profit Harvesting / Metals Protection Plan", _metals_profit_harvesting_html),
     "basket-manager": ("Basket Manager", _metals_std_basket_manager_html),
-    "open-trades": ("Open Trades / Positions", _metals_std_open_trades_html),
-    "broker": ("Broker / OANDA / Accounting", _metals_std_broker_html),
     "execution": ("Execution / Reconciliation", _metals_std_execution_html),
     "signals": ("Signal State", _metals_std_signal_state_html),
-    "research": ("Metals Research / Evidence Lab", build_metals_focused_research_html),
 }
-
 
 @app.get("/dashboard/section/{section_key}", response_class=HTMLResponse)
 def metals_standard_section(section_key: str) -> str:
@@ -33563,15 +33582,12 @@ def metals_build_integrity() -> Dict[str, Any]:
 @app.get("/dashboard", response_class=HTMLResponse)
 def metals_standard_dashboard() -> str:
     sections = "".join([
-        _metals_std_placeholder("latest-signals", "Latest 30 Metals Signals", "Actual XAU/XAG long, short, selected-candidate state and blockers."),
-        _metals_std_placeholder("recent-closed", "Recently Closed Metals Trades", "Latest 30 XAU/XAG closes with exact reason, realised GBP, approximate R and broker ID."),
-        _metals_std_placeholder("profit-harvesting", "Profit Harvesting / Metals Protection Plan", "Current basket/HWM/giveback plus 50/100/150/200R research checkpoints; execution remains unarmed pending ladder decision."),
-        _metals_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48 reviews, protection milestones and close queue."),
+        _metals_std_placeholder("latest-signals", "Latest 30 Metals Signals", "Current XAU/XAG long, short and selected-candidate state plus signal detail."),
+        _metals_std_placeholder("recent-closed", "Recently Closed Metals Trades", "Latest XAU/XAG closes with exact reason, realised GBP, approximate R and broker ID."),
         _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
-        _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA practice lane and sizing previews."),
-        _metals_std_placeholder("execution", "Execution / Reconciliation", "Action queue, audit and scope guard."),
-        _metals_std_placeholder("signals", "Signal State", "XAU/XAG long + generated short v2 candidate state."),
-        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "High-water/banking outcomes, XAU/XAG alignment, trend efficiency and basket recovery. Everything inside remains collapsed until opened."),
+        _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA lane plus execution/reconciliation and sizing/accounting detail."),
+        _metals_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus the unarmed 50/100/150/200R Metals protection framework."),
+        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
     ])
 
     return f"""<!doctype html>
