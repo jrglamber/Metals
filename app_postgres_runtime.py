@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.15 Broker-Authoritative Realised P&L Parity + Standalone OANDA Practice
+# VERIFIED BUILD: Metals v1.6.16 Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
 import os
 import json
 import csv
@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.15"
+METALS_APP_VERSION = "v1.6.16"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Realised P&L Parity"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Fresh Signal Recovery"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -860,6 +860,26 @@ WEBHOOK_ASYNC_PROCESSING_ENABLED = os.getenv("WEBHOOK_ASYNC_PROCESSING_ENABLED",
 WEBHOOK_SIGNAL_QUEUE_MAXSIZE = max(50, min(int(float(os.getenv("WEBHOOK_SIGNAL_QUEUE_MAXSIZE", "1000"))), 10000))
 WEBHOOK_SIGNAL_WORKER_SLEEP_SECONDS = max(0.05, min(float(os.getenv("WEBHOOK_SIGNAL_WORKER_SLEEP_SECONDS", "0.25")), 5.0))
 
+# v1.6.16 — durable fresh-only Metals signal recovery.
+# Safety model:
+# - only signals received AFTER the first v1.6.16 recovery epoch are eligible;
+# - only recent PENDING signals are automatically requeued;
+# - old unfinished rows are marked LEGACY_NO_REPLAY and can never create a trade;
+# - stale RUNNING/ERROR rows are surfaced for review, never blindly replayed.
+METALS_SIGNAL_RECOVERY_ENABLED = os.getenv("METALS_SIGNAL_RECOVERY_ENABLED", "true").strip().lower() == "true"
+METALS_SIGNAL_RECOVERY_INTERVAL_SECONDS = max(
+    5.0, min(float(os.getenv("METALS_SIGNAL_RECOVERY_INTERVAL_SECONDS", "10")), 120.0)
+)
+METALS_SIGNAL_RECOVERY_MAX_AGE_SECONDS = max(
+    600, min(int(float(os.getenv("METALS_SIGNAL_RECOVERY_MAX_AGE_SECONDS", "21600"))), 86400)
+)
+METALS_SIGNAL_RECOVERY_STALE_AFTER_SECONDS = max(
+    30, min(int(float(os.getenv("METALS_SIGNAL_RECOVERY_STALE_AFTER_SECONDS", "90"))), 900)
+)
+METALS_SIGNAL_RECOVERY_BATCH_LIMIT = max(
+    1, min(int(float(os.getenv("METALS_SIGNAL_RECOVERY_BATCH_LIMIT", "20"))), 100)
+)
+
 # v10.0.61: latest-signal broker reconcile. This is NOT broad backlog promotion.
 # It only checks the most recent candidate=true NAS100/US500 signals shortly after they arrive
 # and repairs the specific gap where the raw signal is stored but the broker mirror did not open.
@@ -1262,6 +1282,7 @@ EXPORT_TABLES = {
     "basket-recovery-research": "basket_recovery_research",
     "index-short-regime-research": "index_short_regime_research",
     "live-signal-pipeline": "live_signal_pipeline_audit",
+    "metals-signal-processing": "metals_signal_processing_audit",
 }
 
 # v10.1.09: production/live-only bundle. Research-only tables are deliberately
@@ -1292,6 +1313,7 @@ LIVE_ANALYSIS_EXPORT_TABLES = {
     "index-protection-stages": "index_protection_stages",
     "index-protection-cohorts": "index_protection_cohort_trades",
     "live-signal-pipeline": "live_signal_pipeline_audit",
+    "metals-signal-processing": "metals_signal_processing_audit",
 }
 
 
@@ -8428,6 +8450,52 @@ def _init_db_full() -> None:
             ON live_signal_pipeline_audit(asset, received_at_utc)
         """)
 
+
+        # v1.6.16: Metals-specific durable processing state.
+        # This is deliberately separate from the dormant legacy index pipeline.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_signal_processing_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_signal_id INTEGER NOT NULL UNIQUE,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                received_at_utc TEXT,
+                asset TEXT,
+                signal_time TEXT,
+                signal_id TEXT,
+                candidate INTEGER DEFAULT 0,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                worker_source TEXT,
+                attempts INTEGER DEFAULT 0,
+                recovery_epoch_utc TEXT,
+                legacy_no_replay INTEGER DEFAULT 0,
+                details_json TEXT
+            )
+        """)
+        for metal_proc_col, metal_proc_type in [
+            ("raw_signal_id", "INTEGER"), ("created_at_utc", "TEXT"),
+            ("updated_at_utc", "TEXT"), ("received_at_utc", "TEXT"),
+            ("asset", "TEXT"), ("signal_time", "TEXT"), ("signal_id", "TEXT"),
+            ("candidate", "INTEGER"), ("stage", "TEXT"), ("status", "TEXT"),
+            ("reason", "TEXT"), ("worker_source", "TEXT"), ("attempts", "INTEGER"),
+            ("recovery_epoch_utc", "TEXT"), ("legacy_no_replay", "INTEGER"),
+            ("details_json", "TEXT"),
+        ]:
+            add_column_if_missing(
+                conn, "metals_signal_processing_audit",
+                metal_proc_col, metal_proc_type
+            )
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_metals_signal_processing_raw
+            ON metals_signal_processing_audit(raw_signal_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metals_signal_processing_status
+            ON metals_signal_processing_audit(status, received_at_utc)
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS broker_runtime_settings (
                 key TEXT PRIMARY KEY,
@@ -9597,6 +9665,434 @@ def live_pipeline_event_rows(limit: int = 5000) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+
+
+METALS_SIGNAL_RECOVERY_EPOCH_KEY = "metals_signal_recovery_epoch_v1_6_16"
+
+
+def metals_signal_recovery_epoch(conn: Any, create: bool = True) -> str:
+    """Persistent activation epoch.
+
+    Pre-v1.6.16 raw_signals are intentionally excluded from automatic recovery,
+    even if they have no processing audit row. This is the backfill firewall.
+    """
+    value = _runtime_setting_from_conn(
+        conn, METALS_SIGNAL_RECOVERY_EPOCH_KEY, ""
+    )
+    if value or not create:
+        return value
+    value = now_utc_iso()
+    _set_runtime_setting_from_conn(
+        conn, METALS_SIGNAL_RECOVERY_EPOCH_KEY, value
+    )
+    return value
+
+
+def upsert_metals_signal_processing_audit(
+    raw_signal_id: int,
+    stage: str,
+    status: str,
+    reason: str = "",
+    worker_source: str = "",
+    details: Any = None,
+    increment_attempts: bool = False,
+    legacy_no_replay: Optional[bool] = None,
+    conn: Optional[Any] = None,
+) -> None:
+    """Durable Metals processing state; never allowed to break execution."""
+    raw_signal_id = int(raw_signal_id or 0)
+    if raw_signal_id <= 0:
+        return
+
+    owns_conn = conn is None
+    c = conn
+    try:
+        if c is None:
+            c = get_conn()
+
+        sig = c.execute("""
+            SELECT id, received_at_utc, pair, timestamp_readable,
+                   signal_id, forward_test_candidate
+            FROM raw_signals
+            WHERE id=?
+            LIMIT 1
+        """, (raw_signal_id,)).fetchone()
+        if not sig:
+            return
+
+        asset = _project_scope_pair(sig["pair"])
+        if asset not in PROJECT_SCOPE_ALLOWED_PAIRS:
+            return
+
+        epoch = metals_signal_recovery_epoch(c, create=True)
+        details_json = ""
+        if details is not None:
+            try:
+                details_json = json.dumps(details, default=str)[:8000]
+            except Exception:
+                details_json = safe_str(details)[:8000]
+
+        existing = c.execute("""
+            SELECT id, attempts, legacy_no_replay
+            FROM metals_signal_processing_audit
+            WHERE raw_signal_id=?
+            LIMIT 1
+        """, (raw_signal_id,)).fetchone()
+
+        now = now_utc_iso()
+        attempts = int(existing["attempts"] or 0) if existing else 0
+        if increment_attempts:
+            attempts += 1
+
+        legacy_value = (
+            1 if legacy_no_replay else 0
+            if legacy_no_replay is not None
+            else int(existing["legacy_no_replay"] or 0) if existing else 0
+        )
+
+        if existing:
+            c.execute("""
+                UPDATE metals_signal_processing_audit
+                SET updated_at_utc=?,
+                    received_at_utc=?,
+                    asset=?,
+                    signal_time=?,
+                    signal_id=?,
+                    candidate=?,
+                    stage=?,
+                    status=?,
+                    reason=?,
+                    worker_source=?,
+                    attempts=?,
+                    recovery_epoch_utc=?,
+                    legacy_no_replay=?,
+                    details_json=CASE WHEN ?<>'' THEN ? ELSE details_json END
+                WHERE raw_signal_id=?
+            """, (
+                now,
+                safe_str(sig["received_at_utc"]),
+                asset,
+                safe_str(sig["timestamp_readable"]),
+                safe_str(sig["signal_id"]),
+                1 if is_true(sig["forward_test_candidate"]) else 0,
+                safe_str(stage),
+                safe_str(status),
+                safe_str(reason)[:2000],
+                safe_str(worker_source),
+                attempts,
+                epoch,
+                legacy_value,
+                details_json,
+                details_json,
+                raw_signal_id,
+            ))
+        else:
+            c.execute("""
+                INSERT INTO metals_signal_processing_audit (
+                    raw_signal_id, created_at_utc, updated_at_utc,
+                    received_at_utc, asset, signal_time, signal_id, candidate,
+                    stage, status, reason, worker_source, attempts,
+                    recovery_epoch_utc, legacy_no_replay, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                raw_signal_id, now, now,
+                safe_str(sig["received_at_utc"]),
+                asset,
+                safe_str(sig["timestamp_readable"]),
+                safe_str(sig["signal_id"]),
+                1 if is_true(sig["forward_test_candidate"]) else 0,
+                safe_str(stage), safe_str(status), safe_str(reason)[:2000],
+                safe_str(worker_source), attempts, epoch,
+                legacy_value, details_json,
+            ))
+
+        if owns_conn:
+            c.commit()
+    except Exception:
+        pass
+    finally:
+        if owns_conn and c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def metals_signal_recovery_status() -> Dict[str, Any]:
+    init_db()
+    now_dt = datetime.now(timezone.utc)
+    recent_cutoff = (
+        now_dt - timedelta(seconds=METALS_SIGNAL_RECOVERY_MAX_AGE_SECONDS)
+    ).isoformat()
+    stale_cutoff = (
+        now_dt - timedelta(seconds=METALS_SIGNAL_RECOVERY_STALE_AFTER_SECONDS)
+    ).isoformat()
+
+    with get_conn() as conn:
+        epoch = metals_signal_recovery_epoch(conn, create=True)
+
+        counts: Dict[str, int] = {}
+        for row in conn.execute("""
+            SELECT status, COUNT(*) AS c
+            FROM metals_signal_processing_audit
+            GROUP BY status
+        """).fetchall():
+            counts[safe_str(row["status"]).upper()] = int(row["c"] or 0)
+
+        eligible_row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM metals_signal_processing_audit
+            WHERE COALESCE(legacy_no_replay,0)=0
+              AND status='PENDING'
+              AND received_at_utc>=?
+              AND received_at_utc>=?
+              AND updated_at_utc<=?
+        """, (epoch, recent_cutoff, stale_cutoff)).fetchone()
+
+        stale_running_row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM metals_signal_processing_audit
+            WHERE COALESCE(legacy_no_replay,0)=0
+              AND status IN ('RUNNING','ERROR','REVIEW')
+              AND received_at_utc>=?
+        """, (epoch,)).fetchone()
+
+        pre_epoch_row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM raw_signals
+            WHERE UPPER(pair) IN ('XAUUSD','XAGUSD')
+              AND received_at_utc<?
+        """, (epoch,)).fetchone()
+
+        recent = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_signal_processing_audit
+                ORDER BY id DESC
+                LIMIT 50
+            """).fetchall()
+        ]
+
+    return {
+        "status": "ok",
+        "enabled": bool(METALS_SIGNAL_RECOVERY_ENABLED),
+        "recovery_epoch_utc": epoch,
+        "max_age_seconds": METALS_SIGNAL_RECOVERY_MAX_AGE_SECONDS,
+        "stale_after_seconds": METALS_SIGNAL_RECOVERY_STALE_AFTER_SECONDS,
+        "interval_seconds": METALS_SIGNAL_RECOVERY_INTERVAL_SECONDS,
+        "eligible_pending": int(eligible_row["c"] or 0) if eligible_row else 0,
+        "manual_review": int(stale_running_row["c"] or 0) if stale_running_row else 0,
+        "pre_epoch_rows_excluded": int(pre_epoch_row["c"] or 0) if pre_epoch_row else 0,
+        "status_counts": counts,
+        "recent": recent,
+        "time_utc": now_utc_iso(),
+    }
+
+
+def recover_fresh_metals_signals(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Requeue only fresh, never-started/still-PENDING Metals signals.
+
+    Critical safety rule:
+    RUNNING / ERROR rows are NOT automatically replayed. A broker call may have
+    partially succeeded before the process died, so blind replay could duplicate
+    an OANDA trade. They are surfaced as manual-review state instead.
+    """
+    if not METALS_SIGNAL_RECOVERY_ENABLED:
+        return {
+            "ok": True, "enabled": False, "requeued": 0,
+            "legacy_marked": 0, "manual_review": 0,
+        }
+
+    batch = max(
+        1, min(int(limit or METALS_SIGNAL_RECOVERY_BATCH_LIMIT), 100)
+    )
+    now_dt = datetime.now(timezone.utc)
+    recent_cutoff = (
+        now_dt - timedelta(seconds=METALS_SIGNAL_RECOVERY_MAX_AGE_SECONDS)
+    ).isoformat()
+    stale_cutoff = (
+        now_dt - timedelta(seconds=METALS_SIGNAL_RECOVERY_STALE_AFTER_SECONDS)
+    ).isoformat()
+
+    with get_conn() as conn:
+        epoch = metals_signal_recovery_epoch(conn, create=True)
+
+        # Any unfinished audited row that ages beyond the recovery window is
+        # permanently isolated from automatic replay.
+        legacy_rows = conn.execute("""
+            SELECT raw_signal_id
+            FROM metals_signal_processing_audit
+            WHERE COALESCE(legacy_no_replay,0)=0
+              AND status NOT IN ('COMPLETE','SKIPPED','LEGACY_NO_REPLAY')
+              AND received_at_utc<?
+            ORDER BY raw_signal_id ASC
+            LIMIT 500
+        """, (recent_cutoff,)).fetchall()
+
+        for row in legacy_rows:
+            upsert_metals_signal_processing_audit(
+                int(row["raw_signal_id"]),
+                "LEGACY_NO_REPLAY",
+                "LEGACY_NO_REPLAY",
+                (
+                    "Aged beyond fresh recovery window; retained for audit and "
+                    "permanently excluded from automatic execution replay."
+                ),
+                worker_source="metals_recovery_worker",
+                legacy_no_replay=True,
+                conn=conn,
+            )
+
+        # Fresh raw signals created after the recovery epoch but missing an
+        # audit row are safe to adopt as PENDING. This covers a crash between
+        # raw_signals commit and audit creation.
+        missing_audit = conn.execute("""
+            SELECT r.id
+            FROM raw_signals r
+            LEFT JOIN metals_signal_processing_audit a
+              ON a.raw_signal_id=r.id
+            WHERE a.id IS NULL
+              AND UPPER(r.pair) IN ('XAUUSD','XAGUSD')
+              AND r.received_at_utc>=?
+              AND r.received_at_utc>=?
+              AND r.received_at_utc<=?
+            ORDER BY r.id ASC
+            LIMIT ?
+        """, (epoch, recent_cutoff, stale_cutoff, batch)).fetchall()
+
+        for row in missing_audit:
+            upsert_metals_signal_processing_audit(
+                int(row["id"]),
+                "RECOVERY_DISCOVERED",
+                "PENDING",
+                "Fresh post-epoch raw signal had no processing audit row.",
+                worker_source="metals_recovery_worker",
+                conn=conn,
+            )
+
+        conn.commit()
+
+        eligible = conn.execute("""
+            SELECT raw_signal_id
+            FROM metals_signal_processing_audit
+            WHERE COALESCE(legacy_no_replay,0)=0
+              AND status='PENDING'
+              AND received_at_utc>=?
+              AND received_at_utc>=?
+              AND updated_at_utc<=?
+            ORDER BY raw_signal_id ASC
+            LIMIT ?
+        """, (epoch, recent_cutoff, stale_cutoff, batch)).fetchall()
+
+        manual_review_row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM metals_signal_processing_audit
+            WHERE COALESCE(legacy_no_replay,0)=0
+              AND status IN ('RUNNING','ERROR','REVIEW')
+              AND received_at_utc>=?
+        """, (epoch,)).fetchone()
+
+    requeued: List[int] = []
+    queue_errors: List[Dict[str, Any]] = []
+
+    for row in eligible:
+        raw_id = int(row["raw_signal_id"])
+        try:
+            enqueue_result = enqueue_raw_signal_for_processing(raw_id)
+            if enqueue_result.get("queued") or enqueue_result.get("fallback_started"):
+                requeued.append(raw_id)
+                upsert_metals_signal_processing_audit(
+                    raw_id,
+                    "RECOVERY_QUEUED",
+                    "PENDING",
+                    "Fresh stale PENDING signal requeued by recovery worker.",
+                    worker_source="metals_recovery_worker",
+                    details=enqueue_result,
+                )
+            else:
+                queue_errors.append({
+                    "raw_signal_id": raw_id,
+                    "reason": safe_str(enqueue_result.get("reason")),
+                })
+        except Exception as exc:
+            queue_errors.append({
+                "raw_signal_id": raw_id,
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+
+    result = {
+        "ok": not queue_errors,
+        "enabled": True,
+        "requeued": len(requeued),
+        "requeued_ids": requeued,
+        "legacy_marked": len(legacy_rows),
+        "manual_review": int(manual_review_row["c"] or 0)
+            if manual_review_row else 0,
+        "queue_errors": queue_errors,
+        "time_utc": now_utc_iso(),
+    }
+
+    if requeued or legacy_rows or queue_errors:
+        try:
+            log_system_event(
+                "metals_signal_recovery_tick",
+                json.dumps(result, default=str)[:2500],
+            )
+        except Exception:
+            pass
+    return result
+
+
+_metals_signal_recovery_worker_started = False
+_metals_signal_recovery_worker_thread: Optional[threading.Thread] = None
+_metals_signal_recovery_worker_last_heartbeat_utc = ""
+
+
+def metals_signal_recovery_background_loop() -> None:
+    global _metals_signal_recovery_worker_last_heartbeat_utc
+    while True:
+        _metals_signal_recovery_worker_last_heartbeat_utc = now_utc_iso()
+        try:
+            recover_fresh_metals_signals()
+        except Exception as exc:
+            try:
+                log_system_event(
+                    "metals_signal_recovery_error",
+                    f"{type(exc).__name__}: {exc}"[:1800],
+                )
+            except Exception:
+                pass
+        _metals_signal_recovery_worker_last_heartbeat_utc = now_utc_iso()
+        time.sleep(METALS_SIGNAL_RECOVERY_INTERVAL_SECONDS)
+
+
+def start_metals_signal_recovery_worker() -> None:
+    global _metals_signal_recovery_worker_started
+    global _metals_signal_recovery_worker_thread
+
+    if not METALS_SIGNAL_RECOVERY_ENABLED:
+        return
+    if (
+        _metals_signal_recovery_worker_thread is not None
+        and _metals_signal_recovery_worker_thread.is_alive()
+    ):
+        _metals_signal_recovery_worker_started = True
+        return
+
+    # Create/persist epoch BEFORE the worker can scan raw_signals.
+    with get_conn() as conn:
+        metals_signal_recovery_epoch(conn, create=True)
+        conn.commit()
+
+    _metals_signal_recovery_worker_started = True
+    _metals_signal_recovery_worker_thread = threading.Thread(
+        target=metals_signal_recovery_background_loop,
+        name="metals-fresh-signal-recovery",
+        daemon=True,
+    )
+    _metals_signal_recovery_worker_thread.start()
+
+
 _signal_processing_queue: "queue.Queue[int]" = queue.Queue(maxsize=WEBHOOK_SIGNAL_QUEUE_MAXSIZE)
 _signal_processing_worker_started = False
 _signal_processing_worker_thread: Optional[threading.Thread] = None
@@ -9621,6 +10117,14 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
     # shadow manager, broker mirror, protection, harvest, reconciliation or close logic.
     if PROJECT_SCOPE == "METALS_ONLY":
         try:
+            upsert_metals_signal_processing_audit(
+                int(new_signal_db_id),
+                "PROCESSING",
+                "RUNNING",
+                "Background worker began deterministic Metals processing.",
+                worker_source=source,
+                increment_attempts=True,
+            )
             with get_conn() as _scope_conn:
                 _scope_row = _scope_conn.execute(
                     "SELECT pair FROM raw_signals WHERE id=? LIMIT 1",
@@ -9657,12 +10161,28 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
                 pass
             result["project_scope"] = PROJECT_SCOPE
             result["legacy_index_pipeline_executed"] = False
+            upsert_metals_signal_processing_audit(
+                int(new_signal_db_id),
+                "COMPLETE",
+                "COMPLETE",
+                "Deterministic Metals processing completed.",
+                worker_source=source,
+                details=result,
+            )
             return result
         except Exception as e:
             result["ok"] = False
             result["project_scope"] = PROJECT_SCOPE
             result["legacy_index_pipeline_executed"] = False
             result["metals_demo_lane"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            upsert_metals_signal_processing_audit(
+                int(new_signal_db_id),
+                "PROCESSING_ERROR",
+                "ERROR",
+                f"{type(e).__name__}: {e}",
+                worker_source=source,
+                details=result,
+            )
             return result
 
     # v10.0.93: before a new signal can create a fresh index trade, force-close
@@ -9814,6 +10334,15 @@ def enqueue_raw_signal_for_processing(raw_signal_id: int) -> Dict[str, Any]:
         status["queue_size"] = _signal_processing_queue.qsize()
         status["worker"] = signal_processing_worker_status()
         upsert_live_signal_pipeline_audit(raw_signal_id, "QUEUED", "PENDING", worker_source="webhook_enqueue", details=status)
+        if PROJECT_SCOPE == "METALS_ONLY":
+            upsert_metals_signal_processing_audit(
+                raw_signal_id,
+                "QUEUED",
+                "PENDING",
+                "Stored Metals signal queued for background deterministic processing.",
+                worker_source="webhook_enqueue",
+                details=status,
+            )
         return status
     except queue.Full:
         status["reason"] = "signal_processing_queue_full"
@@ -9854,6 +10383,14 @@ def signal_processing_background_loop() -> None:
         try:
             _signal_processing_worker_last_raw_signal_id = int(raw_signal_id)
             upsert_live_signal_pipeline_audit(int(raw_signal_id), "WORKER_DEQUEUED", "RUNNING", worker_source="signal_worker")
+            if PROJECT_SCOPE == "METALS_ONLY":
+                upsert_metals_signal_processing_audit(
+                    int(raw_signal_id),
+                    "WORKER_DEQUEUED",
+                    "PENDING",
+                    "Signal dequeued by main worker; deterministic processing about to start.",
+                    worker_source="signal_worker",
+                )
             acquired = _signal_processing_worker_lock.acquire(blocking=False)
             if acquired:
                 try:
@@ -10297,6 +10834,17 @@ def startup() -> None:
         start_signal_processing_background_worker()
     except Exception:
         pass
+    try:
+        if PROJECT_SCOPE == "METALS_ONLY":
+            start_metals_signal_recovery_worker()
+    except Exception as exc:
+        try:
+            log_system_event(
+                "metals_signal_recovery_worker_start_warning",
+                f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
     try:
         start_broker_retry_background_worker()
     except Exception:
@@ -16953,6 +17501,61 @@ def broker_cross_index_solo_guard() -> Dict[str, Any]:
     return cross_index_solo_guard_status_snapshot()
 
 
+@app.get("/metals/signal-recovery-status")
+def metals_signal_recovery_status_api() -> Dict[str, Any]:
+    snap = metals_signal_recovery_status()
+    snap["worker"] = {
+        "started_flag": bool(_metals_signal_recovery_worker_started),
+        "thread_alive": bool(
+            _metals_signal_recovery_worker_thread
+            and _metals_signal_recovery_worker_thread.is_alive()
+        ),
+        "last_heartbeat_utc": _metals_signal_recovery_worker_last_heartbeat_utc,
+    }
+    return snap
+
+
+@app.get("/export/metals-signal-processing.csv")
+def export_metals_signal_processing_csv(limit: int = 50000) -> Response:
+    init_db()
+    limit = max(1, min(int(limit or 50000), 100000))
+    with get_conn() as conn:
+        rows = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_signal_processing_audit
+                ORDER BY id DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        ]
+    return Response(
+        content=rows_to_csv(
+            rows,
+            [
+                "raw_signal_id", "received_at_utc", "asset", "signal_time",
+                "candidate", "stage", "status", "reason", "worker_source",
+                "attempts", "legacy_no_replay", "recovery_epoch_utc",
+            ],
+        ),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="metals-signal-processing.csv"'
+        },
+    )
+
+
+@app.post("/admin/metals/recover-fresh-signals")
+def admin_recover_fresh_metals_signals(
+    x_admin_secret: Optional[str] = Header(default=None),
+    limit: int = 20,
+) -> Dict[str, Any]:
+    check_admin(x_admin_secret)
+    return recover_fresh_metals_signals(
+        limit=max(1, min(int(limit or 20), 100))
+    )
+
+
 @app.get("/broker/live-signal-pipeline")
 def broker_live_signal_pipeline(limit: int = 250) -> Dict[str, Any]:
     rows = live_signal_pipeline_rows(limit=limit)
@@ -16967,6 +17570,8 @@ def broker_live_signal_pipeline(limit: int = 250) -> Dict[str, Any]:
         "cross_index_closed_trades_counted": False,
         "family_risk_budget_enabled": False,
         "signal_processing_worker": signal_processing_worker_status(),
+        "metals_signal_recovery": metals_signal_recovery_status()
+            if PROJECT_SCOPE == "METALS_ONLY" else {},
         "broker_retry_worker": broker_retry_worker_status(),
         "rows": rows,
         "time_utc": now_utc_iso(),
@@ -31146,6 +31751,22 @@ async def tradingview_webhook(
         raise HTTPException(status_code=503, detail="Signal could not be stored due to database contention")
 
     _webhook_ingress_finish(receipt_id,'STORED',pair=pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],raw_signal_id=new_id,detail='HTTP received, validated and stored in raw_signals')
+
+    # v1.6.16: durable Metals processing receipt. This is written before the
+    # in-memory queue is touched, so a crash/redeploy after raw storage can be
+    # safely recovered later — but only inside the fresh post-epoch window.
+    upsert_metals_signal_processing_audit(
+        int(new_id),
+        "STORED",
+        "PENDING",
+        "Webhook stored raw Metals signal; awaiting deterministic processing.",
+        worker_source="webhook",
+        details={
+            "pair": pair,
+            "signal_id": signal_id,
+            "timestamp": timestamp_info["timestamp_readable"],
+        },
+    )
 
     if is_live_pipeline_asset(pair) and is_true(forward_test_candidate):
         upsert_live_signal_pipeline_audit(int(new_id), "SIGNAL_STORED", "PENDING", "true live candidate stored; awaiting shadow/broker processing", worker_source="webhook", details={"pair":pair,"signal_id":signal_id,"timestamp":timestamp_info["timestamp_readable"],"exec_close":exec_close})
