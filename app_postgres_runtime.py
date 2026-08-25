@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.14 Signal Coverage Consistency + Standalone OANDA Practice
+# VERIFIED BUILD: Metals v1.6.15 Broker-Authoritative Realised P&L Parity + Standalone OANDA Practice
 import os
 import json
 import csv
@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.14"
+METALS_APP_VERSION = "v1.6.15"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Signal Coverage Consistency"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Realised P&L Parity"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -32830,16 +32830,20 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
         # truth used by /signal-coverage and cannot mix different candles.
         signal_coverage = build_signal_coverage(conn)
 
+        # v1.6.15: calendar realised P&L uses the same broker-authoritative
+        # OANDA transaction ledger as the Broker P&L tile. Previously these
+        # cards summed local trade-link realized_pl, which could lag or miss a
+        # broker-confirmed close and incorrectly show £0.
         wk = conn.execute(
-            """SELECT COALESCE(SUM(realized_pl),0) AS p
-               FROM metals_demo_trade_links
-               WHERE closed_at_utc>=?""",
+            """SELECT COALESCE(SUM(net_realized_gbp),0) AS p
+               FROM metals_demo_broker_transactions
+               WHERE transaction_time>=?""",
             (week_start.isoformat(),)
         ).fetchone()
         mo = conn.execute(
-            """SELECT COALESCE(SUM(realized_pl),0) AS p
-               FROM metals_demo_trade_links
-               WHERE closed_at_utc>=?""",
+            """SELECT COALESCE(SUM(net_realized_gbp),0) AS p
+               FROM metals_demo_broker_transactions
+               WHERE transaction_time>=?""",
             (month_start.isoformat(),)
         ).fetchone()
 
@@ -32887,9 +32891,9 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
         },
         "accounting": {
             "week_pnl": safe_float(wk["p"] if wk else 0) or 0.0,
-            "week_label": "Realised this week",
+            "week_label": "OANDA realised this week",
             "month_pnl": safe_float(mo["p"] if mo else 0) or 0.0,
-            "month_label": "Realised this month",
+            "month_label": "OANDA realised this month",
         },
         "strategy": {
             "open_pnl": broker_open_pnl,
