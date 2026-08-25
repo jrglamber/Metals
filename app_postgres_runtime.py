@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.12"
+METALS_APP_VERSION = "v1.6.13"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Standardised Dashboard"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Webhook Ingress Hardening"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -30929,6 +30929,139 @@ def capture_ai_regime_snapshot(raw_signal_id):
     return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,"queue":q,"research_only":True}
 
 # ============================================================
+# WEBHOOK INGRESS AUDIT / DELIVERY HARDENING
+# ============================================================
+def ensure_webhook_ingress_audit_table() -> None:
+    with get_conn() as conn:
+        id_type = "BIGSERIAL PRIMARY KEY" if _is_postgres_engine() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS webhook_ingress_audit (
+                id {id_type},
+                received_at_utc TEXT NOT NULL,
+                completed_at_utc TEXT,
+                status TEXT NOT NULL,
+                http_content_type TEXT,
+                body_size INTEGER,
+                body_preview_redacted TEXT,
+                pair TEXT,
+                signal_id TEXT,
+                signal_time TEXT,
+                raw_signal_id BIGINT,
+                detail TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_webhook_ingress_time ON webhook_ingress_audit(received_at_utc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_webhook_ingress_pair_status ON webhook_ingress_audit(pair,status,received_at_utc)")
+        conn.commit()
+
+
+def _redact_webhook_body_preview(raw_text: str, limit: int = 12000) -> str:
+    s = safe_str(raw_text)[:max(1000, int(limit))]
+    # Never persist webhook credentials into the audit table.
+    s = re.sub(r'(?i)("secret"\s*:\s*")[^"]*(")', r'\1***REDACTED***\2', s)
+    s = re.sub(r"(?i)('secret'\s*:\s*')[^']*(')", r'\1***REDACTED***\2', s)
+    return s
+
+
+def _webhook_ingress_begin(content_type: str, raw_text: str) -> Optional[int]:
+    try:
+        ensure_webhook_ingress_audit_table()
+        with get_conn() as conn:
+            rid = db_insert_returning_id(conn, """
+                INSERT INTO webhook_ingress_audit(
+                    received_at_utc,status,http_content_type,body_size,body_preview_redacted,detail
+                ) VALUES(?,?,?,?,?,?)
+            """, (now_utc_iso(),'RECEIVED',safe_str(content_type),len(raw_text.encode('utf-8',errors='ignore')),
+                  _redact_webhook_body_preview(raw_text),'HTTP request reached Railway'))
+            conn.commit()
+            return int(rid)
+    except Exception:
+        return None
+
+
+def _webhook_ingress_finish(receipt_id: Optional[int], status: str, *, pair: str = '', signal_id: str = '', signal_time: str = '', raw_signal_id: Any = None, detail: str = '') -> None:
+    if not receipt_id:
+        return
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                UPDATE webhook_ingress_audit
+                SET completed_at_utc=?,status=?,pair=?,signal_id=?,signal_time=?,raw_signal_id=?,detail=?
+                WHERE id=?
+            """, (now_utc_iso(),safe_str(status),safe_str(pair),safe_str(signal_id),safe_str(signal_time),
+                  int(raw_signal_id) if raw_signal_id is not None else None,safe_str(detail),int(receipt_id)))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def webhook_ingress_health(hours: int = 48) -> Dict[str, Any]:
+    ensure_webhook_ingress_audit_table()
+    hours=max(1,min(int(hours),168))
+    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("""
+            SELECT * FROM webhook_ingress_audit
+            WHERE received_at_utc>=?
+            ORDER BY id DESC LIMIT 2000
+        """,(cutoff,)).fetchall()]
+    owned=[r for r in rows if safe_str(r.get('pair')).upper() in {'XAUUSD','XAGUSD'}]
+    counts={}
+    pair_counts={'XAUUSD':0,'XAGUSD':0}
+    for r in rows:
+        st=safe_str(r.get('status') or 'UNKNOWN').upper(); counts[st]=counts.get(st,0)+1
+        p=safe_str(r.get('pair')).upper()
+        if p in pair_counts and st in {'STORED','DUPLICATE'}: pair_counts[p]+=1
+    failures=sum(v for k,v in counts.items() if k in {'INVALID_JSON','BAD_SECRET','DB_ERROR','STORE_FAILED'})
+    return {
+        'ok': failures==0,
+        'hours':hours,
+        'receipt_count':len(rows),
+        'owned_receipt_count':len(owned),
+        'status_counts':counts,
+        'pair_accepted_counts':pair_counts,
+        'latest':rows[:50],
+        'note':'RECEIVED proves the HTTP request reached Railway; STORED proves it entered raw_signals.'
+    }
+
+
+@app.get('/webhook/ingress-health')
+def webhook_ingress_health_route(hours: int = 48):
+    return webhook_ingress_health(hours)
+
+
+@app.get('/export/webhook-ingress.csv')
+def export_webhook_ingress_csv(limit: int = 5000):
+    ensure_webhook_ingress_audit_table(); limit=max(1,min(int(limit),50000))
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute('SELECT * FROM webhook_ingress_audit ORDER BY id DESC LIMIT ?',(limit,)).fetchall()]
+    out=io.StringIO()
+    fields=['id','received_at_utc','completed_at_utc','status','http_content_type','body_size','pair','signal_id','signal_time','raw_signal_id','detail','body_preview_redacted']
+    w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore'); w.writeheader(); w.writerows(rows)
+    return Response(content=out.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="webhook-ingress.csv"'})
+
+
+def build_metals_webhook_ingress_html() -> str:
+    h=webhook_ingress_health(48); counts=h.get('status_counts') or {}; pairs=h.get('pair_accepted_counts') or {}
+    bad=sum(v for k,v in counts.items() if k in {'INVALID_JSON','BAD_SECRET','DB_ERROR','STORE_FAILED'})
+    latest=h.get('latest') or []
+    trs=''
+    for r in latest[:30]:
+        trs += f"<tr><td>{esc(r.get('received_at_utc'))}</td><td>{esc(r.get('pair') or '—')}</td><td>{esc(r.get('signal_time') or '—')}</td><td><strong>{esc(r.get('status'))}</strong></td><td>{esc(r.get('raw_signal_id') or '—')}</td><td>{esc(r.get('detail') or '—')}</td></tr>"
+    if not trs: trs='<tr><td colspan="6">No ingress receipts yet; logging begins with the next webhook hit.</td></tr>'
+    return f"""
+      <div class='metric-grid'>
+        <div class='mini-card'><div class='k'>HTTP Receipts · 48h</div><div class='v'>{int(h.get('receipt_count') or 0)}</div><div class='small'>Every request that reached Railway</div></div>
+        <div class='mini-card'><div class='k'>XAU Accepted</div><div class='v'>{int(pairs.get('XAUUSD') or 0)}</div><div class='small'>STORED + DUPLICATE receipts</div></div>
+        <div class='mini-card'><div class='k'>XAG Accepted</div><div class='v'>{int(pairs.get('XAGUSD') or 0)}</div><div class='small'>STORED + DUPLICATE receipts</div></div>
+        <div class='mini-card'><div class='k'>Ingress Errors</div><div class='v'>{bad}</div><div class='small'>{esc(counts)}</div></div>
+      </div>
+      <div class='section-note small'><strong>Delivery audit.</strong> RECEIVED = HTTP reached Railway; STORED = raw_signals insert succeeded. Cross-asset duplicate suppression is prevented by pair+signal_id dedupe.</div>
+      <div class='table-scroll'><table><thead><tr><th>Received</th><th>Pair</th><th>Signal Time</th><th>Status</th><th>Raw ID</th><th>Detail</th></tr></thead><tbody>{trs}</tbody></table></div>
+      <div class='section-note small'><a href='/webhook/ingress-health'>Ingress health JSON</a> · <a href='/export/webhook-ingress.csv'>Ingress audit CSV</a></div>
+    """
+
+# ============================================================
 # WEBHOOK
 # ============================================================
 
@@ -30938,13 +31071,20 @@ async def tradingview_webhook(
     x_webhook_secret: Optional[str] = Header(default=None),
     secret: Optional[str] = None,
 ) -> Dict[str, Any]:
+    raw_bytes = await request.body()
+    raw_text = raw_bytes.decode('utf-8', errors='replace')
+    receipt_id = _webhook_ingress_begin(request.headers.get('content-type',''), raw_text)
+
     try:
-        body = await request.json()
-    except Exception:
+        body = json.loads(raw_text)
+    except Exception as exc:
+        _webhook_ingress_finish(receipt_id,'INVALID_JSON',detail=f'{type(exc).__name__}: {exc}')
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        _webhook_ingress_finish(receipt_id,'INVALID_JSON',detail='JSON object required')
+        raise HTTPException(status_code=400, detail="JSON object required")
 
     payload = extract_payload(body)
-
     body_secret = safe_str(body.get("secret", ""))
     payload_secret = safe_str(payload.get("secret", ""))
     query_secret = safe_str(secret)
@@ -30955,57 +31095,36 @@ async def tradingview_webhook(
         and payload_secret != WEBHOOK_SECRET
         and query_secret != WEBHOOK_SECRET
     ):
+        _webhook_ingress_finish(receipt_id,'BAD_SECRET',detail='Request reached Railway but webhook secret did not match')
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     source = safe_str(body.get("source") or payload.get("source") or "direct_or_unknown")
     raw_pair = safe_str(payload.get("pair") or payload.get("ticker") or payload.get("symbol") or "")
     scoped_pair = _project_scope_pair(raw_pair)
-    if scoped_pair not in PROJECT_SCOPE_ALLOWED_PAIRS:
-        return {
-            "ok": True,
-            "ignored": True,
-            "project_scope": PROJECT_SCOPE,
-            "raw_pair": raw_pair,
-            "normalised_pair": scoped_pair,
-            "reason": "instrument_not_owned_by_this_project",
-        }
-    pair = scoped_pair
     signal_id = safe_str(payload.get("signal_id", ""))
     raw_timestamp = payload.get("timestamp") or payload.get("time")
     timestamp_info = normalise_timestamp(raw_timestamp, signal_id)
 
-    timeframe = safe_str(payload.get("timeframe"))
-    context_tf = safe_str(payload.get("context_tf"))
-    execution_tf = safe_str(payload.get("execution_tf"))
+    if scoped_pair not in PROJECT_SCOPE_ALLOWED_PAIRS:
+        _webhook_ingress_finish(receipt_id,'IGNORED_WRONG_ASSET',pair=scoped_pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],detail=f'raw_pair={raw_pair}')
+        return {"ok":True,"ignored":True,"project_scope":PROJECT_SCOPE,"raw_pair":raw_pair,"normalised_pair":scoped_pair,"reason":"instrument_not_owned_by_this_project"}
+    pair = scoped_pair
 
-    exec_close = safe_float(payload.get("exec_close") or payload.get("close"))
-    exec_high = safe_float(payload.get("exec_high") or payload.get("high"))
-    exec_low = safe_float(payload.get("exec_low") or payload.get("low"))
+    timeframe = safe_str(payload.get("timeframe")); context_tf = safe_str(payload.get("context_tf")); execution_tf = safe_str(payload.get("execution_tf"))
+    exec_close = safe_float(payload.get("exec_close") or payload.get("close")); exec_high = safe_float(payload.get("exec_high") or payload.get("high")); exec_low = safe_float(payload.get("exec_low") or payload.get("low"))
+    forward_test_candidate = safe_str(payload.get("forward_test_candidate", "")); take_trade = safe_str(payload.get("take_trade", "")); model_version = safe_str(payload.get("model_version", "")); received_at = now_utc_iso()
 
-    forward_test_candidate = safe_str(payload.get("forward_test_candidate", ""))
-    take_trade = safe_str(payload.get("take_trade", ""))
-    model_version = safe_str(payload.get("model_version", ""))
-    received_at = now_utc_iso()
-
-    # v10.0.67: webhook bursts can arrive at exactly the same second.
-    # Retry the short raw-signal insert section on transient SQLite locks so
-    # valid TradingView alerts are not lost with a 500 response.
     new_id = None
     for attempt in range(6):
         try:
             with get_conn() as conn:
                 if signal_id:
-                    duplicate = conn.execute("SELECT id FROM raw_signals WHERE signal_id = ? LIMIT 1", (signal_id,)).fetchone()
+                    # IMPORTANT: dedupe is asset-scoped. XAU and XAG may legitimately
+                    # share a timestamp-derived signal_id and must never suppress each other.
+                    duplicate = conn.execute("SELECT id FROM raw_signals WHERE pair=? AND signal_id=? LIMIT 1", (pair, signal_id)).fetchone()
                     if duplicate:
-                        return {
-                            "ok": True,
-                            "duplicate": True,
-                            "existing_id": duplicate["id"],
-                            "pair": pair,
-                            "raw_pair": raw_pair,
-                            "signal_id": signal_id,
-                            "message": "Signal already stored",
-                        }
+                        _webhook_ingress_finish(receipt_id,'DUPLICATE',pair=pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],raw_signal_id=duplicate['id'],detail='Pair-scoped signal already stored')
+                        return {"ok":True,"duplicate":True,"existing_id":duplicate["id"],"pair":pair,"raw_pair":raw_pair,"signal_id":signal_id,"message":"Signal already stored for this pair"}
 
                 new_id = db_insert_returning_id(conn, """
                     INSERT INTO raw_signals (
@@ -31013,71 +31132,35 @@ async def tradingview_webhook(
                         timestamp_parse_status, timeframe, context_tf, execution_tf, exec_close,
                         exec_high, exec_low, forward_test_candidate, take_trade, model_version,
                         signal_id, raw_json
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    received_at, source, pair, timestamp_info["timestamp_readable"],
-                    timestamp_info["timestamp_raw"], timestamp_info["timestamp_readable"],
-                    timestamp_info["timestamp_parse_status"], timeframe, context_tf, execution_tf,
-                    exec_close, exec_high, exec_low, forward_test_candidate, take_trade,
-                    model_version, signal_id, json.dumps(body),
-                ))
-                conn.commit()
-                break
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (received_at,source,pair,timestamp_info["timestamp_readable"],timestamp_info["timestamp_raw"],timestamp_info["timestamp_readable"],timestamp_info["timestamp_parse_status"],timeframe,context_tf,execution_tf,exec_close,exec_high,exec_low,forward_test_candidate,take_trade,model_version,signal_id,json.dumps(body)))
+                conn.commit(); break
         except Exception as e:
             if is_transient_database_error(e) and attempt < 5:
-                time.sleep(0.35 * (attempt + 1))
-                continue
+                time.sleep(0.35*(attempt+1)); continue
+            _webhook_ingress_finish(receipt_id,'DB_ERROR',pair=pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],detail=f'{type(e).__name__}: {e}')
             raise
 
     if new_id is None:
+        _webhook_ingress_finish(receipt_id,'STORE_FAILED',pair=pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],detail='Six insert attempts exhausted')
         raise HTTPException(status_code=503, detail="Signal could not be stored due to database contention")
 
-    # v10.1.09: start a durable live-candidate audit before queueing.
-    if is_live_pipeline_asset(pair) and is_true(forward_test_candidate):
-        upsert_live_signal_pipeline_audit(
-            int(new_id), "SIGNAL_STORED", "PENDING",
-            "true live candidate stored; awaiting shadow/broker processing",
-            worker_source="webhook",
-            details={
-                "pair": pair,
-                "signal_id": signal_id,
-                "timestamp": timestamp_info["timestamp_readable"],
-                "exec_close": exec_close,
-            },
-        )
+    _webhook_ingress_finish(receipt_id,'STORED',pair=pair,signal_id=signal_id,signal_time=timestamp_info['timestamp_readable'],raw_signal_id=new_id,detail='HTTP received, validated and stored in raw_signals')
 
-    # Freeze AI regime-observer evidence BEFORE deterministic signal/broker processing.
+    if is_live_pipeline_asset(pair) and is_true(forward_test_candidate):
+        upsert_live_signal_pipeline_audit(int(new_id), "SIGNAL_STORED", "PENDING", "true live candidate stored; awaiting shadow/broker processing", worker_source="webhook", details={"pair":pair,"signal_id":signal_id,"timestamp":timestamp_info["timestamp_readable"],"exec_close":exec_close})
+
     try:
         ai_regime_observer = capture_ai_regime_snapshot(int(new_id))
     except Exception as _ai_exc:
         ai_regime_observer = {"captured":False,"research_only":True,"error":f"{type(_ai_exc).__name__}: {_ai_exc}"}
 
-    # Keep TradingView responses fast. Store raw signal durably, enqueue the
-    # heavier shadow/broker work, then return 200 quickly.
-    broker_auto_maintenance: Dict[str, Any] = {}
     if WEBHOOK_ASYNC_PROCESSING_ENABLED:
-        broker_auto_maintenance = {"mode": "queued", "queue": enqueue_raw_signal_for_processing(new_id)}
+        broker_auto_maintenance = {"mode":"queued","queue":enqueue_raw_signal_for_processing(new_id)}
     else:
         broker_auto_maintenance = run_post_signal_processing(new_id, source="webhook_inline")
 
-    return {
-        "ok": True,
-        "duplicate": False,
-        "stored_id": new_id,
-        "source": source,
-        "pair": pair,
-        "raw_pair": raw_pair,
-        "signal_id": signal_id,
-        "timestamp": timestamp_info["timestamp_readable"],
-        "timestamp_raw": timestamp_info["timestamp_raw"],
-        "timestamp_parse_status": timestamp_info["timestamp_parse_status"],
-        "exec_close": exec_close,
-        "forward_test_candidate": forward_test_candidate,
-        "received_at_utc": received_at,
-        "broker_auto_maintenance": broker_auto_maintenance,
-        "ai_regime_observer": ai_regime_observer,
-    }
+    return {"ok":True,"duplicate":False,"stored_id":new_id,"ingress_receipt_id":receipt_id,"source":source,"pair":pair,"raw_pair":raw_pair,"signal_id":signal_id,"timestamp":timestamp_info["timestamp_readable"],"timestamp_raw":timestamp_info["timestamp_raw"],"timestamp_parse_status":timestamp_info["timestamp_parse_status"],"exec_close":exec_close,"forward_test_candidate":forward_test_candidate,"received_at_utc":received_at,"broker_auto_maintenance":broker_auto_maintenance,"ai_regime_observer":ai_regime_observer}
 
 
 # ============================================================
@@ -33463,6 +33546,8 @@ def _metals_profit_harvesting_html() -> str:
 
 def _metals_standard_latest_signals_combined_html():
     return _metals_latest_30_signals_html() + """
+      <details><summary>Webhook Ingress / Delivery Audit</summary>
+      <div class="research-inner-body">""" + build_metals_webhook_ingress_html() + """</div></details>
       <details><summary>Current Signal State / Recent Signal Detail</summary>
       <div class="research-inner-body">""" + _metals_std_signal_state_html() + """</div></details>"""
 
