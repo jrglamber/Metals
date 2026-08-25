@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.0.0 Standalone Research + OANDA Practice
+# VERIFIED BUILD: Metals v1.6.14 Signal Coverage Consistency + Standalone OANDA Practice
 import os
 import json
 import csv
@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.13"
+METALS_APP_VERSION = "v1.6.14"
 METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Webhook Ingress Hardening"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Signal Coverage Consistency"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -3990,15 +3990,15 @@ def signal_candle_is_ignored(timestamp_value: Any) -> bool:
 
 def build_signal_coverage(conn: sqlite3.Connection, lookback: int = SIGNAL_COVERAGE_LOOKBACK) -> Dict[str, Any]:
     """
-    Checks whether each valid hourly candle received all expected asset signals.
+    Checks whether each valid hourly candle received all expected Metals signals.
 
-    Expected assets:
-    - NAS100
-    - US500
+    Expected assets in the standalone Metals project:
     - XAUUSD
     - XAGUSD
 
-    Known exception:
+    Important:
+    - Coverage is evaluated on the SAME candle timestamp. A stale latest XAG
+      row must never combine with a newer XAU row to produce a false 2/2.
     - ignore timestamp hour 17 because no candle is expected in the current stream.
     """
     rows = conn.execute(
@@ -32797,16 +32797,14 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
     oldest = max(open_trade_ages or [0])
 
     latest = snap.get("latest") or {}
-    signal_count = sum(
-        1 for a in ("XAUUSD", "XAGUSD")
-        if (latest.get(a) or {}).get("raw_signal_id")
-    )
-    candidate_count = sum(
-        1 for a in ("XAUUSD", "XAGUSD")
-        if safe_str(
-            ((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")
-        ).upper() in ("CANDIDATE", "ACCEPTED", "TRUE")
-    )
+
+    # v1.6.14: Signal Health / Signals use exact SAME-CANDLE coverage.
+    # The old "latest row per asset" count could show 2/2 when XAU had the
+    # current candle but XAG's latest row was several hours old.
+    signal_coverage: Dict[str, Any] = {
+        "status": "UNKNOWN",
+        "latest": {},
+    }
 
     # Top-level HWM / Giveback is broker-authoritative and updates on every
     # dashboard refresh, not only after a local manager review.
@@ -32828,6 +32826,10 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
     )
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     with get_conn() as conn:
+        # Exact-candle XAU/XAG delivery coverage. This is the same source of
+        # truth used by /signal-coverage and cannot mix different candles.
+        signal_coverage = build_signal_coverage(conn)
+
         wk = conn.execute(
             """SELECT COALESCE(SUM(realized_pl),0) AS p
                FROM metals_demo_trade_links
@@ -32840,6 +32842,34 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
                WHERE closed_at_utc>=?""",
             (month_start.isoformat(),)
         ).fetchone()
+
+    latest_cov = signal_coverage.get("latest") or {}
+    received_pairs = {
+        _project_scope_pair(x)
+        for x in (latest_cov.get("received_pairs") or [])
+        if _project_scope_pair(x) in {"XAUUSD", "XAGUSD"}
+    }
+    missing_pairs = [
+        _project_scope_pair(x)
+        for x in (latest_cov.get("missing_pairs") or [])
+        if _project_scope_pair(x) in {"XAUUSD", "XAGUSD"}
+    ]
+    signal_count = int(safe_float(latest_cov.get("received_count")) or 0)
+    signal_count = max(0, min(signal_count, 2))
+    signal_health_status = safe_str(
+        signal_coverage.get("status") or "UNKNOWN"
+    ).upper()
+
+    # Candidate Support is current-candle only. A stale/missing asset cannot
+    # contribute to the current headline count.
+    candidate_count = sum(
+        1
+        for a in ("XAUUSD", "XAGUSD")
+        if a in received_pairs
+        and safe_str(
+            ((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")
+        ).upper() in ("CANDIDATE", "ACCEPTED", "TRUE")
+    )
 
     return {
         "status": "ok",
@@ -32899,6 +32929,17 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "received_assets": signal_count,
             "expected_assets": 2,
             "candidate_assets": candidate_count,
+            "coverage_status": signal_health_status,
+            "coverage_candle": safe_str(latest_cov.get("candle_time")),
+            "coverage_candle_display": safe_str(
+                latest_cov.get("candle_time_display")
+                or display_candle_time(latest_cov.get("candle_time"))
+            ),
+            "received_pairs": sorted(received_pairs),
+            "missing_assets": missing_pairs,
+            "latest_received_at_utc": safe_str(
+                latest_cov.get("latest_received_at_utc")
+            ),
             "latest": latest,
         },
         "research": {
@@ -33723,6 +33764,14 @@ async function loadTop(force=false){{
   const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);
   const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},q=d.research||{{}},ac=d.accounting||{{}};
   const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';
+  const health=String(g.coverage_status||'UNKNOWN').toUpperCase();
+  const healthClass=health==='OK'?'pos':health==='WAITING'?'warn':'neg';
+  const missing=(Array.isArray(g.missing_assets)?g.missing_assets:[]).join(', ');
+  const signalClass=Number(g.received_assets||0)===2?'pos':health==='WAITING'?'warn':'neg';
+  const signalDetail=Number(g.received_assets||0)===2
+      ? `Missing none · ${{eh(g.coverage_candle_display||'')}}`
+      : `${{missing?'Missing '+eh(missing):'Incomplete current candle'}} · ${{eh(g.coverage_candle_display||'')}}`;
+  const candidateDetail=`Current candle only${{missing?' · '+eh(missing)+' missing':''}}`;
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Account-wide UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
@@ -33735,9 +33784,9 @@ ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA Metals · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
-${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,'Latest XAU/XAG received',Number(g.received_assets||0)===2?'pos':'warn')}}
-${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,Number(g.received_assets||0)===2?'Missing none':'Waiting')}}
-${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,'XAU / XAG',Number(g.candidate_assets||0)>0?'pos':'neg')}}</div>`;
+${{card('Signal Health',eh(health),`Current XAU/XAG candle · ${{eh(g.coverage_candle_display||'')}}`,healthClass)}}
+${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||2)}}`,signalDetail,signalClass)}}
+${{card('Candidate Support',`${{eh(g.candidate_assets||0)}}/2`,candidateDetail,Number(g.candidate_assets||0)>0?'pos':'neg')}}</div>`;
   st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`;
  }}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}
 }}
@@ -33755,7 +33804,7 @@ loadTop(false);setInterval(()=>loadTop(true),60000);
 def metals_standard_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": "v1.6.2",
+        "version": METALS_APP_VERSION,
         "project_standard": True,
         "project": "METALS",
         "environment": "practice",
