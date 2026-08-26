@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.16 Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
+# VERIFIED BUILD: Metals v1.6.17 Manager Postgres Reconciliation Fix + Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
 import os
 import json
 import csv
@@ -25,9 +25,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.16"
-METALS_BUILD_BASELINE = "user-supplied known-good v1.6.2 / 2026-08-22"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Fresh Signal Recovery"
+METALS_APP_VERSION = "v1.6.17"
+METALS_BUILD_BASELINE = "user-supplied Metals v1.6.16 / 2026-08-26"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Manager Postgres Reconciliation Fix"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1043,6 +1043,13 @@ METALS_DEMO_BASKET_SEVERE_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_SEVERE_LO
 METALS_DEMO_BASKET_GIVEBACK_WARN_PCT = float(os.getenv("METALS_DEMO_BASKET_GIVEBACK_WARN_PCT", "70"))
 METALS_DEMO_MANAGER_VERSION = "metals_demo_basket_manager_v1_hourly_post48_long_short"
 
+# v1.6.17 — Postgres-safe Metals manager reconciliation repair.
+# Fixes two operational faults observed in the live demo evidence export:
+# - existing metals_demo_trade_links schemas did not have last_reconciled_at_utc;
+# - a CASE WHEN ? IS NOT NULL expression left a NULL parameter untyped on Postgres.
+# This is schema/reconciliation plumbing only; no signal, entry, exit, basket, stop,
+# sizing, harvest, or candidate rule is changed.
+#
 # v1.6.9 cumulative maintenance layer.
 # These are operational/resilience controls only; they do not change signal,
 # entry, exit, stop, basket-defence or sizing rules.
@@ -7975,7 +7982,8 @@ def _init_db_full() -> None:
                 model_version TEXT, signal_time TEXT, entry_signal_id INTEGER, requested_risk_amount REAL,
                 estimated_risk_amount REAL, requested_units REAL, filled_units REAL, entry_price REAL, stop_price REAL,
                 broker_trade_id TEXT, broker_order_id TEXT, status TEXT NOT NULL, last_known_price REAL,
-                last_known_unrealized_pl REAL, realized_pl REAL, closed_at_utc TEXT, close_reason TEXT, raw_json TEXT
+                last_known_unrealized_pl REAL, realized_pl REAL, closed_at_utc TEXT, close_reason TEXT,
+                last_reconciled_at_utc TEXT, raw_json TEXT
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_links_status ON metals_demo_trade_links(status, asset)")
@@ -8057,6 +8065,8 @@ def _init_db_full() -> None:
             ("manager_last_decision", "TEXT"), ("manager_last_reason", "TEXT"),
             ("fixed_48h_price", "REAL"), ("fixed_48h_r", "REAL"),
             ("fixed_48h_recorded_at_utc", "TEXT"), ("current_stop_price", "REAL"),
+            # v1.6.17: required by broker/local ghost reconciliation and manager audit.
+            ("last_reconciled_at_utc", "TEXT"),
         ]:
             add_column_if_missing(conn, "metals_demo_trade_links", col, typ)
 
@@ -24875,7 +24885,47 @@ def metals_demo_reconcile_and_close(asset: str = "", allow_actions: bool = True,
         if not m.get("ok"): results.append({"link_id":link["id"],"status":"METRICS_FAILED","metrics":m}); continue
         upl=safe_float(trade.get("unrealizedPL")); d=_metals_demo_decision(m); hold=int(m.get("hold_candles") or 0)
         with get_conn() as conn:
-            conn.execute("""UPDATE metals_demo_trade_links SET updated_at_utc=?,last_known_price=?,last_known_unrealized_pl=?,manager_current_r=?,manager_high_water_r=?,manager_mfe_r=?,manager_mae_r=?,manager_last_review_signal_id=?,manager_last_review_candles=?,manager_last_decision=?,manager_last_reason=?,fixed_48h_price=COALESCE(fixed_48h_price,?),fixed_48h_r=COALESCE(fixed_48h_r,?),fixed_48h_recorded_at_utc=CASE WHEN fixed_48h_r IS NULL AND ? IS NOT NULL THEN ? ELSE fixed_48h_recorded_at_utc END WHERE id=?""",(now_utc_iso(),m.get("current_price"),upl,m.get("current_r"),m.get("high_water_r"),m.get("mfe_r"),m.get("mae_r"),m.get("latest_signal_id"),hold,d.get("decision"),d.get("reason"),m.get("fixed_48h_price"),m.get("fixed_48h_r"),m.get("fixed_48h_r"),now_utc_iso(),int(link["id"]))); conn.commit()
+            # v1.6.17 Postgres repair:
+            # Do not use `? IS NOT NULL` for the fixed-48h value. When that value is
+            # None psycopg cannot infer the parameter type (IndeterminateDatatype).
+            # Branch in Python instead, and stamp reconciliation explicitly.
+            reconciled_at = now_utc_iso()
+            fixed_48h_r = safe_float(m.get("fixed_48h_r"))
+            if fixed_48h_r is not None:
+                conn.execute("""
+                    UPDATE metals_demo_trade_links
+                    SET updated_at_utc=?, last_known_price=?, last_known_unrealized_pl=?,
+                        manager_current_r=?, manager_high_water_r=?, manager_mfe_r=?, manager_mae_r=?,
+                        manager_last_review_signal_id=?, manager_last_review_candles=?,
+                        manager_last_decision=?, manager_last_reason=?,
+                        fixed_48h_price=COALESCE(fixed_48h_price, ?),
+                        fixed_48h_r=COALESCE(fixed_48h_r, ?),
+                        fixed_48h_recorded_at_utc=COALESCE(fixed_48h_recorded_at_utc, ?),
+                        last_reconciled_at_utc=?
+                    WHERE id=?
+                """, (
+                    reconciled_at, m.get("current_price"), upl, m.get("current_r"),
+                    m.get("high_water_r"), m.get("mfe_r"), m.get("mae_r"),
+                    m.get("latest_signal_id"), hold, d.get("decision"), d.get("reason"),
+                    m.get("fixed_48h_price"), fixed_48h_r, reconciled_at,
+                    reconciled_at, int(link["id"]),
+                ))
+            else:
+                conn.execute("""
+                    UPDATE metals_demo_trade_links
+                    SET updated_at_utc=?, last_known_price=?, last_known_unrealized_pl=?,
+                        manager_current_r=?, manager_high_water_r=?, manager_mfe_r=?, manager_mae_r=?,
+                        manager_last_review_signal_id=?, manager_last_review_candles=?,
+                        manager_last_decision=?, manager_last_reason=?,
+                        last_reconciled_at_utc=?
+                    WHERE id=?
+                """, (
+                    reconciled_at, m.get("current_price"), upl, m.get("current_r"),
+                    m.get("high_water_r"), m.get("mfe_r"), m.get("mae_r"),
+                    m.get("latest_signal_id"), hold, d.get("decision"), d.get("reason"),
+                    reconciled_at, int(link["id"]),
+                ))
+            conn.commit()
         link.update({"manager_current_r":m.get("current_r"),"manager_high_water_r":m.get("high_water_r"),"manager_last_review_candles":hold})
         stop_result={"status":"NO_UPDATE"}; close_status=""
         if allow_actions and METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED:
