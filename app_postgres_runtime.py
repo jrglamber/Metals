@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.18 XAU LONG MFE50 Active Exit + Exit Challenger Forward Shadows
-# Cumulative on v1.6.17 Manager Postgres Reconciliation Fix + Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
+# VERIFIED BUILD: Metals v1.6.19 XAU LONG MFE50 + Broker-HWM Harvest Ladder + Exit Shadows
+# Cumulative on v1.6.18 XAU LONG MFE50 Active Exit + Exit Challenger Forward Shadows; all prior v1.6.17 reconciliation/recovery/webhook/dashboard/research updates retained
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.18"
-METALS_BUILD_BASELINE = "user-supplied Metals v1.6.17 / 2026-08-27"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU LONG MFE50 + Exit Challenger Forward Shadows"
+METALS_APP_VERSION = "v1.6.19"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.18 / 2026-08-27"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — MFE50 + Broker-HWM Harvest Ladder + Exit Shadows"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1078,6 +1078,43 @@ METALS_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R = 0.75
 METALS_EXIT_SHADOW_EXECUTION_AUTHORITY = False
 METALS_EXIT_SHADOW_FORWARD_ONLY_NO_BACKFILL = True
 
+
+# ============================================================
+# v1.6.19 — BROKER-AUTHORITATIVE METALS BASKET HARVEST LADDER
+# ============================================================
+# Trade-level exits and family harvesting deliberately coexist.
+#
+# Frozen ladder:
+#   50R  -> bank 20% of the remaining profitable broker pool
+#   100R -> bank 20%
+#   150R -> bank 25%
+#   200R -> bank 25%
+#   250R+ -> continue every +50R, bank 25% each stage
+#
+# Whole-trade closes only. Selection aims to bank the fixed cash target with
+# as few suitable profitable closes as practical while preserving strong,
+# mature, low-giveback runners where possible.
+#
+# First-deploy safety: checkpoints crossed by the already-active basket before
+# this policy is activated are recorded but NEVER executed retroactively.
+METALS_HARVEST_POLICY_VERSION = "metals_broker_hwm_harvest_v1_50r_spacing_20_20_25_2026_08_27"
+METALS_HARVEST_EXECUTION_ENABLED = env_bool("METALS_HARVEST_EXECUTION_ENABLED", True)
+METALS_HARVEST_FIRST_LEVEL_R = 50.0
+METALS_HARVEST_STEP_R = 50.0
+METALS_HARVEST_50_FRACTION = 0.20
+METALS_HARVEST_100_FRACTION = 0.20
+METALS_HARVEST_150_PLUS_FRACTION = 0.25
+METALS_HARVEST_TARGET_TOLERANCE_GBP = max(
+    0.01, min(float(os.getenv("METALS_HARVEST_TARGET_TOLERANCE_GBP", "0.05")), 5.0)
+)
+METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET = env_bool(
+    "METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET", True
+)
+METALS_HARVEST_MAX_LEVEL_R = max(
+    300.0, min(float(os.getenv("METALS_HARVEST_MAX_LEVEL_R", "5000")), 100000.0)
+)
+
+
 # v1.6.17 — Postgres-safe Metals manager reconciliation repair.
 # Fixes two operational faults observed in the live demo evidence export:
 # - existing metals_demo_trade_links schemas did not have last_reconciled_at_utc;
@@ -1326,6 +1363,8 @@ EXPORT_TABLES = {
     "live-signal-pipeline": "live_signal_pipeline_audit",
     "metals-signal-processing": "metals_signal_processing_audit",
     "metals-exit-challenger-shadow": "metals_exit_challenger_shadow",
+    "metals-demo-harvest-stages": "metals_demo_harvest_stages",
+    "metals-demo-harvest-events": "metals_demo_harvest_events",
 }
 
 # v10.1.09: production/live-only bundle. Research-only tables are deliberately
@@ -1357,6 +1396,8 @@ LIVE_ANALYSIS_EXPORT_TABLES = {
     "index-protection-cohorts": "index_protection_cohort_trades",
     "live-signal-pipeline": "live_signal_pipeline_audit",
     "metals-signal-processing": "metals_signal_processing_audit",
+    "metals-demo-harvest-stages": "metals_demo_harvest_stages",
+    "metals-demo-harvest-events": "metals_demo_harvest_events",
 }
 
 
@@ -8040,6 +8081,59 @@ def _init_db_full() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_queue_status ON metals_demo_action_queue(status, created_at_utc)")
+
+        # v1.6.19 broker-authoritative family harvest state and immutable close audit.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_harvest_stages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                cycle_id TEXT NOT NULL,
+                threshold_r INTEGER NOT NULL,
+                bank_fraction REAL NOT NULL,
+                status TEXT NOT NULL,
+                armed_at_utc TEXT,
+                executed_at_utc TEXT,
+                armed_hwm_r REAL,
+                armed_hwm_gbp REAL,
+                trigger_current_r REAL,
+                trigger_current_gbp REAL,
+                trigger_profitable_pool_gbp REAL,
+                target_bank_gbp REAL,
+                executed_bank_gbp REAL DEFAULT 0,
+                selected_link_ids TEXT,
+                selected_broker_trade_ids TEXT,
+                selected_expected_gbp REAL DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
+                reason TEXT,
+                raw_json TEXT,
+                UNIQUE(cycle_id, threshold_r)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_harvest_stage_cycle ON metals_demo_harvest_stages(cycle_id, threshold_r)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_harvest_stage_status ON metals_demo_harvest_stages(status, threshold_r)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_harvest_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                cycle_id TEXT NOT NULL,
+                stage_id INTEGER,
+                threshold_r INTEGER,
+                bank_fraction REAL,
+                link_id INTEGER,
+                broker_trade_id TEXT,
+                asset TEXT,
+                side TEXT,
+                expected_upl_gbp REAL,
+                realized_pl_gbp REAL,
+                status TEXT,
+                reason TEXT,
+                raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_harvest_event_stage ON metals_demo_harvest_events(stage_id, created_at_utc)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS metals_demo_broker_transactions (
@@ -22967,7 +23061,17 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "fixed_48h_baseline_candles": METALS_DEMO_FIXED_HOLD_CANDLES,
         "hourly_review_after_min_hold": True,
         "forced_max_hold_candles": METALS_DEMO_MANAGER_MAX_HOLD_CANDLES,
-        "family_overlay_execution": "ADVISORY_ONLY",
+        "family_overlay_execution": "MODEL_ADVISORY_PLUS_BROKER_HARVEST",
+        "harvest_execution_enabled": METALS_HARVEST_EXECUTION_ENABLED,
+        "harvest_policy_version": METALS_HARVEST_POLICY_VERSION,
+        "harvest_ladder": {
+            "first_level_r": METALS_HARVEST_FIRST_LEVEL_R,
+            "step_r": METALS_HARVEST_STEP_R,
+            "50r_fraction": METALS_HARVEST_50_FRACTION,
+            "100r_fraction": METALS_HARVEST_100_FRACTION,
+            "150r_plus_fraction": METALS_HARVEST_150_PLUS_FRACTION,
+            "no_retroactive_existing_basket": METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET,
+        },
         "live_execution_armed": METALS_LIVE_EXECUTION_ARMED,
         "safety_note": "Standalone XAU/XAG ownership. Same lane supports practice or live; live writes additionally require METALS_LIVE_EXECUTION_ARMED=true.",
     }
@@ -25076,6 +25180,21 @@ def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
                 "ok": False, "error": f"{type(exc).__name__}: {exc}"
             }
 
+        # v1.6.19 family harvesting is independent of individual exits.
+        # It gets first chance after ghost reconciliation; survivors then flow
+        # through the unchanged per-asset manager below.
+        try:
+            result["harvest"] = _metals_harvest_maintenance_tick(
+                allow_execution=(market.get("tradeable") is True),
+                source="maintenance_worker",
+            )
+        except Exception as exc:
+            result["ok"] = False
+            result["harvest"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         now_dt = now_utc()
         for asset in ("XAUUSD", "XAGUSD"):
             with get_conn() as conn:
@@ -25573,7 +25692,7 @@ def metals_demo_summary() -> Dict[str, Any]:
             "current_preview_effective_risk_gbp":safe_float(p.get("estimated_risk_gbp")),
             "minimum_size_applied":bool(p.get("minimum_size_applied")),
         }
-    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"exit_policy":metals_exit_policy_status(),"exit_challenger_shadow":metals_exit_challenger_shadow_summary(),"latest":latest,"previews":previews,"risk_visibility":risk_visibility,"manager_worker":metals_demo_manager_worker_status(),"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h remains the minimum. NEW XAU LONG trades use MFE50 active execution after 48h; existing XAU trades, XAG LONG and both SHORT lanes retain Current Manager. Exit shadows are research-only.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"exit_policy":metals_exit_policy_status(),"exit_challenger_shadow":metals_exit_challenger_shadow_summary(),"latest":latest,"previews":previews,"risk_visibility":risk_visibility,"manager_worker":metals_demo_manager_worker_status(),"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h remains the minimum. NEW XAU LONG trades use MFE50 active execution after 48h; existing XAU trades, XAG LONG and both SHORT lanes retain Current Manager. Broker-authoritative family harvest ladder is independent and executable; exit shadows are research-only.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
@@ -33611,8 +33730,10 @@ def _mf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_metals_focused_research_html():
-    return '<div class="section-note small"><strong>Focused Metals research.</strong> Exit challenger shadows, AI regime labels and focused evidence streams. Shadow outputs have zero execution authority.</div>' + \
+    return '<div class="section-note small"><strong>Focused Metals research.</strong> Exit challenger shadows, broker-HWM harvest audit, AI regime labels and focused evidence streams. Shadow outputs have zero execution authority; harvest rows are the durable audit of the active family banking layer.</div>' + \
       '<details class="research-inner"><summary>MFE / ATR2 / Fixed120 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_metals_exit_challenger_shadow_html() + '</div></details>' + \
+      _mf_table("Broker-HWM Harvest Stages",_mf_rows("metals_demo_harvest_stages",100),["threshold_r","bank_fraction","status","armed_hwm_r","armed_hwm_gbp","target_bank_gbp","executed_bank_gbp","selected_broker_trade_ids","reason"]) + \
+      _mf_table("Broker-HWM Harvest Close Audit",_mf_rows("metals_demo_harvest_events",150),["created_at_utc","threshold_r","bank_fraction","asset","side","broker_trade_id","expected_upl_gbp","realized_pl_gbp","status","reason"]) + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
@@ -33652,7 +33773,7 @@ def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
 @app.get("/export/metals-focused-research.zip")
 def export_metals_focused_research_zip(limit:int=25000):
     ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
+    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","harvest-stages.csv":"metals_demo_harvest_stages","harvest-events.csv":"metals_demo_harvest_events","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_mf_rows(tbl,limit);out=io.StringIO()
@@ -33674,7 +33795,7 @@ def export_metals_focused_research_zip(limit:int=25000):
                     if _k not in _fields:_fields.append(_k)
             _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
         z.writestr("ai-regime-observer.csv",_aio.getvalue())
-        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"],"exit_policy":metals_exit_policy_status()},indent=2))
+        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"],"exit_policy":metals_exit_policy_status(),"harvest_policy":{"version":METALS_HARVEST_POLICY_VERSION,"execution_enabled":METALS_HARVEST_EXECUTION_ENABLED,"first_level_r":METALS_HARVEST_FIRST_LEVEL_R,"step_r":METALS_HARVEST_STEP_R,"fractions":{"50R":METALS_HARVEST_50_FRACTION,"100R":METALS_HARVEST_100_FRACTION,"150R_plus":METALS_HARVEST_150_PLUS_FRACTION},"no_retroactive_existing_basket":METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET}},indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="metals-focused-research.zip"'})
 
 
@@ -33998,6 +34119,770 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         "historical_repair": historical_repair,
         "historical_evidence": evidence,
     }
+
+
+
+def _metals_harvest_fraction_for_level(level_r: Any) -> float:
+    level = float(safe_float(level_r) or 0.0)
+    if level <= 50.0:
+        return float(METALS_HARVEST_50_FRACTION)
+    if level <= 100.0:
+        return float(METALS_HARVEST_100_FRACTION)
+    return float(METALS_HARVEST_150_PLUS_FRACTION)
+
+
+def _metals_harvest_level_sequence(up_to_r: Any, extra_levels: int = 0) -> List[float]:
+    top = max(0.0, float(safe_float(up_to_r) or 0.0))
+    top += max(0, int(extra_levels or 0)) * float(METALS_HARVEST_STEP_R)
+    top = min(top, float(METALS_HARVEST_MAX_LEVEL_R))
+    levels: List[float] = []
+    level = float(METALS_HARVEST_FIRST_LEVEL_R)
+    while level <= top + 1e-9:
+        levels.append(float(level))
+        level += float(METALS_HARVEST_STEP_R)
+    return levels
+
+
+def _metals_harvest_current_cycle_id(conn: Any, hwm: Dict[str, Any]) -> str:
+    """Durable family cycle; reset only after a successful OANDA read proves flat."""
+    open_count = int(hwm.get("open_count") or 0)
+    cycle_id = _metals_runtime_get(conn, "metals_harvest_cycle_id", "")
+
+    if open_count <= 0:
+        if cycle_id:
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,
+                    status=CASE
+                        WHEN status IN ('EXECUTED','LEGACY_PASSED_UNBANKED','RECOVERY_PASSED_UNBANKED')
+                            THEN status
+                        ELSE 'EXPIRED_FLAT'
+                    END,
+                    reason=CASE
+                        WHEN status IN ('EXECUTED','LEGACY_PASSED_UNBANKED','RECOVERY_PASSED_UNBANKED')
+                            THEN reason
+                        ELSE 'broker-confirmed Metals basket flat before stage completion'
+                    END
+                WHERE cycle_id=?
+            """, (now_utc_iso(), cycle_id))
+        _metals_runtime_set(conn, "metals_harvest_cycle_id", "")
+        _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", 0.0)
+        _metals_runtime_set(conn, "metals_harvest_cycle_started_at", "")
+        if not _metals_runtime_get(conn, "metals_harvest_ever_initialized", ""):
+            _metals_runtime_set(conn, "metals_harvest_ever_initialized", "1")
+        conn.commit()
+        return ""
+
+    if cycle_id:
+        return cycle_id
+
+    first = conn.execute("""
+        SELECT id,created_at_utc,signal_time
+        FROM metals_demo_trade_links
+        WHERE status='OPEN'
+        ORDER BY id ASC
+        LIMIT 1
+    """).fetchone()
+    first_id = int(first["id"]) if first else 0
+    started = safe_str(
+        (first["signal_time"] if first else "")
+        or (first["created_at_utc"] if first else "")
+        or hwm.get("high_water_seen_at")
+        or now_utc_iso()
+    )
+    compact = re.sub(r"[^0-9A-Za-z]+", "", started)[-20:] or str(int(time.time()))
+    cycle_id = f"METALS_{first_id}_{compact}"
+    _metals_runtime_set(conn, "metals_harvest_cycle_id", cycle_id)
+    _metals_runtime_set(conn, "metals_harvest_cycle_started_at", started)
+    _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", 0.0)
+    conn.commit()
+    return cycle_id
+
+
+def _metals_harvest_insert_stage(
+    conn: Any,
+    cycle_id: str,
+    threshold_r: float,
+    status: str,
+    hwm: Dict[str, Any],
+    reason: str,
+) -> None:
+    conn.execute("""
+        INSERT OR IGNORE INTO metals_demo_harvest_stages (
+            created_at_utc,updated_at_utc,policy_version,cycle_id,threshold_r,
+            bank_fraction,status,armed_at_utc,armed_hwm_r,armed_hwm_gbp,
+            trigger_current_r,trigger_current_gbp,reason,raw_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), now_utc_iso(), METALS_HARVEST_POLICY_VERSION, cycle_id,
+        int(round(float(threshold_r))),
+        _metals_harvest_fraction_for_level(threshold_r),
+        status,
+        now_utc_iso() if status.startswith("ARMED") else "",
+        safe_float(hwm.get("high_water_r")),
+        safe_float(hwm.get("high_water_gbp")),
+        safe_float(hwm.get("current_r")),
+        safe_float(hwm.get("current_gbp")),
+        reason,
+        json.dumps({
+            "hwm_source": hwm.get("source"),
+            "broker_read_ok": hwm.get("broker_read_ok"),
+            "historical_repair": hwm.get("historical_repair"),
+        }, default=str),
+    ))
+
+
+def _metals_harvest_reconciliation_snapshot(broker: Dict[str, Any]) -> Dict[str, Any]:
+    owned = broker.get("owned_open_trades") or []
+    by_id = {safe_str(t.get("id")): t for t in owned}
+    with get_conn() as conn:
+        links = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM metals_demo_trade_links
+            WHERE status='OPEN'
+            ORDER BY id
+        """).fetchall()]
+
+    matched = []
+    local_only = []
+    for link in links:
+        bid = safe_str(link.get("broker_trade_id"))
+        bt = by_id.get(bid)
+        if bt is None:
+            local_only.append(link)
+        else:
+            matched.append((link, bt))
+
+    linked_ids = {safe_str(link.get("broker_trade_id")) for link, _ in matched}
+    broker_only = [t for t in owned if safe_str(t.get("id")) not in linked_ids]
+    exact = bool(
+        broker.get("ok")
+        and not local_only
+        and not broker_only
+        and len(matched) == int(broker.get("owned_open_count") or 0)
+    )
+    reasons = []
+    if not broker.get("ok"):
+        reasons.append("fresh OANDA Metals read failed")
+    if local_only:
+        reasons.append(f"{len(local_only)} local OPEN link(s) absent from OANDA")
+    if broker_only:
+        reasons.append(f"{len(broker_only)} OANDA Metals trade(s) have no local link")
+    return {
+        "execution_safe": exact,
+        "matched": matched,
+        "matched_count": len(matched),
+        "local_only_count": len(local_only),
+        "broker_only_count": len(broker_only),
+        "block_reasons": reasons,
+    }
+
+
+def _metals_harvest_candidate_rows(reconciliation: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for link, bt in reconciliation.get("matched") or []:
+        upl = float(safe_float(bt.get("unrealizedPL")) or 0.0)
+        if upl <= 0:
+            continue
+        risk = (
+            safe_float(link.get("estimated_risk_amount"))
+            or safe_float(link.get("requested_risk_amount"))
+            or _metals_demo_risk(link.get("asset"))
+        )
+        risk = float(risk or 0.0)
+        current_r = upl / risk if risk > 0 else 0.0
+        age = _metals_trade_age_hours(link, bt)
+        hwm_r = max(
+            float(safe_float(link.get("manager_high_water_r")) or 0.0),
+            float(safe_float(link.get("manager_mfe_r")) or 0.0),
+            current_r,
+        )
+        giveback = max(0.0, (hwm_r - current_r) / hwm_r * 100.0) if hwm_r > 0 else 0.0
+        rows.append({
+            "link": link,
+            "broker": bt,
+            "link_id": int(link.get("id") or 0),
+            "broker_trade_id": safe_str(bt.get("id")),
+            "asset": _metals_demo_asset(link.get("asset")),
+            "side": _metals_demo_side(link.get("side")),
+            "upl_gbp": upl,
+            "effective_risk_gbp": risk,
+            "current_r": current_r,
+            "high_water_r": hwm_r,
+            "giveback_pct": giveback,
+            "age_hours": age,
+            "active_exit_policy": _metals_demo_link_exit_policy(link),
+        })
+    return rows
+
+
+def _metals_harvest_close_priority(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Lower tuple closes first; strong mature MFE50 runners are preserved."""
+    rr = float(safe_float(row.get("current_r")) or 0.0)
+    gb = float(safe_float(row.get("giveback_pct")) or 0.0)
+    age = int(safe_float(row.get("age_hours")) or 0)
+    policy = safe_str(row.get("active_exit_policy")).upper()
+
+    if rr <= 0.25 or gb >= 60.0:
+        preserve_bucket = 0
+    elif age < 48 or rr < 0.75 or gb >= 35.0:
+        preserve_bucket = 1
+    elif policy == METALS_XAU_LONG_MFE50_POLICY and rr >= 1.0 and gb < 35.0:
+        preserve_bucket = 3
+    else:
+        preserve_bucket = 2
+
+    return (
+        preserve_bucket,
+        -float(safe_float(row.get("upl_gbp")) or 0.0),
+        -gb,
+        rr,
+        int(row.get("link_id") or 0),
+    )
+
+
+def _metals_harvest_select_rows(
+    candidates: List[Dict[str, Any]], target_gbp: float
+) -> Tuple[List[Dict[str, Any]], float]:
+    """Select whole profitable trades while preserving the strongest runners.
+
+    Priority is intentionally two-stage:
+      1) use the lowest preservation buckets capable of meeting the target;
+      2) within those eligible rows, use as few whole-trade closes as practical
+         and minimise cash overshoot.
+
+    A strong mature MFE50 runner therefore is not sacrificed merely because it
+    could satisfy the target alone when weaker profitable rows can do the job.
+    """
+    ranked = sorted(list(candidates), key=_metals_harvest_close_priority)
+    target = max(0.0, float(target_gbp or 0.0))
+    tol = float(METALS_HARVEST_TARGET_TOLERANCE_GBP)
+    if target <= tol or not ranked:
+        return [], 0.0
+
+    # Find the lowest preservation ceiling whose total profitable cash can meet
+    # the target. Stronger buckets are excluded if weaker rows are sufficient.
+    buckets = sorted({_metals_harvest_close_priority(r)[0] for r in ranked})
+    allowed: List[Dict[str, Any]] = []
+    for ceiling in buckets:
+        allowed = [r for r in ranked if _metals_harvest_close_priority(r)[0] <= ceiling]
+        if sum(float(r.get("upl_gbp") or 0.0) for r in allowed) + tol >= target:
+            break
+
+    selected: List[Dict[str, Any]] = []
+    running = 0.0
+    remaining_rows = list(allowed)
+
+    while remaining_rows and running + tol < target:
+        remaining = max(0.0, target - running)
+        finishers = [
+            r for r in remaining_rows
+            if float(r.get("upl_gbp") or 0.0) + tol >= remaining
+        ]
+        if finishers:
+            # One more close can finish the stage. Minimise overshoot first,
+            # then prefer the lower preservation bucket.
+            row = min(
+                finishers,
+                key=lambda r: (
+                    float(r.get("upl_gbp") or 0.0) - remaining,
+                    _metals_harvest_close_priority(r)[0],
+                    _metals_harvest_close_priority(r),
+                ),
+            )
+        else:
+            # No single remaining row can finish: take the largest cash winner
+            # from the weakest available preservation bucket to reduce the
+            # number of whole-trade closes without reaching for stronger rows.
+            weakest = min(_metals_harvest_close_priority(r)[0] for r in remaining_rows)
+            pool = [r for r in remaining_rows if _metals_harvest_close_priority(r)[0] == weakest]
+            row = max(
+                pool,
+                key=lambda r: (
+                    float(r.get("upl_gbp") or 0.0),
+                    -float(safe_float(r.get("giveback_pct")) or 0.0),
+                ),
+            )
+
+        selected.append(row)
+        running += float(row.get("upl_gbp") or 0.0)
+        bid = safe_str(row.get("broker_trade_id"))
+        remaining_rows = [
+            r for r in remaining_rows
+            if safe_str(r.get("broker_trade_id")) != bid
+        ]
+
+    return selected, running
+
+def _metals_harvest_append_ids(old: Any, values: List[Any]) -> str:
+    out = [x for x in safe_str(old).split(",") if safe_str(x)]
+    for value in values:
+        txt = safe_str(value)
+        if txt and txt not in out:
+            out.append(txt)
+    return ",".join(out)
+
+
+def _metals_harvest_record_event(
+    conn: Any,
+    stage: Dict[str, Any],
+    row: Dict[str, Any],
+    result: Dict[str, Any],
+    reason: str,
+) -> None:
+    conn.execute("""
+        INSERT INTO metals_demo_harvest_events (
+            created_at_utc,policy_version,cycle_id,stage_id,threshold_r,
+            bank_fraction,link_id,broker_trade_id,asset,side,expected_upl_gbp,
+            realized_pl_gbp,status,reason,raw_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), METALS_HARVEST_POLICY_VERSION, stage.get("cycle_id"),
+        stage.get("id"), stage.get("threshold_r"), stage.get("bank_fraction"),
+        row.get("link_id"), row.get("broker_trade_id"), row.get("asset"),
+        row.get("side"), row.get("upl_gbp"), result.get("realized_pl"),
+        result.get("status"), reason, json.dumps(result, default=str),
+    ))
+
+
+def _metals_harvest_execute_stage(
+    stage: Dict[str, Any],
+    reconciliation: Dict[str, Any],
+    allow_execution: bool,
+    source: str,
+) -> Dict[str, Any]:
+    stage_id = int(stage.get("id") or 0)
+    threshold = float(safe_float(stage.get("threshold_r")) or 0.0)
+    fraction = float(safe_float(stage.get("bank_fraction")) or 0.0)
+
+    candidates = _metals_harvest_candidate_rows(reconciliation)
+    pool = sum(float(r.get("upl_gbp") or 0.0) for r in candidates)
+
+    with get_conn() as conn:
+        current = conn.execute(
+            "SELECT * FROM metals_demo_harvest_stages WHERE id=?", (stage_id,)
+        ).fetchone()
+        stage = dict(current) if current else dict(stage)
+        target = float(safe_float(stage.get("target_bank_gbp")) or 0.0)
+        banked = float(safe_float(stage.get("executed_bank_gbp")) or 0.0)
+
+        # Freeze the cash target once, using the remaining profitable broker pool.
+        # It never shrinks merely because the basket later gives back.
+        if target <= 0 and pool > 0:
+            target = pool * fraction
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,trigger_profitable_pool_gbp=?,
+                    target_bank_gbp=?,status='ARMED_TARGET_FROZEN',reason=?
+                WHERE id=?
+            """, (
+                now_utc_iso(), pool, target,
+                f"{fraction*100:.0f}% of remaining profitable OANDA Metals pool frozen at checkpoint execution observation",
+                stage_id,
+            ))
+            conn.commit()
+
+        remaining = max(0.0, target - banked)
+        if target > 0 and remaining <= METALS_HARVEST_TARGET_TOLERANCE_GBP:
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,status='EXECUTED',
+                    executed_at_utc=COALESCE(NULLIF(executed_at_utc,''),?),
+                    reason='fixed cash banking target completed'
+                WHERE id=?
+            """, (now_utc_iso(), now_utc_iso(), stage_id))
+            conn.commit()
+            return {"ok": True, "status": "EXECUTED", "threshold_r": threshold,
+                    "target_gbp": target, "banked_gbp": banked}
+
+        if target <= 0:
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,status='ARMED_WAITING_FOR_PROFITABLE_POOL',
+                    trigger_profitable_pool_gbp=?,reason=?
+                WHERE id=?
+            """, (
+                now_utc_iso(), pool,
+                "checkpoint crossed but no profitable OANDA Metals pool is currently available",
+                stage_id,
+            ))
+            conn.commit()
+            return {"ok": True, "status": "WAITING_POOL", "threshold_r": threshold,
+                    "pool_gbp": pool}
+
+        if pool + METALS_HARVEST_TARGET_TOLERANCE_GBP < remaining:
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,status='ARMED_WAITING_FOR_PROFITABLE_POOL',
+                    trigger_profitable_pool_gbp=?,reason=?
+                WHERE id=?
+            """, (
+                now_utc_iso(), pool,
+                f"current profitable pool £{pool:.2f} is below remaining fixed target £{remaining:.2f}",
+                stage_id,
+            ))
+            conn.commit()
+            return {"ok": True, "status": "WAITING_POOL", "threshold_r": threshold,
+                    "pool_gbp": pool, "remaining_target_gbp": remaining}
+
+        if not METALS_HARVEST_EXECUTION_ENABLED or not allow_execution:
+            status = "ARMED_EXECUTION_DISABLED" if not METALS_HARVEST_EXECUTION_ENABLED else "ARMED_MARKET_CLOSED"
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,status=?,reason=?
+                WHERE id=?
+            """, (
+                now_utc_iso(), status,
+                "harvest execution disabled" if not METALS_HARVEST_EXECUTION_ENABLED else "Metals market not currently tradeable",
+                stage_id,
+            ))
+            conn.commit()
+            return {"ok": True, "status": status, "threshold_r": threshold,
+                    "target_gbp": target, "banked_gbp": banked}
+
+        if not metals_demo_config_status().get("orders_allowed"):
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,status='ARMED_BROKER_WRITES_BLOCKED',
+                    reason='Metals broker writes are not currently allowed by safety gates'
+                WHERE id=?
+            """, (now_utc_iso(), stage_id))
+            conn.commit()
+            return {"ok": True, "status": "BROKER_WRITES_BLOCKED", "threshold_r": threshold}
+
+    selected, expected = _metals_harvest_select_rows(candidates, remaining)
+    if not selected:
+        return {"ok": True, "status": "NO_SELECTION", "threshold_r": threshold}
+
+    realized_sum = 0.0
+    selected_link_ids: List[Any] = []
+    selected_broker_ids: List[Any] = []
+    failures = []
+
+    for row in selected:
+        link = dict(row["link"])
+        reason = (
+            f"METALS_HARVEST_{int(round(threshold))}R_"
+            f"BANK_{int(round(fraction*100))}PCT:{source}"
+        )
+        qid = _metals_demo_queue_close(
+            link,
+            reason,
+            int(safe_float(link.get("manager_last_review_signal_id"))
+                or safe_float(link.get("raw_signal_id")) or 0),
+        )
+        close_result = _metals_demo_close(link, qid)
+        realized = float(safe_float(close_result.get("realized_pl")) or 0.0)
+
+        with get_conn() as conn:
+            stage_row = conn.execute(
+                "SELECT * FROM metals_demo_harvest_stages WHERE id=?", (stage_id,)
+            ).fetchone()
+            _metals_harvest_record_event(
+                conn, dict(stage_row) if stage_row else stage, row, close_result, reason
+            )
+            conn.commit()
+
+        if close_result.get("ok"):
+            selected_link_ids.append(row.get("link_id"))
+            selected_broker_ids.append(row.get("broker_trade_id"))
+            realized_sum += max(0.0, realized)
+        else:
+            failures.append({
+                "link_id": row.get("link_id"),
+                "broker_trade_id": row.get("broker_trade_id"),
+                "result": close_result,
+            })
+            break
+
+    with get_conn() as conn:
+        fresh = conn.execute(
+            "SELECT * FROM metals_demo_harvest_stages WHERE id=?", (stage_id,)
+        ).fetchone()
+        stage_now = dict(fresh) if fresh else stage
+        old_banked = float(safe_float(stage_now.get("executed_bank_gbp")) or 0.0)
+        new_banked = old_banked + realized_sum
+        target_now = float(safe_float(stage_now.get("target_bank_gbp")) or target)
+        complete = bool(
+            target_now > 0
+            and new_banked + METALS_HARVEST_TARGET_TOLERANCE_GBP >= target_now
+        )
+        status = "EXECUTED" if complete else ("PARTIAL_RETRY" if failures else "PARTIAL_TARGET")
+        conn.execute("""
+            UPDATE metals_demo_harvest_stages
+            SET updated_at_utc=?,status=?,executed_at_utc=?,
+                executed_bank_gbp=?,selected_expected_gbp=COALESCE(selected_expected_gbp,0)+?,
+                selected_link_ids=?,selected_broker_trade_ids=?,
+                attempts=COALESCE(attempts,0)+1,reason=?
+            WHERE id=?
+        """, (
+            now_utc_iso(), status,
+            now_utc_iso() if complete else safe_str(stage_now.get("executed_at_utc")),
+            new_banked, expected,
+            _metals_harvest_append_ids(stage_now.get("selected_link_ids"), selected_link_ids),
+            _metals_harvest_append_ids(stage_now.get("selected_broker_trade_ids"), selected_broker_ids),
+            "fixed cash banking target completed" if complete else (
+                "broker close retry retained after partial banking" if failures
+                else "whole-trade closes banked less than fixed target; continue next maintenance tick"
+            ),
+            stage_id,
+        ))
+        conn.commit()
+
+    return {
+        "ok": not failures,
+        "status": status,
+        "threshold_r": threshold,
+        "target_gbp": target,
+        "banked_this_tick_gbp": realized_sum,
+        "banked_total_gbp": old_banked + realized_sum,
+        "selected_count": len(selected_link_ids),
+        "failures": failures,
+    }
+
+
+def _metals_harvest_maintenance_tick(
+    allow_execution: bool = True,
+    source: str = "auto",
+) -> Dict[str, Any]:
+    """Broker-authoritative family banking; independent of individual exit policy."""
+    init_db()
+    broker = metals_demo_live_broker_snapshot()
+    hwm = _metals_broker_highwater_state(broker)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "enabled": bool(METALS_HARVEST_EXECUTION_ENABLED),
+        "policy_version": METALS_HARVEST_POLICY_VERSION,
+        "source": source,
+        "broker_hwm": hwm,
+        "armed_levels": [],
+        "executed_levels": [],
+        "waiting_levels": [],
+        "legacy_levels": [],
+    }
+
+    with get_conn() as conn:
+        cycle_id = _metals_harvest_current_cycle_id(conn, hwm)
+        result["cycle_id"] = cycle_id
+        if not cycle_id:
+            result["status"] = "FLAT"
+            return result
+
+        recon = _metals_harvest_reconciliation_snapshot(broker)
+        result["reconciliation"] = {k: v for k, v in recon.items() if k != "matched"}
+        ever = bool(_metals_runtime_get(conn, "metals_harvest_ever_initialized", ""))
+        high_r = float(safe_float(hwm.get("high_water_r")) or 0.0)
+
+        # One-time legacy baseline for the basket already in progress at deployment.
+        if not ever:
+            if METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET and high_r >= METALS_HARVEST_FIRST_LEVEL_R:
+                for level in _metals_harvest_level_sequence(high_r):
+                    _metals_harvest_insert_stage(
+                        conn, cycle_id, level, "LEGACY_PASSED_UNBANKED", hwm,
+                        "threshold crossed before v1.6.19 activation; deliberately not executed retroactively",
+                    )
+                    result["legacy_levels"].append(level)
+                _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", high_r)
+            _metals_runtime_set(conn, "metals_harvest_ever_initialized", "1")
+            _metals_runtime_set(conn, "metals_harvest_policy_version", METALS_HARVEST_POLICY_VERSION)
+            conn.commit()
+
+        last_seen = float(
+            safe_float(_metals_runtime_get(conn, "metals_harvest_last_seen_hwm_r", "0")) or 0.0
+        )
+
+        # A historical HWM repair is evidence, not permission for delayed broker action.
+        if hwm.get("historical_repair") and high_r > last_seen:
+            for level in _metals_harvest_level_sequence(high_r):
+                if level > last_seen + 1e-9:
+                    _metals_harvest_insert_stage(
+                        conn, cycle_id, level, "RECOVERY_PASSED_UNBANKED", hwm,
+                        "historical HWM repair crossed threshold; no retroactive broker action",
+                    )
+                    result["legacy_levels"].append(level)
+            _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", high_r)
+            conn.commit()
+            last_seen = high_r
+
+        # Exact R trigger requires exact local/OANDA ownership. Do not advance the
+        # checkpoint watermark while the broker composition cannot be reconciled.
+        if not recon.get("execution_safe"):
+            result["status"] = "RECONCILIATION_BLOCKED"
+            result["block_reasons"] = list(recon.get("block_reasons") or [])
+            return result
+
+        if high_r > last_seen + 1e-9:
+            for level in _metals_harvest_level_sequence(high_r):
+                if level > last_seen + 1e-9:
+                    _metals_harvest_insert_stage(
+                        conn, cycle_id, level, "ARMED", hwm,
+                        f"broker-authoritative Metals HWM crossed {level:.0f}R",
+                    )
+                    result["armed_levels"].append(level)
+            _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", high_r)
+            conn.commit()
+
+        stages = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM metals_demo_harvest_stages
+            WHERE cycle_id=?
+              AND status NOT IN (
+                  'EXECUTED','LEGACY_PASSED_UNBANKED',
+                  'RECOVERY_PASSED_UNBANKED','EXPIRED_FLAT'
+              )
+            ORDER BY threshold_r ASC,id ASC
+        """, (cycle_id,)).fetchall()]
+
+    prior_incomplete = False
+    for stage in stages:
+        if prior_incomplete:
+            with get_conn() as conn:
+                conn.execute("""
+                    UPDATE metals_demo_harvest_stages
+                    SET updated_at_utc=?,status='ARMED_WAITING_FOR_PRIOR_STAGE',
+                        reason='lower harvest checkpoint must complete first'
+                    WHERE id=?
+                """, (now_utc_iso(), stage.get("id")))
+                conn.commit()
+            result["waiting_levels"].append({
+                "threshold_r": stage.get("threshold_r"),
+                "status": "WAITING_FOR_PRIOR_STAGE",
+            })
+            continue
+
+        # Re-read after every completed checkpoint so the next percentage is
+        # applied to the remaining profitable basket, not the pre-harvest pool.
+        broker_now = metals_demo_live_broker_snapshot()
+        recon_now = _metals_harvest_reconciliation_snapshot(broker_now)
+        if not recon_now.get("execution_safe"):
+            result["waiting_levels"].append({
+                "threshold_r": stage.get("threshold_r"),
+                "status": "RECONCILIATION_BLOCKED",
+                "reasons": recon_now.get("block_reasons"),
+            })
+            prior_incomplete = True
+            continue
+
+        outcome = _metals_harvest_execute_stage(
+            stage, recon_now, allow_execution=allow_execution, source=source
+        )
+        if safe_str(outcome.get("status")).upper() == "EXECUTED":
+            result["executed_levels"].append(outcome)
+        else:
+            result["waiting_levels"].append(outcome)
+            prior_incomplete = True
+
+    result["status"] = "OK"
+    return result
+
+
+def metals_harvest_plan_snapshot() -> Dict[str, Any]:
+    """Read-only dashboard/export state. Never sends OANDA writes."""
+    init_db()
+    broker = metals_demo_live_broker_snapshot()
+    hwm = _metals_broker_highwater_state(broker)
+    recon = _metals_harvest_reconciliation_snapshot(broker)
+
+    with get_conn() as conn:
+        cycle_id = _metals_runtime_get(conn, "metals_harvest_cycle_id", "")
+        if cycle_id:
+            stages = [dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_demo_harvest_stages
+                WHERE cycle_id=?
+                ORDER BY id DESC
+                LIMIT 500
+            """, (cycle_id,)).fetchall()]
+        else:
+            stages = []
+        runtime = {
+            "cycle_id": cycle_id,
+            "last_seen_hwm_r": float(
+                safe_float(_metals_runtime_get(conn, "metals_harvest_last_seen_hwm_r", "0")) or 0.0
+            ),
+            "ever_initialized": bool(
+                _metals_runtime_get(conn, "metals_harvest_ever_initialized", "")
+            ),
+        }
+
+    by_level: Dict[int, Dict[str, Any]] = {}
+    for row in stages:
+        lvl = int(safe_float(row.get("threshold_r")) or 0)
+        if lvl and lvl not in by_level:
+            by_level[lvl] = row
+
+    consumed = {
+        lvl for lvl, row in by_level.items()
+        if safe_str(row.get("status")).upper() in {
+            "EXECUTED","LEGACY_PASSED_UNBANKED","RECOVERY_PASSED_UNBANKED"
+        }
+    }
+    next_level = float(METALS_HARVEST_FIRST_LEVEL_R)
+    while int(round(next_level)) in consumed and next_level < METALS_HARVEST_MAX_LEVEL_R:
+        next_level += float(METALS_HARVEST_STEP_R)
+
+    incomplete = sorted(
+        float(safe_float(row.get("threshold_r")) or 0.0)
+        for row in by_level.values()
+        if safe_str(row.get("status")).upper() not in {
+            "EXECUTED","LEGACY_PASSED_UNBANKED",
+            "RECOVERY_PASSED_UNBANKED","EXPIRED_FLAT"
+        }
+    )
+    if incomplete:
+        next_level = incomplete[0]
+
+    return {
+        "ok": True,
+        "policy_version": METALS_HARVEST_POLICY_VERSION,
+        "execution_enabled": bool(METALS_HARVEST_EXECUTION_ENABLED),
+        "orders_allowed": bool(metals_demo_config_status().get("orders_allowed")),
+        "broker_hwm": hwm,
+        "reconciliation": {k: v for k, v in recon.items() if k != "matched"},
+        "runtime": runtime,
+        "stages": stages,
+        "by_level": by_level,
+        "next_level_r": next_level,
+        "next_fraction": _metals_harvest_fraction_for_level(next_level),
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/broker/metals-demo/harvest-plan")
+def metals_demo_harvest_plan_route() -> Dict[str, Any]:
+    return metals_harvest_plan_snapshot()
+
+
+@app.get("/export/metals-demo-harvest-stages.csv")
+def export_metals_demo_harvest_stages_csv(limit: int = 5000) -> Response:
+    init_db()
+    limit = max(1, min(int(limit or 5000), 50000))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_harvest_stages ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()]
+    return Response(
+        dicts_to_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="metals-demo-harvest-stages.csv"'},
+    )
+
+
+@app.get("/export/metals-demo-harvest-events.csv")
+def export_metals_demo_harvest_events_csv(limit: int = 5000) -> Response:
+    init_db()
+    limit = max(1, min(int(limit or 5000), 50000))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_harvest_events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()]
+    return Response(
+        dicts_to_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="metals-demo-harvest-events.csv"'},
+    )
 
 
 def _metals_trade_age_hours(link: Dict[str, Any], broker_trade: Optional[Dict[str, Any]] = None) -> int:
@@ -34633,43 +35518,80 @@ def _metals_std_basket_manager_html() -> str:
     snap = metals_demo_summary()
     baskets = snap.get("recent_basket_snapshots") or []
 
-    latest_by_key = {}
+    latest_by_key: Dict[str, Dict[str, Any]] = {}
     for b in baskets:
         key = safe_str(b.get("basket_key"))
         if key and key not in latest_by_key:
             latest_by_key[key] = b
 
-    family = latest_by_key.get("METALS_BASKET") or {}
+    model_family = latest_by_key.get("METALS_BASKET") or {}
+
+    broker = metals_demo_live_broker_snapshot()
+    broker_hwm = _metals_broker_highwater_state(broker)
+    harvest = metals_harvest_plan_snapshot()
+
+    current_r = float(safe_float(broker_hwm.get("current_r")) or 0.0)
+    high_r = float(safe_float(broker_hwm.get("high_water_r")) or 0.0)
+    current_gbp = float(safe_float(broker_hwm.get("current_gbp")) or 0.0)
+    high_gbp = float(safe_float(broker_hwm.get("high_water_gbp")) or 0.0)
+    giveback_r = float(safe_float(broker_hwm.get("giveback_r")) or 0.0)
+    giveback_gbp = float(safe_float(broker_hwm.get("giveback_gbp")) or 0.0)
+    giveback_pct = float(safe_float(broker_hwm.get("giveback_pct")) or 0.0)
+    next_level = float(safe_float(harvest.get("next_level_r")) or METALS_HARVEST_FIRST_LEVEL_R)
+    next_fraction = float(
+        safe_float(harvest.get("next_fraction"))
+        or _metals_harvest_fraction_for_level(next_level)
+    )
+
     cards = ""
     for key in ("XAUUSD:LONG", "XAUUSD:SHORT", "XAGUSD:LONG", "XAGUSD:SHORT"):
         b = latest_by_key.get(key) or {}
         state = safe_str(b.get("state") or "FLAT")
-        cls = "pos" if state in ("GREEN","OBSERVE") else "warn" if state == "AMBER" else "neg"
+        cls = "pos" if state in ("GREEN", "OBSERVE") else "warn" if state == "AMBER" else "neg"
         cards += f"""
         <div class="mini-card">
           <div class="k">{esc(key.replace(':',' '))}</div>
           <div class="v {cls}">{esc(state)}</div>
           <div class="small">
-            {_metals_fmt(b.get('basket_r'),2,'R')} · HWM {_metals_fmt(b.get('high_water_r'),2,'R')} ·
+            {_metals_fmt(b.get('basket_r'),2,'R')} · model HWM {_metals_fmt(b.get('high_water_r'),2,'R')} ·
             giveback {_metals_fmt(b.get('giveback_pct'),1,'%')} · open {int(safe_float(b.get('open_count')) or 0)}
           </div>
         </div>
         """
 
+    recon = harvest.get("reconciliation") or {}
+    recon_note = (
+        "EXACT"
+        if recon.get("execution_safe")
+        else "BLOCKED: " + "; ".join(recon.get("block_reasons") or [])
+    )
+
     return f"""
       <div class="section-note">
-        <strong>Metals Basket Manager.</strong> Same Project Exit Plan operating contract as Indices:
-        48h minimum normal hold, hourly review thereafter, runner protection at 48/72/96/120h,
-        asset/side defence, persistent close-until-flat retries, and fixed-48h benchmark evidence.
-        The combined Metals family remains advisory only.
+        <strong>Metals Basket Manager / Profit Protection.</strong>
+        NEW XAU LONG trades use MFE50 after the existing 48h minimum; XAG LONG,
+        both SHORT lanes and pre-v1.6.18 XAU trades retain their stored Current Manager.
+        The family harvest ladder is independent: broker-authoritative 50R checkpoints
+        can bank profitable exposure while surviving trades continue under their own exit policy.
+        Hard SL and asset/side defence remain separate safety layers.
+      </div>
+      <div class="section-note small">
+        <strong>Harvest ladder:</strong> 50R = 20%, 100R = 20%, 150R = 25%,
+        200R = 25%, then 25% at every additional +50R checkpoint.
+        Percentages apply to the remaining profitable OANDA Metals pool.
+        Existing checkpoints crossed before v1.6.19 are never executed retroactively.
       </div>
       <div class="metric-grid">
-        <div class="mini-card"><div class="k">Family Basket</div><div class="v {pnl_class(family.get('basket_r'))}">{_metals_fmt(family.get('basket_r'),2,'R')}</div><div class="small">XAU + XAG advisory overlay</div></div>
-        <div class="mini-card"><div class="k">Family High-Water</div><div class="v {pnl_class(family.get('high_water_r'))}">{_metals_fmt(family.get('high_water_r'),2,'R')}</div><div class="small">Giveback {_metals_fmt(family.get('giveback_pct'),1,'%')}</div></div>
-        <div class="mini-card"><div class="k">Family State</div><div class="v">{esc(family.get('state') or 'FLAT')}</div><div class="small">{esc(family.get('action') or 'ADVISORY_ONLY')}</div></div>
+        <div class="mini-card"><div class="k">Broker Basket</div><div class="v {pnl_class(current_gbp)}">{current_r:.2f}R</div><div class="small">{money(current_gbp,'GBP')} · XAU/XAG OANDA source</div></div>
+        <div class="mini-card"><div class="k">Broker High-Water</div><div class="v {pnl_class(high_gbp)}">{high_r:.2f}R</div><div class="small">{money(high_gbp,'GBP')} · {esc(broker_hwm.get('high_water_seen_at') or 'time not recorded')}</div></div>
+        <div class="mini-card"><div class="k">Broker Giveback</div><div class="v {'neg' if giveback_pct >= 50 else 'warn' if giveback_pct >= 25 else 'pos'}">{giveback_r:.2f}R</div><div class="small">{money(giveback_gbp,'GBP')} · {giveback_pct:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Next Harvest</div><div class="v {'pos' if METALS_HARVEST_EXECUTION_ENABLED else 'warn'}">{next_level:.0f}R</div><div class="small">Bank {next_fraction*100:.0f}% · {'ARMED' if METALS_HARVEST_EXECUTION_ENABLED else 'DISABLED'}</div></div>
+        <div class="mini-card"><div class="k">Family State</div><div class="v">{esc(model_family.get('state') or 'FLAT')}</div><div class="small">{esc(model_family.get('action') or 'ADVISORY_ONLY')} · manager model only</div></div>
+        <div class="mini-card"><div class="k">Manager Model HWM</div><div class="v flat">{_metals_fmt(model_family.get('high_water_r'),2,'R')}</div><div class="small">ADVISORY DIAGNOSTIC · not harvest/HWM authority</div></div>
         <div class="mini-card"><div class="k">48h Benchmark</div><div class="v {pnl_class(snap.get('fixed_48h_baseline_total_R'))}">{_metals_fmt(snap.get('fixed_48h_baseline_total_R'),2,'R')}</div><div class="small">{int(snap.get('fixed_48h_baseline_rows') or 0)} matured rows</div></div>
+        <div class="mini-card"><div class="k">Harvest Reconciliation</div><div class="v {'pos' if recon.get('execution_safe') else 'warn'}">{'EXACT' if recon.get('execution_safe') else 'BLOCKED'}</div><div class="small">{esc(recon_note)}</div></div>
       </div>
-      <h3>Asset / Side Basket States</h3>
+      <h3>Asset / Side Basket States — Manager Model</h3>
       <div class="metric-grid">{cards or '<div class="mini-card"><div class="v">No basket snapshots yet</div></div>'}</div>
       {_metals_std_open_trades_html()}
     """
@@ -34818,8 +35740,8 @@ def _metals_std_execution_html() -> str:
     """
 
 
-# Dashboard/research checkpoints only. No Metals execution path consumes these values.
-METALS_HARVEST_RESEARCH_LEVELS_R = (50.0, 100.0, 150.0, 200.0)
+# v1.6.19 dashboard rows reflect the executable durable family ladder.
+METALS_HARVEST_DISPLAY_MIN_LEVELS = (50.0, 100.0, 150.0, 200.0, 250.0, 300.0)
 
 def _metals_latest_30_signals_html(limit: int = 30) -> str:
     init_db(); limit=max(1,min(int(limit or 30),100))
@@ -34848,12 +35770,115 @@ def _metals_recently_closed_trades_html(limit: int = 30) -> str:
     return f'''<div class="section-note small"><strong>Recently Closed Metals Trades.</strong> Latest 30 XAU/XAG broker-link closures with exact reason and realised result.</div><div class="table-scroll"><table><thead><tr><th>Closed</th><th>Asset</th><th>Side</th><th>Local ID</th><th>Broker ID</th><th>Entry Time</th><th>Age</th><th>Why Closed</th><th>Realised P&amp;L</th><th>Approx R</th><th>Effective Risk</th><th>Entry</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
 
 def _metals_profit_harvesting_html() -> str:
-    broker=metals_demo_live_broker_snapshot(); hwm=_metals_broker_highwater_state(broker); realized=metals_demo_broker_realized_summary(); owned=broker.get('owned_open_trades') or []; profitable=[t for t in owned if float(safe_float(t.get('unrealizedPL')) or 0.0)>0]; pool=sum(float(safe_float(t.get('unrealizedPL')) or 0.0) for t in profitable); current_r=float(safe_float(hwm.get('current_r')) or 0.0); high_r=float(safe_float(hwm.get('high_water_r')) or 0.0); rows=[]
-    for level in METALS_HARVEST_RESEARCH_LEVELS_R:
-        reached=high_r>=level; rows.append(f'''<tr><td>{level:.0f}R</td><td class="{'pos' if reached else 'warn'}">{'OBSERVED / PASSED' if reached else 'NOT REACHED'}</td><td>RESEARCH ONLY</td><td>—</td><td>—</td><td>—</td><td>{'HWM has crossed this level' if reached else 'waiting'}</td></tr>''')
-    gb=float(safe_float(hwm.get('giveback_pct')) or 0.0); gbcls='neg' if gb>=50 else 'warn' if gb>=25 else 'pos'
-    return f'''<div class="section-note warn"><strong>Metals harvesting is NOT armed yet.</strong> Indices-style visibility while we finish choosing the live Metals ladder. Working research checkpoints: 50/100/150/200R. No percentage, broker close, stop change or stage execution is triggered here.</div><div class="metric-grid"><div class="mini-card"><div class="k">Current Basket P&amp;L</div><div class="v {pnl_class(hwm.get('current_gbp'))}">{money(hwm.get('current_gbp'),'GBP')}</div><div class="small">{current_r:.2f}R broker-derived</div></div><div class="mini-card"><div class="k">Protection High-Water</div><div class="v {pnl_class(hwm.get('high_water_gbp'))}">{money(hwm.get('high_water_gbp'),'GBP')}</div><div class="small">{high_r:.2f}R · {esc(hwm.get('high_water_seen_at') or 'time not recorded')}</div></div><div class="mini-card"><div class="k">Actual OANDA P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">Fresh XAU/XAG open-trade cash</div></div><div class="mini-card"><div class="k">Profitable Banking Pool</div><div class="v {pnl_class(pool)}">{money(pool,'GBP')}</div><div class="small">{len(profitable)} profitable trades</div></div><div class="mini-card"><div class="k">Giveback</div><div class="v {gbcls}">{money(hwm.get('giveback_gbp'),'GBP')} · {gb:.1f}%</div><div class="small">{float(safe_float(hwm.get('giveback_r')) or 0):.2f}R</div></div><div class="mini-card"><div class="k">Harvest Execution</div><div class="v warn">NOT ARMED</div><div class="small">Percentages not chosen yet</div></div><div class="mini-card"><div class="k">Open Metals Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">XAU/XAG only</div></div><div class="mini-card"><div class="k">Broker Realised</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">Accounting context only</div></div></div><h3>Working Metals Harvest Checkpoints — Decision Pending</h3><div class="table-scroll"><table><thead><tr><th>Level</th><th>Observed State</th><th>Execution State</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Note</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div><div class="section-note small"><strong>Next decision:</strong> after this reference basket completes, choose the bank percentages and whether the 50R-spaced ladder becomes executable.</div>'''
+    plan = metals_harvest_plan_snapshot()
+    hwm = plan.get("broker_hwm") or {}
+    recon = plan.get("reconciliation") or {}
+    realized = metals_demo_broker_realized_summary()
+    broker = metals_demo_live_broker_snapshot()
+    owned = broker.get("owned_open_trades") or []
+    profitable = [
+        t for t in owned
+        if float(safe_float(t.get("unrealizedPL")) or 0.0) > 0
+    ]
+    pool = sum(float(safe_float(t.get("unrealizedPL")) or 0.0) for t in profitable)
 
+    current_r = float(safe_float(hwm.get("current_r")) or 0.0)
+    high_r = float(safe_float(hwm.get("high_water_r")) or 0.0)
+    next_level = float(safe_float(plan.get("next_level_r")) or METALS_HARVEST_FIRST_LEVEL_R)
+    next_fraction = float(
+        safe_float(plan.get("next_fraction"))
+        or _metals_harvest_fraction_for_level(next_level)
+    )
+    by_level = plan.get("by_level") or {}
+
+    display_top = max(300.0, next_level + 100.0, high_r + 100.0)
+    levels = _metals_harvest_level_sequence(display_top)
+    rows = []
+    for level in levels:
+        stage = by_level.get(int(round(level))) or {}
+        status = safe_str(stage.get("status"))
+        if not status:
+            status = "NEXT" if abs(level - next_level) < 0.01 else (
+                "PASSED_NO_STAGE" if high_r >= level else "WAITING"
+            )
+
+        cls = "pos" if status == "EXECUTED" else "flat"
+        if status in {
+            "ARMED","ARMED_TARGET_FROZEN","PARTIAL_TARGET","PARTIAL_RETRY",
+            "ARMED_WAITING_FOR_PROFITABLE_POOL","ARMED_MARKET_CLOSED",
+            "ARMED_EXECUTION_DISABLED","ARMED_BROKER_WRITES_BLOCKED",
+            "ARMED_WAITING_FOR_PRIOR_STAGE",
+        }:
+            cls = "warn"
+
+        fraction = float(
+            safe_float(stage.get("bank_fraction"))
+            or _metals_harvest_fraction_for_level(level)
+        )
+        target = safe_float(stage.get("target_bank_gbp"))
+        banked = safe_float(stage.get("executed_bank_gbp"))
+        selected = safe_str(stage.get("selected_broker_trade_ids")) or "—"
+        note = safe_str(stage.get("reason"))
+        if status == "WAITING":
+            note = "future checkpoint"
+        elif status == "NEXT" and not note:
+            note = "next broker-HWM checkpoint"
+        elif status == "LEGACY_PASSED_UNBANKED":
+            note = "crossed before v1.6.19; deliberately not executed retroactively"
+
+        rows.append(f"""
+            <tr>
+              <td>{level:.0f}R</td>
+              <td class="{cls}"><strong>{esc(status.replace('_',' '))}</strong></td>
+              <td>{fraction*100:.0f}%</td>
+              <td>{'—' if target is None else money(target,'GBP')}</td>
+              <td>{'—' if banked is None else money(banked,'GBP')}</td>
+              <td>{esc(selected)}</td>
+              <td>{esc(note or '—')}</td>
+            </tr>
+        """)
+
+    gb = float(safe_float(hwm.get("giveback_pct")) or 0.0)
+    gbcls = "neg" if gb >= 50 else "warn" if gb >= 25 else "pos"
+    execution_live = bool(plan.get("execution_enabled") and plan.get("orders_allowed"))
+    recon_text = "EXACT" if recon.get("execution_safe") else "; ".join(
+        recon.get("block_reasons") or ["reconciliation incomplete"]
+    )
+
+    return f"""
+    <div class="section-note">
+      <strong>Metals basket harvesting is ARMED.</strong>
+      Family checkpoints use the same broker-authoritative OANDA HWM as the top dashboard.
+      MFE50 remains the individual exit for new XAU LONG trades; harvesting is an independent
+      family-level bank. Surviving trades continue normally after a harvest.
+    </div>
+    <div class="section-note small">
+      Ladder: <strong>50R 20% · 100R 20% · 150R 25% · 200R 25% · then 25% every +50R</strong>.
+      The percentage is frozen against the remaining profitable broker pool at each stage.
+      Whole-trade selection aims to bank the fixed cash target with few suitable closes while
+      preserving stronger mature runners. No individual age gate applies to checkpoint banking.
+    </div>
+    <div class="metric-grid">
+      <div class="mini-card"><div class="k">Current Basket P&amp;L</div><div class="v {pnl_class(hwm.get('current_gbp'))}">{money(hwm.get('current_gbp'),'GBP')}</div><div class="small">{current_r:.2f}R broker-derived</div></div>
+      <div class="mini-card"><div class="k">Broker High-Water</div><div class="v {pnl_class(hwm.get('high_water_gbp'))}">{money(hwm.get('high_water_gbp'),'GBP')}</div><div class="small">{high_r:.2f}R · {esc(hwm.get('high_water_seen_at') or 'time not recorded')}</div></div>
+      <div class="mini-card"><div class="k">Giveback</div><div class="v {gbcls}">{money(hwm.get('giveback_gbp'),'GBP')} · {gb:.1f}%</div><div class="small">{float(safe_float(hwm.get('giveback_r')) or 0):.2f}R</div></div>
+      <div class="mini-card"><div class="k">Next Harvest</div><div class="v pos">{next_level:.0f}R</div><div class="small">Bank {next_fraction*100:.0f}% of remaining profitable pool</div></div>
+      <div class="mini-card"><div class="k">Harvest Execution</div><div class="v {'pos' if execution_live else 'warn'}">{'ARMED' if execution_live else 'SAFETY BLOCKED'}</div><div class="small">{esc(recon_text)}</div></div>
+      <div class="mini-card"><div class="k">Profitable Banking Pool</div><div class="v {pnl_class(pool)}">{money(pool,'GBP')}</div><div class="small">{len(profitable)} profitable OANDA trades</div></div>
+      <div class="mini-card"><div class="k">Open Metals Trades</div><div class="v">{int(broker.get('owned_open_count') or 0)}</div><div class="small">XAU/XAG only</div></div>
+      <div class="mini-card"><div class="k">Broker Realised</div><div class="v {pnl_class(realized.get('net_realized_gbp'))}">{money(realized.get('net_realized_gbp'),'GBP')}</div><div class="small">Accounting context</div></div>
+    </div>
+    <h3>Metals Harvest Ladder — Durable Stage State</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Level</th><th>Status</th><th>Bank %</th><th>Frozen Target</th><th>Actually Banked</th><th>Broker Trades</th><th>Note</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table></div>
+    <div class="section-note small">
+      <a href="/broker/metals-demo/harvest-plan">harvest plan JSON</a> ·
+      <a href="/export/metals-demo-harvest-stages.csv">harvest stages CSV</a> ·
+      <a href="/export/metals-demo-harvest-events.csv">harvest events CSV</a>
+    </div>
+    """
 
 def _metals_standard_latest_signals_combined_html():
     return _metals_latest_30_signals_html() + """
@@ -34983,7 +36008,7 @@ def metals_standard_dashboard() -> str:
         _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
         _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA lane plus execution/reconciliation and sizing/accounting detail."),
         _metals_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus the unarmed 50/100/150/200R Metals protection framework."),
-        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "MFE/ATR2/Fixed120 exit challengers, AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
+        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "MFE/ATR2/Fixed120 exit challengers, broker-HWM harvest evidence, AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
     ])
 
     return f"""<!doctype html>
