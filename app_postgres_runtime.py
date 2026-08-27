@@ -1,4 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.17 Manager Postgres Reconciliation Fix + Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
+# VERIFIED BUILD: Metals v1.6.18 XAU LONG MFE50 Active Exit + Exit Challenger Forward Shadows
+# Cumulative on v1.6.17 Manager Postgres Reconciliation Fix + Fresh-Only Signal Recovery + Legacy Isolation + Standalone OANDA Practice
 import os
 import json
 import csv
@@ -25,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.17"
-METALS_BUILD_BASELINE = "user-supplied Metals v1.6.16 / 2026-08-26"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Manager Postgres Reconciliation Fix"
+METALS_APP_VERSION = "v1.6.18"
+METALS_BUILD_BASELINE = "user-supplied Metals v1.6.17 / 2026-08-27"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU LONG MFE50 + Exit Challenger Forward Shadows"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1043,6 +1044,40 @@ METALS_DEMO_BASKET_SEVERE_LOSS_R = float(os.getenv("METALS_DEMO_BASKET_SEVERE_LO
 METALS_DEMO_BASKET_GIVEBACK_WARN_PCT = float(os.getenv("METALS_DEMO_BASKET_GIVEBACK_WARN_PCT", "70"))
 METALS_DEMO_MANAGER_VERSION = "metals_demo_basket_manager_v1_hourly_post48_long_short"
 
+
+# ============================================================
+# v1.6.18 — XAU LONG ACTIVE MFE50 + EXIT CHALLENGER FORWARD SHADOWS
+# ============================================================
+# Production/practice execution change is deliberately narrow:
+# - NEW XAUUSD LONG trades opened after this build are assigned MFE_GIVEBACK_50.
+# - Existing open trades are NOT backfilled/cut over; a blank stored policy falls
+#   back to the pre-v1.6.18 CURRENT_MANAGER behaviour.
+# - XAG LONG and both SHORT lanes keep CURRENT_MANAGER as their active exit.
+# - Existing basket defence and broker hard SL remain authoritative safety layers.
+#
+# Research shadows are forward-only, created only for NEW accepted broker trades.
+# They have zero broker/execution authority and never feed production decisions.
+METALS_XAU_LONG_MFE50_ACTIVE_ENABLED = env_bool("METALS_XAU_LONG_MFE50_ACTIVE_ENABLED", True)
+METALS_XAU_LONG_MFE50_POLICY = "MFE_GIVEBACK_50"
+METALS_XAU_LONG_MFE50_POLICY_VERSION = "metals_xau_long_mfe50_active_v1_2026_08_27"
+METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES = 48
+METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION = 0.50
+METALS_XAU_LONG_MFE50_EXECUTION_AUTHORITY = True
+
+METALS_EXIT_SHADOW_ENABLED = env_bool("METALS_EXIT_SHADOW_ENABLED", True)
+METALS_EXIT_SHADOW_VERSION = "metals_exit_shadow_v1_mfe_sensitivity_atr2_fixed120_2026_08_27"
+METALS_EXIT_SHADOW_MIN_HOLD_CANDLES = 48
+METALS_EXIT_SHADOW_FIXED_HOLD_CANDLES = 120
+METALS_EXIT_SHADOW_ATR_MULTIPLIER = 2.0
+METALS_EXIT_SHADOW_ATR_PERIOD = 14
+METALS_EXIT_SHADOW_ATR_LOOKBACK_BARS = 500
+METALS_EXIT_SHADOW_PAIR_TIE_R = 0.10
+METALS_EXIT_SHADOW_REVERSAL_SAVE_DELTA_R = 0.50
+METALS_EXIT_SHADOW_LARGE_WINNER_R = 2.00
+METALS_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R = 0.75
+METALS_EXIT_SHADOW_EXECUTION_AUTHORITY = False
+METALS_EXIT_SHADOW_FORWARD_ONLY_NO_BACKFILL = True
+
 # v1.6.17 — Postgres-safe Metals manager reconciliation repair.
 # Fixes two operational faults observed in the live demo evidence export:
 # - existing metals_demo_trade_links schemas did not have last_reconciled_at_utc;
@@ -1290,6 +1325,7 @@ EXPORT_TABLES = {
     "index-short-regime-research": "index_short_regime_research",
     "live-signal-pipeline": "live_signal_pipeline_audit",
     "metals-signal-processing": "metals_signal_processing_audit",
+    "metals-exit-challenger-shadow": "metals_exit_challenger_shadow",
 }
 
 # v10.1.09: production/live-only bundle. Research-only tables are deliberately
@@ -8067,6 +8103,11 @@ def _init_db_full() -> None:
             ("fixed_48h_recorded_at_utc", "TEXT"), ("current_stop_price", "REAL"),
             # v1.6.17: required by broker/local ghost reconciliation and manager audit.
             ("last_reconciled_at_utc", "TEXT"),
+            # v1.6.18: persist the execution policy at entry so existing trades
+            # never change manager mid-flight after a deploy.
+            ("active_exit_policy", "TEXT"),
+            ("active_exit_policy_version", "TEXT"),
+            ("active_exit_policy_started_at_utc", "TEXT"),
         ]:
             add_column_if_missing(conn, "metals_demo_trade_links", col, typ)
 
@@ -8082,6 +8123,67 @@ def _init_db_full() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_demo_manager_reviews_link ON metals_demo_manager_reviews(link_id, created_at_utc)")
+
+
+        # v1.6.18 forward-only exit challenger evidence. No execution authority.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_exit_challenger_shadow (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                shadow_version TEXT NOT NULL,
+                link_id INTEGER NOT NULL,
+                raw_signal_id INTEGER,
+                asset TEXT NOT NULL,
+                instrument TEXT,
+                side TEXT NOT NULL,
+                challenger TEXT NOT NULL,
+                actual_policy TEXT,
+                actual_policy_version TEXT,
+                entry_raw_signal_id INTEGER,
+                entry_signal_id INTEGER,
+                entry_time TEXT,
+                entry_price REAL,
+                sl_pct REAL,
+                hard_stop_price REAL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                last_raw_signal_id INTEGER,
+                last_signal_time TEXT,
+                hold_candles INTEGER DEFAULT 0,
+                current_price REAL,
+                current_r REAL DEFAULT 0,
+                highest_high REAL,
+                lowest_low REAL,
+                mfe_r REAL DEFAULT 0,
+                mae_r REAL DEFAULT 0,
+                high_water_r REAL DEFAULT 0,
+                giveback_pct REAL DEFAULT 0,
+                atr14 REAL,
+                trail_price REAL,
+                mfe_floor_price REAL,
+                current_manager_decision TEXT,
+                current_manager_reason TEXT,
+                hypothetical_exit_time TEXT,
+                hypothetical_exit_price REAL,
+                hypothetical_exit_r REAL,
+                hypothetical_exit_reason TEXT,
+                actual_status TEXT,
+                actual_exit_time TEXT,
+                actual_exit_price REAL,
+                actual_r REAL,
+                actual_exit_reason TEXT,
+                paired_complete INTEGER DEFAULT 0,
+                challenger_minus_actual_r REAL,
+                paired_winner TEXT,
+                saved_reversal INTEGER DEFAULT 0,
+                killed_large_winner INTEGER DEFAULT 0,
+                note TEXT,
+                UNIQUE(link_id, challenger)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_exit_shadow_status ON metals_exit_challenger_shadow(status, paired_complete)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_exit_shadow_link ON metals_exit_challenger_shadow(link_id, challenger)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_exit_shadow_signal ON metals_exit_challenger_shadow(asset, last_raw_signal_id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS metals_demo_basket_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, review_signal_id INTEGER,
@@ -22853,6 +22955,7 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "simulate_shorts": METALS_DEMO_SIMULATE_SHORTS,
         "basket_manager_enabled": METALS_DEMO_BASKET_MANAGER_ENABLED,
         "manager_version": METALS_DEMO_MANAGER_VERSION,
+        "exit_policy": metals_exit_policy_status(),
         "model_version": METALS_DEMO_MODEL_VERSION,
         "risk_gbp": {"XAUUSD": METALS_DEMO_XAU_RISK_AMOUNT, "XAGUSD": METALS_DEMO_XAG_RISK_AMOUNT},
         "sl_pct": {"XAUUSD": METALS_DEMO_XAU_SL_PCT, "XAGUSD": METALS_DEMO_XAG_SL_PCT},
@@ -22895,6 +22998,77 @@ def metals_demo_request(path: str, method: str = "GET", body: Optional[Dict[str,
         return {"ok": False, "status_code": e.code, "error": str(e), "data": payload, "url_path": clean_path}
     except Exception as e:
         return {"ok": False, "status_code": None, "error": str(e), "url_path": clean_path}
+
+
+
+def _metals_demo_new_trade_exit_policy(asset: str, side: str) -> Dict[str, str]:
+    """Freeze the active exit policy when a NEW broker trade is created."""
+    a = _metals_demo_asset(asset)
+    d = _metals_demo_side(side)
+    if a == "XAUUSD" and d == "long" and METALS_XAU_LONG_MFE50_ACTIVE_ENABLED:
+        return {
+            "policy": METALS_XAU_LONG_MFE50_POLICY,
+            "version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
+        }
+    return {
+        "policy": "CURRENT_MANAGER",
+        "version": METALS_DEMO_MANAGER_VERSION,
+    }
+
+
+def _metals_demo_link_exit_policy(link: Optional[Dict[str, Any]]) -> str:
+    """Stored policy wins. Blank legacy rows remain on CURRENT_MANAGER."""
+    if not link:
+        return "CURRENT_MANAGER"
+    p = safe_str(link.get("active_exit_policy")).upper()
+    return p or "CURRENT_MANAGER"
+
+
+def _metals_exit_shadow_challengers_for_lane(asset: str, side: str, actual_policy: str) -> List[str]:
+    """Frozen forward-shadow matrix agreed after historical sensitivity tests."""
+    a = _metals_demo_asset(asset)
+    d = _metals_demo_side(side)
+    actual = safe_str(actual_policy).upper() or "CURRENT_MANAGER"
+    if a == "XAUUSD" and d == "long":
+        candidates = [
+            "CURRENT_MANAGER", "MFE_GIVEBACK_25", "MFE_GIVEBACK_50",
+            "MFE_GIVEBACK_75", "ATR2_CHANDELIER", "FIXED_120H",
+        ]
+    elif a == "XAGUSD" and d == "long":
+        candidates = ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "MFE_GIVEBACK_75", "ATR2_CHANDELIER"]
+    elif a in {"XAUUSD", "XAGUSD"} and d == "short":
+        candidates = ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"]
+    else:
+        candidates = []
+    # Do not waste a shadow row reproducing the active execution policy itself.
+    return [c for c in candidates if c != actual]
+
+
+def metals_exit_policy_status() -> Dict[str, Any]:
+    return {
+        "active_execution": {
+            "XAUUSD_LONG_new_trades": METALS_XAU_LONG_MFE50_POLICY if METALS_XAU_LONG_MFE50_ACTIVE_ENABLED else "CURRENT_MANAGER",
+            "XAGUSD_LONG": "CURRENT_MANAGER",
+            "XAUUSD_SHORT": "CURRENT_MANAGER",
+            "XAGUSD_SHORT": "CURRENT_MANAGER",
+            "existing_open_pre_v1_6_18": "CURRENT_MANAGER unless a policy was already persisted",
+            "xau_long_mfe50_min_hold_candles": METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES,
+            "xau_long_mfe50_giveback_fraction": METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION,
+            "hard_sl_remains_active": True,
+            "basket_defence_remains_active": True,
+        },
+        "forward_shadow": {
+            "enabled": METALS_EXIT_SHADOW_ENABLED,
+            "version": METALS_EXIT_SHADOW_VERSION,
+            "execution_authority": METALS_EXIT_SHADOW_EXECUTION_AUTHORITY,
+            "forward_only_no_backfill": METALS_EXIT_SHADOW_FORWARD_ONLY_NO_BACKFILL,
+            "XAUUSD_LONG": ["CURRENT_MANAGER", "MFE_GIVEBACK_25", "MFE_GIVEBACK_75", "ATR2_CHANDELIER", "FIXED_120H"] if METALS_XAU_LONG_MFE50_ACTIVE_ENABLED else ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "MFE_GIVEBACK_75", "ATR2_CHANDELIER", "FIXED_120H"],
+            "XAGUSD_LONG": ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "MFE_GIVEBACK_75", "ATR2_CHANDELIER"],
+            "XAUUSD_SHORT": ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"],
+            "XAGUSD_SHORT": ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"],
+            "current_manager_shadow_note": "Individual manager + staged-stop counterfactual only; hypothetical basket-defence composition is not re-simulated.",
+        },
+    }
 
 
 def cleaned_metal_short_demo_candidate(raw: Dict[str, Any], row: Any) -> Dict[str, Any]:
@@ -23615,11 +23789,19 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
         _metals_demo_audit(raw_signal_id,asset,instrument,"entry","FAILED",safe_str(response.get("error") or data),preview,response,candidate_state="CANDIDATE"); return {"ok":False,"asset":asset,"side":side,"response":response,"preview":preview}
     with get_conn() as conn:
         er=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=?",(raw_signal_id,)).fetchone(); fill_units=abs(safe_float(fill.get("units")) or preview.get("units") or 0); fill_price=safe_float(fill.get("price")) or preview.get("entry_price")
-        link_id=db_insert_returning_id(conn,"""INSERT INTO metals_demo_trade_links (created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,model_version,signal_time,entry_signal_id,requested_risk_amount,estimated_risk_amount,requested_units,filled_units,entry_price,stop_price,current_stop_price,broker_trade_id,broker_order_id,status,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_utc_iso(),now_utc_iso(),raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",json.dumps({"candidate":candidate,"confirmation_guard":confirmation_guard,"preview":preview,"response":response},default=str)))
+        policy_info=_metals_demo_new_trade_exit_policy(asset,side); policy_started=now_utc_iso()
+        link_id=db_insert_returning_id(conn,"""INSERT INTO metals_demo_trade_links (created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,model_version,signal_time,entry_signal_id,requested_risk_amount,estimated_risk_amount,requested_units,filled_units,entry_price,stop_price,current_stop_price,broker_trade_id,broker_order_id,status,active_exit_policy,active_exit_policy_version,active_exit_policy_started_at_utc,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (policy_started,policy_started,raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",policy_info["policy"],policy_info["version"],policy_started,json.dumps({"candidate":candidate,"confirmation_guard":confirmation_guard,"preview":preview,"response":response,"active_exit_policy":policy_info},default=str)))
         conn.commit()
-    _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}",preview,response,link_id,"CANDIDATE")
-    return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate}
+    shadow_start={"ok":True,"enabled":False,"created":0}
+    try:
+        with get_conn() as _shadow_conn:
+            shadow_start=start_metals_exit_challenger_shadows(_shadow_conn,int(link_id))
+            _shadow_conn.commit()
+    except Exception as _shadow_exc:
+        shadow_start={"ok":False,"error":f"{type(_shadow_exc).__name__}: {_shadow_exc}","research_only":True}
+    _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}; active_exit_policy={policy_info['policy']}",preview,response,link_id,"CANDIDATE")
+    return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate,"active_exit_policy":policy_info,"exit_challenger_shadow":shadow_start}
 
 
 def _metals_demo_pair_variants(asset: str) -> Tuple[str, str]:
@@ -23654,7 +23836,7 @@ def _metals_demo_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
         c=cleaned_metal_long_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate")); reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
     else:
         c=cleaned_metal_short_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate") or int(c.get("short_watch") or 0)==1); reversal=bool((_raw_bool_value(latest["forward_test_candidate"]) if latest else False) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
-    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c}
+    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c}
 
 def _metals_demo_phase(hold: int) -> str:
     if hold<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES: return "PRE_48_MIN_HOLD"
@@ -23663,7 +23845,7 @@ def _metals_demo_phase(hold: int) -> str:
     if hold<120: return "96_119_MATURE_RUNNER"
     return "120_PLUS_LATE_RUNNER"
 
-def _metals_demo_decision(m: Dict[str, Any]) -> Dict[str, Any]:
+def _metals_demo_current_manager_decision(m: Dict[str, Any]) -> Dict[str, Any]:
     h=int(m.get("hold_candles") or 0)
     r=safe_float(m.get("current_r"))
     hwm=safe_float(m.get("high_water_r"))
@@ -23730,19 +23912,423 @@ def _metals_demo_decision(m: Dict[str, Any]) -> Dict[str, Any]:
         "reason":"Trade remains acceptable; review again on next hourly metal signal."
     }
 
+
+def _metals_demo_decision(m: Dict[str, Any], link: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Active execution decision, frozen per trade at entry.
+
+    Only NEW XAUUSD LONG trades assigned MFE_GIVEBACK_50 use the new branch.
+    Legacy/existing rows and all XAG/SHORT rows retain CURRENT_MANAGER.
+    """
+    policy = _metals_demo_link_exit_policy(link)
+    if policy != METALS_XAU_LONG_MFE50_POLICY:
+        d = _metals_demo_current_manager_decision(m)
+        d["active_exit_policy"] = "CURRENT_MANAGER"
+        return d
+
+    h = int(m.get("hold_candles") or 0)
+    r = safe_float(m.get("current_r"))
+    mfe = max(0.0, float(safe_float(m.get("mfe_r")) or 0.0))
+    phase = _metals_demo_phase(h)
+    if h < METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES:
+        return {
+            "decision": "HOLD_MIN_48",
+            "phase": phase,
+            "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
+            "reason": "XAU LONG MFE50 active policy: normal exit locked before 48h; original hard broker SL remains active.",
+        }
+
+    if mfe > 0:
+        retained_fraction = 1.0 - METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION
+        floor_r = mfe * retained_fraction
+        if r is not None and r <= floor_r:
+            return {
+                "decision": "CLOSE_MFE50_GIVEBACK",
+                "phase": phase,
+                "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
+                "mfe_r": mfe,
+                "mfe_floor_r": floor_r,
+                "reason": f"XAU LONG MFE50: current {r:.2f}R is at/below the 50% giveback floor {floor_r:.2f}R from {mfe:.2f}R MFE.",
+            }
+        return {
+            "decision": "EXTEND",
+            "phase": phase,
+            "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
+            "mfe_r": mfe,
+            "mfe_floor_r": floor_r,
+            "reason": f"XAU LONG MFE50 active: retain 50% of {mfe:.2f}R MFE; floor {floor_r:.2f}R, review next hourly signal.",
+        }
+
+    return {
+        "decision": "EXTEND",
+        "phase": phase,
+        "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
+        "mfe_r": mfe,
+        "mfe_floor_r": None,
+        "reason": "XAU LONG MFE50 active: no positive MFE yet; hard SL remains the protection and review continues hourly.",
+    }
+
+
 def _metals_demo_protect_fraction(hold: int) -> float:
     if hold>=120: return METALS_DEMO_MANAGER_PROTECT_120
     if hold>=96: return METALS_DEMO_MANAGER_PROTECT_96
     if hold>=72: return METALS_DEMO_MANAGER_PROTECT_72
     return METALS_DEMO_MANAGER_PROTECT_48
 
+def _metals_demo_mfe50_stop_candidate(link: Dict[str, Any], m: Dict[str, Any]) -> Dict[str, Any]:
+    h = int(m.get("hold_candles") or 0)
+    entry = safe_float(link.get("entry_price"))
+    cur = safe_float(m.get("current_price"))
+    mfe_r = max(0.0, float(safe_float(m.get("mfe_r")) or 0.0))
+    if h < METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES or entry is None or entry <= 0 or cur is None or mfe_r <= 0:
+        return {"eligible": False, "reason": "mfe50_pre48_or_no_positive_mfe"}
+    if _metals_demo_asset(link.get("asset")) != "XAUUSD" or _metals_demo_side(link.get("side")) != "long":
+        return {"eligible": False, "reason": "mfe50_active_policy_only_xau_long"}
+
+    retained_fraction = 1.0 - METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION
+    floor_r = mfe_r * retained_fraction
+    sl_pct = _metals_demo_sl_pct("XAUUSD")
+    raw_stop = float(entry) * (1.0 + ((floor_r * sl_pct) / 100.0))
+    precision = 3
+    stop = round(raw_stop, precision)
+    if stop >= float(cur):
+        return {
+            "eligible": False,
+            "reason": "mfe50_floor_at_or_above_current_market_close_close_decision_should_handle",
+            "stop_price": stop,
+            "mfe_floor_r": floor_r,
+        }
+
+    prev = safe_float(link.get("current_stop_price")) or safe_float(link.get("stop_price"))
+    step = float(entry) * METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT / 100.0
+    if prev is not None and stop <= float(prev) + step:
+        return {"eligible": False, "reason": "mfe50_would_not_tighten_enough", "stop_price": stop, "mfe_floor_r": floor_r}
+    return {
+        "eligible": True,
+        "stop_price": stop,
+        "protect_fraction": retained_fraction,
+        "mfe_floor_r": floor_r,
+        "reason": f"XAU LONG MFE50: broker stop retains 50% of {mfe_r:.2f}R MFE ({floor_r:.2f}R floor)",
+    }
+
+
 def _metals_demo_stop_candidate(link: Dict[str, Any],m: Dict[str, Any]) -> Dict[str, Any]:
+    if _metals_demo_link_exit_policy(link) == METALS_XAU_LONG_MFE50_POLICY:
+        return _metals_demo_mfe50_stop_candidate(link, m)
     h=int(m.get("hold_candles") or 0); entry=safe_float(link.get("entry_price")); cur=safe_float(m.get("current_price")); r=safe_float(m.get("current_r"))
     if h<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES or entry is None or cur is None or r is None or r<=0: return {"eligible":False,"reason":"not_profitable_or_pre48"}
     side=_metals_demo_side(link.get("side")); f=_metals_demo_protect_fraction(h); raw=entry+(cur-entry)*f if side=="long" else entry-(entry-cur)*f; raw=min(raw,cur*0.9999) if side=="long" else max(raw,cur*1.0001); precision=3 if _metals_demo_asset(link.get("asset"))=="XAUUSD" else 5; stop=round(raw,precision)
     prev=safe_float(link.get("current_stop_price")) or safe_float(link.get("stop_price")); step=entry*METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT/100
     if prev is not None and ((side=="long" and stop<=prev+step) or (side=="short" and stop>=prev-step)): return {"eligible":False,"reason":"would_not_tighten_enough","stop_price":stop}
     return {"eligible":True,"stop_price":stop,"protect_fraction":f,"reason":f"protect {f:.0%} of current favourable move"}
+
+
+# ============================================================
+# v1.6.18 — METALS EXIT CHALLENGER FORWARD SHADOW ENGINE
+# Research-only. No metals_demo_request/oanda write path appears in this engine.
+# ============================================================
+
+def _metals_exit_shadow_atr14(conn: Any, asset: str, raw_signal_id: int) -> Optional[float]:
+    period = max(2, int(METALS_EXIT_SHADOW_ATR_PERIOD))
+    a,b = _metals_demo_pair_variants(asset)
+    rows = [dict(r) for r in conn.execute("""
+        SELECT id,exec_close,exec_high,exec_low,raw_json
+        FROM raw_signals
+        WHERE UPPER(pair) IN (?,?) AND id<=? AND exec_close IS NOT NULL
+        ORDER BY id DESC LIMIT ?
+    """, (a,b,int(raw_signal_id),max(period+2,int(METALS_EXIT_SHADOW_ATR_LOOKBACK_BARS)))).fetchall()]
+    rows = list(reversed(rows))
+    if len(rows) < period + 1:
+        return None
+    try:
+        latest_raw = json.loads(safe_str(rows[-1].get("raw_json")) or "{}")
+        payload = extract_payload(latest_raw) if isinstance(latest_raw,dict) else {}
+        for key in ("atr14","atr","exec_atr"):
+            v=safe_float(payload.get(key))
+            if v is not None and v>0:return float(v)
+    except Exception:
+        pass
+    trs=[]; prev=None
+    for r in rows:
+        c=safe_float(r.get("exec_close"))
+        if c is None:continue
+        h=safe_float(r.get("exec_high")); l=safe_float(r.get("exec_low"))
+        h=float(h if h is not None else c); l=float(l if l is not None else c)
+        tr=max(0.0,h-l) if prev is None else max(h-l,abs(h-prev),abs(l-prev))
+        trs.append(float(tr)); prev=float(c)
+    if len(trs)<period:return None
+    atr=sum(trs[:period])/float(period)
+    for tr in trs[period:]:atr=((atr*(period-1))+tr)/float(period)
+    return float(atr) if atr>0 else None
+
+
+def _metals_exit_shadow_actual_r(link: Dict[str, Any]) -> Optional[float]:
+    realized=safe_float(link.get("realized_pl"))
+    risk=safe_float(link.get("estimated_risk_amount")) or safe_float(link.get("requested_risk_amount"))
+    if realized is not None and risk is not None and risk>0:
+        return float(realized)/float(risk)
+    if safe_str(link.get("status")).upper() != "OPEN":
+        entry=safe_float(link.get("entry_price")); px=safe_float(link.get("last_known_price"))
+        if entry is not None and px is not None:
+            return _metals_demo_r_from_price(link.get("side"),float(entry),px,_metals_demo_sl_pct(link.get("asset")))
+    return None
+
+
+def _metals_exit_shadow_pair_classification(actual_r: Optional[float], shadow_r: Optional[float]) -> Dict[str, Any]:
+    if actual_r is None or shadow_r is None:
+        return {"paired_complete":False,"delta_r":None,"winner":"","saved_reversal":False,"killed_large_winner":False}
+    actual=float(actual_r); shadow=float(shadow_r); delta=shadow-actual
+    winner="SHADOW" if delta>METALS_EXIT_SHADOW_PAIR_TIE_R else "ACTUAL" if delta<-METALS_EXIT_SHADOW_PAIR_TIE_R else "TIE"
+    return {
+        "paired_complete":True,"delta_r":delta,"winner":winner,
+        "saved_reversal":bool(actual<0 and shadow>actual+METALS_EXIT_SHADOW_REVERSAL_SAVE_DELTA_R),
+        "killed_large_winner":bool(actual>=METALS_EXIT_SHADOW_LARGE_WINNER_R and shadow<actual-METALS_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R),
+    }
+
+
+def _metals_exit_shadow_sync_actual(conn: Any, shadow: Dict[str, Any]) -> Dict[str, Any]:
+    link=conn.execute("SELECT * FROM metals_demo_trade_links WHERE id=? LIMIT 1",(int(shadow.get("link_id") or 0),)).fetchone()
+    if not link:return shadow
+    link=dict(link); status=safe_str(link.get("status")).upper() or "UNKNOWN"
+    closed=status!="OPEN"
+    actual_r=_metals_exit_shadow_actual_r(link) if closed else None
+    shadow_closed=safe_str(shadow.get("status")).upper()=="CLOSED"
+    pair=_metals_exit_shadow_pair_classification(actual_r,safe_float(shadow.get("hypothetical_exit_r")) if shadow_closed else None)
+    conn.execute("""
+        UPDATE metals_exit_challenger_shadow SET
+            actual_policy=?,actual_policy_version=?,actual_status=?,actual_exit_time=?,actual_exit_price=?,actual_r=?,actual_exit_reason=?,
+            paired_complete=?,challenger_minus_actual_r=?,paired_winner=?,saved_reversal=?,killed_large_winner=?,updated_at_utc=?
+        WHERE id=?
+    """,(
+        _metals_demo_link_exit_policy(link),safe_str(link.get("active_exit_policy_version")) or METALS_DEMO_MANAGER_VERSION,
+        status,safe_str(link.get("closed_at_utc")) or None,safe_float(link.get("last_known_price")),actual_r,safe_str(link.get("close_reason")),
+        1 if pair["paired_complete"] else 0,pair["delta_r"],pair["winner"],1 if pair["saved_reversal"] else 0,1 if pair["killed_large_winner"] else 0,
+        now_utc_iso(),int(shadow.get("id")),
+    ))
+    row=conn.execute("SELECT * FROM metals_exit_challenger_shadow WHERE id=? LIMIT 1",(int(shadow.get("id")),)).fetchone()
+    return dict(row) if row else shadow
+
+
+def start_metals_exit_challenger_shadows(conn: Any, link_id: int) -> Dict[str, Any]:
+    """Create forward shadows for a NEW accepted Metals broker trade only."""
+    if not METALS_EXIT_SHADOW_ENABLED:return {"ok":True,"enabled":False,"created":0}
+    row=conn.execute("SELECT * FROM metals_demo_trade_links WHERE id=? LIMIT 1",(int(link_id),)).fetchone()
+    if not row:return {"ok":False,"created":0,"reason":"trade_link_not_found"}
+    link=dict(row)
+    if safe_str(link.get("status")).upper()!="OPEN":return {"ok":False,"created":0,"reason":"trade_link_not_open"}
+    entry=safe_float(link.get("entry_price"))
+    if entry is None or entry<=0:return {"ok":False,"created":0,"reason":"entry_price_missing"}
+    policy=_metals_demo_link_exit_policy(link); challengers=_metals_exit_shadow_challengers_for_lane(link.get("asset"),link.get("side"),policy)
+    hard=safe_float(link.get("stop_price"))
+    if hard is None:
+        sl=_metals_demo_sl_pct(link.get("asset")); hard=float(entry)*(1-sl/100 if _metals_demo_side(link.get("side"))=="long" else 1+sl/100)
+    created=0
+    for challenger in challengers:
+        ex=conn.execute("SELECT id FROM metals_exit_challenger_shadow WHERE link_id=? AND challenger=? LIMIT 1",(int(link_id),challenger)).fetchone()
+        if ex:continue
+        conn.execute("""
+            INSERT INTO metals_exit_challenger_shadow(
+                created_at_utc,updated_at_utc,shadow_version,link_id,raw_signal_id,asset,instrument,side,challenger,
+                actual_policy,actual_policy_version,entry_raw_signal_id,entry_signal_id,entry_time,entry_price,sl_pct,hard_stop_price,
+                status,last_raw_signal_id,last_signal_time,hold_candles,current_price,current_r,highest_high,lowest_low,mfe_r,mae_r,high_water_r,giveback_pct,
+                actual_status,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,(
+            now_utc_iso(),now_utc_iso(),METALS_EXIT_SHADOW_VERSION,int(link_id),int(link.get("raw_signal_id") or 0),
+            _metals_demo_asset(link.get("asset")),safe_str(link.get("instrument")),_metals_demo_side(link.get("side")),challenger,
+            policy,safe_str(link.get("active_exit_policy_version")) or METALS_DEMO_MANAGER_VERSION,int(link.get("raw_signal_id") or 0),
+            int(link.get("entry_signal_id") or link.get("raw_signal_id") or 0),safe_str(link.get("signal_time")),float(entry),_metals_demo_sl_pct(link.get("asset")),float(hard),
+            int(link.get("raw_signal_id") or 0),safe_str(link.get("signal_time")),0,float(entry),0.0,float(entry),float(entry),0.0,0.0,0.0,0.0,
+            safe_str(link.get("status")).upper(),
+            "Forward-only exit research shadow. Zero execution authority; no historical trade backfill.",
+        ))
+        created+=1
+    return {"ok":True,"enabled":True,"created":created,"link_id":int(link_id),"actual_policy":policy,"challengers":challengers,"research_only":True}
+
+
+def _metals_exit_shadow_direction_state(asset: str, side: str, signal: Dict[str, Any]) -> Dict[str, Any]:
+    try:raw=json.loads(safe_str(signal.get("raw_json")) or "{}")
+    except Exception:raw={}
+    if _metals_demo_side(side)=="long":
+        c=cleaned_metal_long_demo_candidate(raw,signal)
+        support=bool(c.get("demo_candidate"))
+        reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
+    else:
+        c=cleaned_metal_short_demo_candidate(raw,signal)
+        support=bool(c.get("demo_candidate") or int(c.get("short_watch") or 0)==1)
+        reversal=bool(_raw_bool_value(signal.get("forward_test_candidate")) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
+    return {"direction_support":support,"adverse_reversal":reversal,"candidate":c}
+
+
+def _metals_exit_shadow_close(conn: Any, shadow: Dict[str, Any], *, signal_time: str, exit_price: float, reason: str,
+                              current: float, highest: float, lowest: float, hold: int, atr14: Optional[float],
+                              trail: Optional[float], mfe_floor: Optional[float], current_decision: str="", current_reason: str="") -> None:
+    entry=float(safe_float(shadow.get("entry_price")) or 0.0); side=_metals_demo_side(shadow.get("side")); sl=float(safe_float(shadow.get("sl_pct")) or _metals_demo_sl_pct(shadow.get("asset")))
+    exit_r=_metals_demo_r_from_price(side,entry,exit_price,sl) if entry>0 else None
+    current_r=_metals_demo_r_from_price(side,entry,current,sl) if entry>0 else None
+    mfe_price=highest if side=="long" else lowest; mae_price=lowest if side=="long" else highest
+    mfe_r=_metals_demo_r_from_price(side,entry,mfe_price,sl) if entry>0 else None; mae_r=_metals_demo_r_from_price(side,entry,mae_price,sl) if entry>0 else None
+    hwm=max([float(x) for x in (safe_float(mfe_r),safe_float(current_r)) if x is not None],default=0.0)
+    gb=((hwm-float(current_r))/hwm*100) if hwm>0 and current_r is not None and current_r<hwm else 0.0
+    conn.execute("""
+        UPDATE metals_exit_challenger_shadow SET status='CLOSED',last_signal_time=?,hold_candles=?,current_price=?,current_r=?,
+            highest_high=?,lowest_low=?,mfe_r=?,mae_r=?,high_water_r=?,giveback_pct=?,atr14=?,trail_price=?,mfe_floor_price=?,
+            current_manager_decision=?,current_manager_reason=?,hypothetical_exit_time=?,hypothetical_exit_price=?,hypothetical_exit_r=?,
+            hypothetical_exit_reason=?,updated_at_utc=? WHERE id=?
+    """,(signal_time,hold,current,current_r,highest,lowest,mfe_r,mae_r,hwm,gb,atr14,trail,mfe_floor,current_decision,current_reason,
+          signal_time,float(exit_price),exit_r,reason,now_utc_iso(),int(shadow.get("id"))))
+
+
+def update_metals_exit_challenger_shadows(asset: str, raw_signal_id: int) -> Dict[str, Any]:
+    """Advance forward shadows once per new asset signal. Research-only."""
+    if not METALS_EXIT_SHADOW_ENABLED:return {"ok":True,"enabled":False,"updated":0,"closed":0}
+    a=_metals_demo_asset(asset)
+    with get_conn() as conn:
+        row=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+        if not row:return {"ok":False,"reason":"raw_signal_not_found","research_only":True}
+        signal=dict(row); current=safe_float(signal.get("exec_close"))
+        if current is None:return {"ok":False,"reason":"exec_close_missing","research_only":True}
+        current=float(current); high=float(safe_float(signal.get("exec_high")) or current); low=float(safe_float(signal.get("exec_low")) or current)
+        signal_time=safe_str(signal.get("timestamp_readable")); atr14=_metals_exit_shadow_atr14(conn,a,int(raw_signal_id))
+        shadows=[dict(r) for r in conn.execute("""
+            SELECT * FROM metals_exit_challenger_shadow
+            WHERE asset=? AND (status='OPEN' OR COALESCE(paired_complete,0)=0)
+            ORDER BY id ASC
+        """,(a,)).fetchall()]
+        updated=0; closed=0
+        for shadow in shadows:
+            shadow=_metals_exit_shadow_sync_actual(conn,shadow)
+            if safe_str(shadow.get("status")).upper()!="OPEN":updated+=1;continue
+            last_id=int(safe_float(shadow.get("last_raw_signal_id")) or 0)
+            if int(raw_signal_id)<=last_id:continue
+            entry=float(safe_float(shadow.get("entry_price")) or 0.0)
+            if entry<=0:continue
+            side=_metals_demo_side(shadow.get("side")); sl=float(safe_float(shadow.get("sl_pct")) or _metals_demo_sl_pct(a)); hard=float(safe_float(shadow.get("hard_stop_price")) or (entry*(1-sl/100 if side=="long" else 1+sl/100)))
+            hold=int(safe_float(shadow.get("hold_candles")) or 0)+1
+            prev_high=float(safe_float(shadow.get("highest_high")) or entry); prev_low=float(safe_float(shadow.get("lowest_low")) or entry)
+            prev_trail=safe_float(shadow.get("trail_price")); prev_mfe_floor=safe_float(shadow.get("mfe_floor_price"))
+            challenger=safe_str(shadow.get("challenger")).upper(); exit_price=None; exit_reason=""; current_decision=""; current_reason=""
+
+            # Previously armed shadow stops act on this candle before the close-of-bar
+            # calculation can tighten them for the NEXT candle. This avoids look-ahead.
+            armed=prev_mfe_floor if challenger.startswith("MFE_GIVEBACK_") else prev_trail if challenger in {"ATR2_CHANDELIER","CURRENT_MANAGER"} else None
+            if armed is not None and ((side=="long" and low<=armed) or (side=="short" and high>=armed)):
+                exit_price=float(armed); exit_reason=f"{challenger}_SHADOW_STOP"
+            elif (side=="long" and low<=hard) or (side=="short" and high>=hard):
+                exit_price=hard; exit_reason="HARD_STOP"
+
+            highest=max(prev_high,high); lowest=min(prev_low,low)
+            current_r=_metals_demo_r_from_price(side,entry,current,sl)
+            mfe_price=highest if side=="long" else lowest; mae_price=lowest if side=="long" else highest
+            mfe_r=_metals_demo_r_from_price(side,entry,mfe_price,sl); mae_r=_metals_demo_r_from_price(side,entry,mae_price,sl)
+            hwm=max([float(x) for x in (safe_float(mfe_r),safe_float(current_r)) if x is not None],default=0.0)
+            gb=((hwm-float(current_r))/hwm*100) if hwm>0 and current_r is not None and current_r<hwm else 0.0
+            trail=prev_trail; mfe_floor=prev_mfe_floor
+
+            if exit_price is None:
+                if challenger=="FIXED_120H" and hold>=METALS_EXIT_SHADOW_FIXED_HOLD_CANDLES:
+                    exit_price=current; exit_reason="FIXED_120H"
+                elif hold>=METALS_EXIT_SHADOW_MIN_HOLD_CANDLES:
+                    if challenger.startswith("MFE_GIVEBACK_"):
+                        fraction={"MFE_GIVEBACK_25":0.25,"MFE_GIVEBACK_50":0.50,"MFE_GIVEBACK_75":0.75}.get(challenger)
+                        if fraction is not None and mfe_r is not None and mfe_r>0:
+                            retain=1.0-fraction; floor_r=float(mfe_r)*retain
+                            candidate=entry*(1+(floor_r*sl/100)) if side=="long" else entry/(1+(floor_r*sl/100))
+                            if side=="long":mfe_floor=max(hard,float(mfe_floor) if mfe_floor is not None else hard,candidate)
+                            else:mfe_floor=min(hard,float(mfe_floor) if mfe_floor is not None else hard,candidate)
+                    elif challenger=="ATR2_CHANDELIER" and atr14 is not None and atr14>0:
+                        candidate=highest-(METALS_EXIT_SHADOW_ATR_MULTIPLIER*atr14) if side=="long" else lowest+(METALS_EXIT_SHADOW_ATR_MULTIPLIER*atr14)
+                        if side=="long":trail=max(hard,float(trail) if trail is not None else hard,candidate)
+                        else:trail=min(hard,float(trail) if trail is not None else hard,candidate)
+                    elif challenger=="CURRENT_MANAGER":
+                        ds=_metals_exit_shadow_direction_state(a,side,signal)
+                        m={"hold_candles":hold,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"high_water_r":hwm,"giveback_pct":gb,
+                           "direction_support":ds["direction_support"],"adverse_reversal":ds["adverse_reversal"]}
+                        d=_metals_demo_current_manager_decision(m); current_decision=safe_str(d.get("decision")); current_reason=safe_str(d.get("reason"))
+                        if current_decision.startswith("CLOSE"):
+                            exit_price=current; exit_reason=f"CURRENT_MANAGER:{current_decision}"
+                        elif current_decision=="EXTEND" and current_r is not None and current_r>0:
+                            f=_metals_demo_protect_fraction(hold); cand=entry+(current-entry)*f if side=="long" else entry-(entry-current)*f
+                            cand=min(cand,current*0.9999) if side=="long" else max(cand,current*1.0001)
+                            precision=3 if a=="XAUUSD" else 5; cand=round(cand,precision); step=entry*METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT/100
+                            if trail is None or (side=="long" and cand>trail+step) or (side=="short" and cand<trail-step):trail=cand
+
+            if exit_price is not None:
+                _metals_exit_shadow_close(conn,shadow,signal_time=signal_time,exit_price=float(exit_price),reason=exit_reason,current=current,highest=highest,lowest=lowest,
+                                          hold=hold,atr14=atr14,trail=trail,mfe_floor=mfe_floor,current_decision=current_decision,current_reason=current_reason)
+                rr=conn.execute("SELECT * FROM metals_exit_challenger_shadow WHERE id=? LIMIT 1",(int(shadow.get("id")),)).fetchone()
+                if rr:_metals_exit_shadow_sync_actual(conn,dict(rr))
+                closed+=1
+            else:
+                conn.execute("""
+                    UPDATE metals_exit_challenger_shadow SET last_raw_signal_id=?,last_signal_time=?,hold_candles=?,current_price=?,current_r=?,
+                        highest_high=?,lowest_low=?,mfe_r=?,mae_r=?,high_water_r=?,giveback_pct=?,atr14=?,trail_price=?,mfe_floor_price=?,
+                        current_manager_decision=?,current_manager_reason=?,updated_at_utc=? WHERE id=?
+                """,(int(raw_signal_id),signal_time,hold,current,current_r,highest,lowest,mfe_r,mae_r,hwm,gb,atr14,trail,mfe_floor,current_decision,current_reason,now_utc_iso(),int(shadow.get("id"))))
+            updated+=1
+        conn.commit()
+    return {"ok":True,"enabled":True,"updated":updated,"closed":closed,"raw_signal_id":int(raw_signal_id),"asset":a,"atr14":atr14,"research_only":True,"execution_authority":False}
+
+
+def sync_metals_exit_challenger_actual_outcomes() -> Dict[str, Any]:
+    if not METALS_EXIT_SHADOW_ENABLED:return {"ok":True,"enabled":False,"updated":0}
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM metals_exit_challenger_shadow WHERE COALESCE(paired_complete,0)=0 ORDER BY id ASC").fetchall()]
+        for r in rows:_metals_exit_shadow_sync_actual(conn,r)
+        conn.commit()
+    return {"ok":True,"enabled":True,"updated":len(rows),"research_only":True}
+
+
+def metals_exit_challenger_shadow_summary() -> Dict[str, Any]:
+    init_db()
+    with get_conn() as conn:rows=[dict(r) for r in conn.execute("SELECT * FROM metals_exit_challenger_shadow ORDER BY id DESC").fetchall()]
+    out={"ok":True,"enabled":METALS_EXIT_SHADOW_ENABLED,"shadow_version":METALS_EXIT_SHADOW_VERSION,"research_only":True,"execution_authority":False,
+         "forward_only_no_backfill":True,"active_policy":metals_exit_policy_status()["active_execution"],"row_count":len(rows),
+         "trade_count":len({int(r.get("link_id") or 0) for r in rows if int(r.get("link_id") or 0)>0}),"challengers":{},"lanes":{}}
+    for ch in sorted({safe_str(r.get("challenger")) for r in rows if safe_str(r.get("challenger"))}):
+        rr=[r for r in rows if safe_str(r.get("challenger"))==ch]; pairs=[r for r in rr if int(safe_float(r.get("paired_complete")) or 0)==1]
+        ds=[safe_float(r.get("challenger_minus_actual_r")) for r in pairs]; ds=[float(x) for x in ds if x is not None]
+        out["challengers"][ch]={"rows":len(rr),"open":sum(1 for r in rr if safe_str(r.get("status")).upper()=="OPEN"),"shadow_closed":sum(1 for r in rr if safe_str(r.get("status")).upper()=="CLOSED"),
+            "paired_complete":len(pairs),"avg_delta_r":sum(ds)/len(ds) if ds else None,"shadow_wins":sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper()=="SHADOW"),
+            "actual_wins":sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper()=="ACTUAL"),"ties":sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper()=="TIE"),
+            "saved_reversals":sum(1 for r in pairs if int(safe_float(r.get("saved_reversal")) or 0)==1),"large_winners_killed":sum(1 for r in pairs if int(safe_float(r.get("killed_large_winner")) or 0)==1)}
+    for a,d in [("XAUUSD","long"),("XAGUSD","long"),("XAUUSD","short"),("XAGUSD","short")]:
+        rr=[r for r in rows if _metals_demo_asset(r.get("asset"))==a and _metals_demo_side(r.get("side"))==d]
+        out["lanes"][f"{a}_{d.upper()}"]={"rows":len(rr),"trades":len({r.get("link_id") for r in rr}),"paired_complete":sum(1 for r in rr if int(safe_float(r.get("paired_complete")) or 0)==1)}
+    return out
+
+
+def build_metals_exit_challenger_shadow_html() -> str:
+    try:
+        summary=metals_exit_challenger_shadow_summary()
+        with get_conn() as conn:rows=[dict(r) for r in conn.execute("SELECT * FROM metals_exit_challenger_shadow ORDER BY id DESC LIMIT 120").fetchall()]
+    except Exception as e:
+        return f'<div class="section-note warn">Exit challenger shadow unavailable: {esc(e)}</div>'
+    cards=""
+    for ch,st in summary.get("challengers",{}).items():
+        delta=safe_float(st.get("avg_delta_r")); delta_txt="n/a" if delta is None else f"{delta:+.2f}R"
+        cards+=f'<div class="mini-card"><div class="k">{esc(ch.replace("_"," "))}</div><div class="v {pnl_class(delta)}">{esc(delta_txt)}</div><div class="small">paired {int(st.get("paired_complete") or 0)} · shadow {int(st.get("shadow_wins") or 0)} / actual {int(st.get("actual_wins") or 0)} / ties {int(st.get("ties") or 0)}</div></div>'
+    body=""
+    for r in rows[:60]:
+        body+=f"""<tr><td>{esc(r.get('asset'))}</td><td>{esc(safe_str(r.get('side')).upper())}</td><td>{esc(r.get('link_id'))}</td><td>{esc(r.get('actual_policy'))}</td><td>{esc(r.get('challenger'))}</td><td>{esc(r.get('status'))}</td><td>{esc(r.get('hold_candles'))}</td><td>{_fmt_metric(r.get('current_r'),'R',2)}</td><td>{_fmt_metric(r.get('mfe_r'),'R',2)}</td><td>{_fmt_metric(r.get('hypothetical_exit_r'),'R',2)}</td><td>{_fmt_metric(r.get('actual_r'),'R',2)}</td><td>{_fmt_metric(r.get('challenger_minus_actual_r'),'R',2)}</td><td>{esc(r.get('paired_winner'))}</td><td>{esc(r.get('hypothetical_exit_reason'))}</td></tr>"""
+    body=body or '<tr><td colspan="14">No forward shadow rows yet. Rows begin only on NEW accepted trades after v1.6.18 deployment.</td></tr>'
+    return f"""<div class="section-note small"><strong>Active execution:</strong> NEW XAU LONG trades use MFE50 after 48h; pre-v1.6.18 open XAU trades remain on their stored/legacy Current Manager. XAG LONG and both SHORT lanes remain Current Manager. Hard SL and existing basket defence stay active.</div>
+    <div class="section-note small"><strong>Forward shadows:</strong> zero execution authority, no historical backfill. XAU LONG: Current + MFE25 + MFE75 + ATR2 + Fixed120; XAG LONG: MFE25/50/75 + ATR2; Shorts: MFE25/50 + ATR2. Current shadow is the individual manager/staged-stop counterfactual; hypothetical basket-defence composition is not re-simulated.</div>
+    <div class="metric-grid">{cards or '<div class="mini-card"><div class="k">Forward trades shadowed</div><div class="v">0</div><div class="small">Waiting for new accepted trades.</div></div>'}</div>
+    <div class="table-scroll"><table><thead><tr><th>Asset</th><th>Side</th><th>Link</th><th>Actual policy</th><th>Shadow</th><th>Status</th><th>Age</th><th>Current R</th><th>MFE</th><th>Shadow Exit R</th><th>Actual R</th><th>Delta</th><th>Winner</th><th>Reason</th></tr></thead><tbody>{body}</tbody></table></div>
+    <div class="section-note small"><a href="/metals-exit-challenger-shadow/status">status JSON</a> · <a href="/export/metals-exit-challenger-shadow.csv">shadow CSV</a></div>"""
+
+
+@app.get("/metals-exit-challenger-shadow/status")
+def metals_exit_challenger_shadow_status_endpoint() -> Dict[str, Any]:
+    return metals_exit_challenger_shadow_summary()
+
+
+@app.get("/export/metals-exit-challenger-shadow.csv")
+def export_metals_exit_challenger_shadow_csv(limit: int = RESEARCH_ROW_EXPORT_LIMIT) -> Response:
+    init_db(); limit=max(1,min(int(limit or RESEARCH_ROW_EXPORT_LIMIT),RESEARCH_ROW_HARD_LIMIT))
+    with get_conn() as conn:rows=[dict(r) for r in conn.execute("SELECT * FROM metals_exit_challenger_shadow ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+    return Response(dicts_to_csv(rows),media_type="text/csv",headers={"Content-Disposition":'attachment; filename="metals-exit-challenger-shadow.csv"'})
+
 
 def _metals_demo_update_stop(link: Dict[str, Any],cand: Dict[str, Any]) -> Dict[str, Any]:
     if not cand.get("eligible"): return {"ok":True,"status":"NO_UPDATE","reason":cand.get("reason")}
@@ -24874,16 +25460,19 @@ def metals_demo_reconcile_and_close(asset: str = "", allow_actions: bool = True,
         sql="SELECT * FROM metals_demo_trade_links WHERE status='OPEN'"; params=[]
         if asset: sql+=" AND asset=?"; params.append(_metals_demo_asset(asset))
         links=[dict(r) for r in conn.execute(sql,tuple(params)).fetchall()]
-    results=[]; review_signal_id=None
+    results=[]; review_signal_id=None; exit_shadow_update={"ok":True,"enabled":METALS_EXIT_SHADOW_ENABLED,"updated":0,"closed":0}
     if asset:
         with get_conn() as conn:
             lr=_metals_demo_latest_signal_row(conn,asset); review_signal_id=int(lr["id"]) if lr else None
+        if review_signal_id:
+            try: exit_shadow_update=update_metals_exit_challenger_shadows(asset,int(review_signal_id))
+            except Exception as _se: exit_shadow_update={"ok":False,"error":f"{type(_se).__name__}: {_se}","research_only":True}
     for link in links:
         trade=broker.get(safe_str(link.get("broker_trade_id")))
         if not trade: results.append({"link_id":link["id"],"broker_refresh":_metals_demo_refresh_closed(link)}); continue
         m=_metals_demo_trade_metrics(link)
         if not m.get("ok"): results.append({"link_id":link["id"],"status":"METRICS_FAILED","metrics":m}); continue
-        upl=safe_float(trade.get("unrealizedPL")); d=_metals_demo_decision(m); hold=int(m.get("hold_candles") or 0)
+        upl=safe_float(trade.get("unrealizedPL")); d=_metals_demo_decision(m,link); hold=int(m.get("hold_candles") or 0)
         with get_conn() as conn:
             # v1.6.17 Postgres repair:
             # Do not use `? IS NOT NULL` for the fixed-48h value. When that value is
@@ -24937,7 +25526,7 @@ def metals_demo_reconcile_and_close(asset: str = "", allow_actions: bool = True,
             close_status="SUPPRESSED_STALE_MAINTENANCE_CATCHUP"
         with get_conn() as conn:
             conn.execute("INSERT INTO metals_demo_manager_reviews (created_at_utc,link_id,raw_signal_id,review_signal_id,asset,instrument,side,hold_candles,current_price,current_r,mfe_r,mae_r,high_water_r,giveback_pct,direction_support,adverse_reversal,manager_phase,decision,reason,proposed_stop_price,stop_update_status,close_queue_status,fixed_48h_price,fixed_48h_r,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_utc_iso(),int(link["id"]),int(link.get("raw_signal_id") or 0),m.get("latest_signal_id"),link.get("asset"),link.get("instrument"),link.get("side"),hold,m.get("current_price"),m.get("current_r"),m.get("mfe_r"),m.get("mae_r"),m.get("high_water_r"),m.get("giveback_pct"),1 if m.get("direction_support") else 0,1 if m.get("adverse_reversal") else 0,d.get("phase"),d.get("decision"),d.get("reason"),stop_result.get("stop_price"),stop_result.get("status"),close_status,m.get("fixed_48h_price"),m.get("fixed_48h_r"),json.dumps({"metrics":m,"decision":d,"stop":stop_result},default=str))); conn.commit()
-        results.append({"link_id":link["id"],"asset":link.get("asset"),"side":link.get("side"),"hold_candles":hold,"current_r":m.get("current_r"),"high_water_r":m.get("high_water_r"),"giveback_pct":m.get("giveback_pct"),"fixed_48h_r":m.get("fixed_48h_r"),"decision":d,"stop_result":stop_result,"close_queue_status":close_status,"unrealized_pl":upl})
+        results.append({"link_id":link["id"],"asset":link.get("asset"),"side":link.get("side"),"active_exit_policy":_metals_demo_link_exit_policy(link),"hold_candles":hold,"current_r":m.get("current_r"),"high_water_r":m.get("high_water_r"),"giveback_pct":m.get("giveback_pct"),"fixed_48h_r":m.get("fixed_48h_r"),"decision":d,"stop_result":stop_result,"close_queue_status":close_status,"unrealized_pl":upl})
     snaps=_metals_demo_snapshot_baskets(review_signal_id)
     defence=_metals_demo_apply_basket_defence(asset,review_signal_id) if allow_actions and asset and METALS_DEMO_BASKET_MANAGER_ENABLED and METALS_DEMO_BROKER_ENABLED else []
     retries=[]
@@ -24946,7 +25535,9 @@ def metals_demo_reconcile_and_close(asset: str = "", allow_actions: bool = True,
         for q in queued:
             l=dict(q); l["id"]=q.get("link_id"); retries.append({"queue_id":q.get("id"),"link_id":q.get("link_id"),"result":_metals_demo_close(l,int(q["id"]))})
     tx_sync=metals_demo_sync_broker_transactions(force=True)
-    return {"ok":True,"source":source,"allow_actions":bool(allow_actions),"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync,"ghost_reconciliation":ghost_sweep}
+    try: exit_shadow_pair_sync=sync_metals_exit_challenger_actual_outcomes()
+    except Exception as _spe: exit_shadow_pair_sync={"ok":False,"error":f"{type(_spe).__name__}: {_spe}","research_only":True}
+    return {"ok":True,"source":source,"allow_actions":bool(allow_actions),"manager_enabled":METALS_DEMO_BASKET_MANAGER_ENABLED,"minimum_hold_candles":METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,"hourly_post48_review":True,"fixed_48h_is_baseline_only":True,"xau_long_new_trade_active_exit":METALS_XAU_LONG_MFE50_POLICY if METALS_XAU_LONG_MFE50_ACTIVE_ENABLED else "CURRENT_MANAGER","open_broker_trades":len(broker),"checked":len(links),"results":results,"basket_snapshot":snaps,"basket_defence_actions":defence,"persistent_close_retries":retries,"broker_transaction_sync":tx_sync,"ghost_reconciliation":ghost_sweep,"exit_challenger_shadow_update":exit_shadow_update,"exit_challenger_shadow_pair_sync":exit_shadow_pair_sync}
 
 
 def metals_demo_summary() -> Dict[str, Any]:
@@ -24982,7 +25573,7 @@ def metals_demo_summary() -> Dict[str, Any]:
             "current_preview_effective_risk_gbp":safe_float(p.get("estimated_risk_gbp")),
             "minimum_size_applied":bool(p.get("minimum_size_applied")),
         }
-    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"latest":latest,"previews":previews,"risk_visibility":risk_visibility,"manager_worker":metals_demo_manager_worker_status(),"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h is minimum hold/baseline only. Every new hourly metal signal after 48h triggers extend/protect/close review.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
+    return {"status":"ok","label":METALS_DEMO_LABEL,"reporting_currency":"GBP","config":cfg,"exit_policy":metals_exit_policy_status(),"exit_challenger_shadow":metals_exit_challenger_shadow_summary(),"latest":latest,"previews":previews,"risk_visibility":risk_visibility,"manager_worker":metals_demo_manager_worker_status(),"open_trades":open_links,"open_trade_count":len(open_links),"open_long_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="long"),"open_short_count":sum(1 for r in open_links if _metals_demo_side(r.get("side"))=="short"),"actual_open_pnl":actual_open,"actual_realized_pnl":actual_closed,"local_realized_pnl":local_closed,"broker_realized_accounting":broker_realized,"actual_total_pnl":actual_open+actual_closed,"fixed_48h_baseline_rows":len(fixed),"fixed_48h_baseline_total_R":sum(fixed) if fixed else 0.0,"manager_note":"48h remains the minimum. NEW XAU LONG trades use MFE50 active execution after 48h; existing XAU trades, XAG LONG and both SHORT lanes retain Current Manager. Exit shadows are research-only.","recent_manager_reviews":reviews,"recent_basket_snapshots":baskets,"recent_action_queue":queue_rows,"recent_audit":audits,"time_utc":now_utc_iso()}
 
 def build_metals_demo_dashboard_html() -> str:
     try: snap=metals_demo_summary()
@@ -24992,9 +25583,9 @@ def build_metals_demo_dashboard_html() -> str:
     for asset in ["XAUUSD","XAGUSD"]:
         item=snap["latest"].get(asset,{}); lc=item.get("long") or {}; sc=item.get("short_v2") or {}; sel=item.get("selected_demo_candidate") or {}; sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td><strong>{esc(sel.get('demo_side') or '-')}</strong></td></tr>"
     opens=""
-    for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
-    opens=opens or '<tr><td colspan="10">No open metals demo trades.</td></tr>'
-    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum hold; review every hourly metal signal thereafter. 72/96/120h are protection milestones, not forced exits. Fixed 48h remains the benchmark.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
+    for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(_metals_demo_link_exit_policy(r))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
+    opens=opens or '<tr><td colspan="11">No open metals demo trades.</td></tr>'
+    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum. NEW XAU LONG trades use active MFE50; existing XAU trades, XAG LONG and both SHORT lanes retain the Current Manager. 72/96/120h remain Current-Manager protection milestones; Fixed48 remains a benchmark. Forward exit shadows have zero execution authority.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Policy</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
 
 
 @app.get("/metals-short-shadow-v2")
@@ -25151,6 +25742,7 @@ def export_metals_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT) -> Resp
                 demo_action_queue = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
                 demo_broker_transactions = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_broker_transactions ORDER BY transaction_time DESC LIMIT ?", (limit,)).fetchall()]
                 demo_runtime_state = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_runtime_state ORDER BY key").fetchall()]
+                demo_exit_shadow = [dict(r) for r in conn.execute("SELECT * FROM metals_exit_challenger_shadow ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
                 try:
                     ensure_metals_hwm_history_table()
                     demo_hwm_events = [dict(r) for r in conn.execute("SELECT * FROM metals_demo_hwm_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
@@ -25164,6 +25756,8 @@ def export_metals_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT) -> Resp
             _write_zip_csv(zf, "metals-demo-action-queue.csv", demo_action_queue, ["id"]); files.append("metals-demo-action-queue.csv")
             _write_zip_csv(zf, "metals-demo-broker-transactions.csv", demo_broker_transactions, ["transaction_id"]); files.append("metals-demo-broker-transactions.csv")
             _write_zip_csv(zf, "metals-demo-runtime-state.csv", demo_runtime_state, ["key"]); files.append("metals-demo-runtime-state.csv")
+            _write_zip_csv(zf, "metals-exit-challenger-shadow.csv", demo_exit_shadow, ["id"]); files.append("metals-exit-challenger-shadow.csv")
+            _write_zip_json(zf, "metals-exit-policy-config.json", metals_exit_policy_status()); files.append("metals-exit-policy-config.json")
             _write_zip_csv(zf, "metals-demo-hwm-events.csv", demo_hwm_events, ["id"]); files.append("metals-demo-hwm-events.csv")
             _write_zip_csv(zf, "metals-demo-open-trades.csv", demo_open, ["id"]); files.append("metals-demo-open-trades.csv")
             _write_zip_json(zf, "metals-demo-summary.json", metals_demo_summary()); files.append("metals-demo-summary.json")
@@ -33017,7 +33611,8 @@ def _mf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_metals_focused_research_html():
-    return '<div class="section-note small"><strong>Focused Metals research.</strong> Same evidence themes as the Indices master plus the event-driven AI Regime Observer. All AI output is research-only with zero execution authority.</div>' + \
+    return '<div class="section-note small"><strong>Focused Metals research.</strong> Exit challenger shadows, AI regime labels and focused evidence streams. Shadow outputs have zero execution authority.</div>' + \
+      '<details class="research-inner"><summary>MFE / ATR2 / Fixed120 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_metals_exit_challenger_shadow_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
@@ -33057,7 +33652,7 @@ def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
 @app.get("/export/metals-focused-research.zip")
 def export_metals_focused_research_zip(limit:int=25000):
     ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
+    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_mf_rows(tbl,limit);out=io.StringIO()
@@ -33079,7 +33674,7 @@ def export_metals_focused_research_zip(limit:int=25000):
                     if _k not in _fields:_fields.append(_k)
             _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
         z.writestr("ai-regime-observer.csv",_aio.getvalue())
-        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"]},indent=2))
+        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"],"exit_policy":metals_exit_policy_status()},indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="metals-focused-research.zip"'})
 
 
@@ -34388,7 +34983,7 @@ def metals_standard_dashboard() -> str:
         _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
         _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA lane plus execution/reconciliation and sizing/accounting detail."),
         _metals_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus the unarmed 50/100/150/200R Metals protection framework."),
-        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
+        _metals_std_placeholder("research", "Metals Research / Evidence Lab", "MFE/ATR2/Fixed120 exit challengers, AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
     ])
 
     return f"""<!doctype html>
