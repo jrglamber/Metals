@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.21"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.20 / 2026-08-27"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Legacy Adoption + Basket Health + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.22"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.21 / 2026-08-27"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — OANDA Fill Adoption + Basket Health + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -23994,6 +23994,47 @@ def _metals_demo_latest_signal_row(conn: Any, asset: str) -> Any:
 def _metals_demo_path(conn: Any, asset: str, entry_signal_id: int, limit: int=1000) -> List[Dict[str, Any]]:
     a,b=_metals_demo_pair_variants(asset); return [dict(r) for r in conn.execute("SELECT id,timestamp_readable,exec_close,exec_high,exec_low,forward_test_candidate,take_trade,raw_json FROM raw_signals WHERE UPPER(pair) IN (?,?) AND id>? ORDER BY id ASC LIMIT ?",(a,b,int(entry_signal_id or 0),int(limit))).fetchall()]
 
+
+def _metals_demo_path_after_broker_open_time(
+    conn: Any,
+    asset: str,
+    broker_open_time: Any,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    """
+    Forward-only manager path for an explicitly broker-adopted legacy trade
+    when its original signal row no longer exists.
+
+    OANDA openTime proves when the position began. We consume only same-asset
+    raw-signal candles received AFTER that time. No historical candidate is
+    invented and no pre-open candle is used.
+    """
+    open_dt = parse_dt(broker_open_time)
+    if open_dt is None:
+        return []
+
+    a, b = _metals_demo_pair_variants(asset)
+    rows = [dict(r) for r in conn.execute("""
+        SELECT id,timestamp_readable,received_at_utc,exec_close,exec_high,exec_low,
+               forward_test_candidate,take_trade,raw_json
+        FROM raw_signals
+        WHERE UPPER(pair) IN (?,?)
+        ORDER BY id ASC
+        LIMIT ?
+    """, (a, b, max(int(limit or 1000) * 4, int(limit or 1000)))).fetchall()]
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        dt = parse_dt(row.get("received_at_utc"))
+        if dt is None:
+            dt = parse_dt(row.get("timestamp_readable"))
+        if dt is None or dt <= open_dt:
+            continue
+        out.append(row)
+        if len(out) >= int(limit or 1000):
+            break
+    return out
+
 def _metals_demo_r_from_price(side: str, entry: float, price: Any, sl_pct: float) -> Optional[float]:
     p=safe_float(price)
     if p is None or entry<=0 or sl_pct<=0: return None
@@ -24003,7 +24044,14 @@ def _metals_demo_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
     asset=_metals_demo_asset(link.get("asset")); side=_metals_demo_side(link.get("side")); entry=safe_float(link.get("entry_price")); sl=_metals_demo_sl_pct(asset)
     if entry is None or entry<=0: return {"ok":False,"reason":"missing_entry_price","hold_candles":0}
     with get_conn() as conn:
-        path=_metals_demo_path(conn,asset,int(link.get("entry_signal_id") or link.get("raw_signal_id") or 0)); latest=_metals_demo_latest_signal_row(conn,asset)
+        path_anchor_id=int(safe_float(link.get("entry_signal_id")) or 0)
+        recovery_source=safe_str(link.get("recovery_source")).upper()
+        broker_open_time=safe_str(link.get("broker_open_time_utc") or link.get("signal_time"))
+        if recovery_source=="BROKER_LEGACY_ADOPTION" and path_anchor_id<=0:
+            path=_metals_demo_path_after_broker_open_time(conn,asset,broker_open_time)
+        else:
+            path=_metals_demo_path(conn,asset,int(path_anchor_id or link.get("raw_signal_id") or 0))
+        latest=_metals_demo_latest_signal_row(conn,asset)
     hold=len(path); current=safe_float(path[-1].get("exec_close")) if path else entry; current_r=_metals_demo_r_from_price(side,entry,current,sl)
     highs=[safe_float(x.get("exec_high")) for x in path]; lows=[safe_float(x.get("exec_low")) for x in path]; highs=[x for x in highs if x is not None]; lows=[x for x in lows if x is not None]
     mfe_price=(max(highs) if highs else current) if side=="long" else (min(lows) if lows else current); mae_price=(min(lows) if lows else current) if side=="long" else (max(highs) if highs else current)
@@ -24017,7 +24065,7 @@ def _metals_demo_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
         c=cleaned_metal_long_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate")); reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
     else:
         c=cleaned_metal_short_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate") or int(c.get("short_watch") or 0)==1); reversal=bool((_raw_bool_value(latest["forward_test_candidate"]) if latest else False) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
-    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c,"path_anchor_signal_id":int(link.get("entry_signal_id") or link.get("raw_signal_id") or 0),"recovery_source":safe_str(link.get("recovery_source")),"path_anchor_is_legacy_approximation":1 if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" else 0}
+    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c,"path_anchor_signal_id":path_anchor_id,"broker_open_time_utc":broker_open_time,"recovery_source":safe_str(link.get("recovery_source")),"path_anchor_is_legacy_approximation":1 if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id>0 else 0,"path_anchor_mode":"BROKER_OPEN_TIME_FORWARD" if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id<=0 else "SIGNAL_ID"}
 
 def _metals_demo_phase(hold: int) -> str:
     if hold<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES: return "PRE_48_MIN_HOLD"
@@ -26284,14 +26332,12 @@ def _metals_adopt_broker_only_legacy_trade(
             "fill_validation": validate,
         }
 
+    # v1.6.22: a nearby historical signal is useful, but it is no longer
+    # required to prove ownership. The exact OANDA opening fill is the ownership
+    # authority. If no usable signal survives, future management begins from
+    # the first same-asset raw candle received after broker openTime.
     anchor = _metals_legacy_anchor_signal(asset, broker_trade.get("openTime"))
-    if not anchor.get("ok"):
-        return {
-            "ok": False,
-            "status": "UNRESOLVED",
-            "reason": safe_str(anchor.get("reason")),
-            "path_anchor": anchor,
-        }
+    anchor_available = bool(anchor.get("ok"))
 
     risk = _metals_legacy_adoption_risk_basis(asset, side, broker_trade, fill_tx)
     if not risk.get("ok"):
@@ -26303,8 +26349,8 @@ def _metals_adopt_broker_only_legacy_trade(
         }
 
     synthetic_id = _metals_legacy_synthetic_raw_signal_id(bid)
-    anchor_id = int(anchor["anchor_signal_id"])
-    anchor_row = dict(anchor["raw_signal"])
+    anchor_id = int(anchor.get("anchor_signal_id") or 0) if anchor_available else 0
+    anchor_row = dict(anchor.get("raw_signal") or {}) if anchor_available else {}
     now = now_utc_iso()
     current_stop = _metals_broker_trade_stop_price(broker_trade) or risk["original_stop_price"]
     order_id = safe_str(fill_tx.get("orderID"))
@@ -26354,12 +26400,17 @@ def _metals_adopt_broker_only_legacy_trade(
             "CURRENT_MANAGER", METALS_DEMO_MANAGER_VERSION,
             safe_str(broker_trade.get("openTime")) or now,
             "BROKER_LEGACY_ADOPTION",
-            "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+            ("EXACT_OANDA_FILL_PLUS_PATH_ANCHOR" if anchor_available else "EXACT_OANDA_FILL_NO_SIGNAL_REQUIRED"),
             now,
             (
                 "Explicit broker-authoritative legacy adoption: exact OANDA opening fill "
-                "proved trade identity; nearest same-asset signal is only a forward path "
-                "anchor; CURRENT_MANAGER retained; no exit-shadow backfill."
+                "proved trade identity; " + (
+                    "nearest same-asset signal retained only as a forward path anchor; "
+                    if anchor_available else
+                    "no historical signal required; future manager path begins from the first "
+                    "same-asset candle after OANDA openTime; "
+                ) +
+                "CURRENT_MANAGER retained; no exit-shadow backfill."
             ),
             safe_str(broker_trade.get("openTime")),
             anchor_id,
@@ -26369,10 +26420,12 @@ def _metals_adopt_broker_only_legacy_trade(
                 "opening_fill": fill_tx,
                 "fill_validation": validate,
                 "path_anchor": {
-                    "signal_id": anchor_id,
+                    "mode": "SIGNAL_ID" if anchor_available else "BROKER_OPEN_TIME_FORWARD",
+                    "signal_id": anchor_id or None,
                     "received_at_utc": anchor_row.get("received_at_utc"),
                     "timestamp_readable": anchor_row.get("timestamp_readable"),
-                    "delta_minutes": anchor.get("delta_minutes"),
+                    "delta_minutes": anchor.get("delta_minutes") if anchor_available else None,
+                    "anchor_search_result": anchor,
                     "not_claimed_as_original_trigger": True,
                 },
                 "risk_basis": risk,
@@ -26388,12 +26441,21 @@ def _metals_adopt_broker_only_legacy_trade(
 
     _metals_broker_recovery_audit(
         broker_trade, "RECOVERED_LEGACY_ADOPTION",
-        confidence="EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+        confidence=(
+            "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR"
+            if anchor_available else
+            "EXACT_OANDA_FILL_NO_SIGNAL_REQUIRED"
+        ),
         raw_signal_id=synthetic_id,
         recovered_link_id=link_id,
         reason=(
-            "Exact OANDA opening fill plus nearby same-asset path anchor. "
-            "CURRENT_MANAGER retained; no historical exit-shadow backfill."
+            "Exact OANDA opening fill proved trade identity. "
+            + (
+                "Nearby same-asset signal retained only as forward path anchor. "
+                if anchor_available else
+                "Historical signal not required; future manager path starts after OANDA openTime. "
+            )
+            + "CURRENT_MANAGER retained; no historical exit-shadow backfill."
         ),
         evidence={
             "opening_fill": fill_tx,
@@ -26413,7 +26475,12 @@ def _metals_adopt_broker_only_legacy_trade(
         "entry_signal_id": anchor_id,
         "asset": asset,
         "side": side,
-        "confidence": "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+        "confidence": (
+            "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR"
+            if anchor_available else
+            "EXACT_OANDA_FILL_NO_SIGNAL_REQUIRED"
+        ),
+        "path_anchor_mode": "SIGNAL_ID" if anchor_available else "BROKER_OPEN_TIME_FORWARD",
         "active_exit_policy": "CURRENT_MANAGER",
         "estimated_risk_gbp": estimated_risk,
         "shadow_backfill": False,
@@ -26467,13 +26534,26 @@ def _metals_recover_one_broker_only_trade(
         signal = _metals_raw_signal_for_recovery(raw_signal_id)
         confidence = "EXACT_EXECUTION_AUDIT"
         if not signal:
+            legacy = _metals_adopt_broker_only_legacy_trade(trade)
+            if legacy.get("ok"):
+                legacy["recovered_via"] = "exact_audit_present_but_raw_signal_missing_then_oanda_fill"
+                return legacy
+            match_evidence["legacy_adoption"] = legacy
             _metals_broker_recovery_audit(
                 trade, "UNRESOLVED", confidence=confidence,
                 raw_signal_id=raw_signal_id, execution_audit_id=int(audit.get("id") or 0),
-                reason="exact execution audit found but raw signal is missing",
+                reason=(
+                    "exact execution audit exists but raw signal is missing; "
+                    f"OANDA fill adoption also failed: {safe_str(legacy.get('reason'))}"
+                ),
                 evidence=match_evidence,
             )
-            return {"ok": False, "status": "UNRESOLVED", "reason": "raw_signal_missing_for_exact_audit"}
+            return {
+                "ok": False,
+                "status": "UNRESOLVED",
+                "reason": safe_str(legacy.get("reason") or "raw_signal_missing_for_exact_audit"),
+                "evidence": match_evidence,
+            }
         if _metals_demo_asset(signal.get("pair")) != asset:
             _metals_broker_recovery_audit(
                 trade, "UNRESOLVED", confidence=confidence,
@@ -35516,14 +35596,36 @@ def _metals_harvest_reconciliation_snapshot(broker: Dict[str, Any]) -> Dict[str,
         reasons.append("fresh OANDA Metals read failed")
     if local_only:
         reasons.append(f"{len(local_only)} local OPEN link(s) absent from OANDA")
+    broker_only_details = []
     if broker_only:
         reasons.append(f"{len(broker_only)} OANDA Metals trade(s) have no local link")
+        with get_conn() as conn:
+            for trade in broker_only:
+                bid = safe_str(trade.get("id"))
+                last = conn.execute("""
+                    SELECT status,confidence,reason,created_at_utc
+                    FROM metals_demo_broker_only_recovery_audit
+                    WHERE broker_trade_id=?
+                    ORDER BY id DESC LIMIT 1
+                """, (bid,)).fetchone()
+                broker_only_details.append({
+                    "broker_trade_id": bid,
+                    "instrument": safe_str(trade.get("instrument")),
+                    "open_time": safe_str(trade.get("openTime")),
+                    "last_recovery_status": safe_str(last["status"]) if last else "",
+                    "last_recovery_confidence": safe_str(last["confidence"]) if last else "",
+                    "last_recovery_reason": safe_str(last["reason"]) if last else "no recovery attempt recorded yet",
+                    "last_recovery_at_utc": safe_str(last["created_at_utc"]) if last else "",
+                })
     return {
         "execution_safe": exact,
         "matched": matched,
         "matched_count": len(matched),
         "local_only_count": len(local_only),
         "broker_only_count": len(broker_only),
+        "broker_only_trade_ids": [safe_str(t.get("id")) for t in broker_only],
+        "broker_only_details": broker_only_details,
+        "local_only_link_ids": [int(x.get("id") or 0) for x in local_only],
         "block_reasons": reasons,
     }
 
@@ -36812,12 +36914,24 @@ def _metals_std_basket_manager_html() -> str:
         """
 
     recon = harvest.get("reconciliation") or {}
-    recon_note = (
-        "EXACT"
-        if recon.get("execution_safe")
-        else "BLOCKED: " + "; ".join(recon.get("block_reasons") or [])
-        + " · broker-only recovery requires exact evidence; exact OANDA opening fills may be adopted as legacy CURRENT_MANAGER"
-    )
+    if recon.get("execution_safe"):
+        recon_note = "EXACT"
+    else:
+        detail_bits = []
+        for d in recon.get("broker_only_details") or []:
+            detail_bits.append(
+                f"broker {safe_str(d.get('broker_trade_id'))}: "
+                f"{safe_str(d.get('last_recovery_reason') or d.get('last_recovery_status') or 'pending recovery')}"
+            )
+        recon_note = (
+            "BLOCKED: " + "; ".join(recon.get("block_reasons") or [])
+            + (
+                " · " + " | ".join(detail_bits)
+                if detail_bits else
+                ""
+            )
+            + " · exact OANDA opening fill is sufficient for legacy CURRENT_MANAGER adoption; historical signal is optional"
+        )
 
     return f"""
       <div class="section-note">
