@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.20"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.19 / 2026-08-27"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Link Recovery + Basket Health + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.21"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.20 / 2026-08-27"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Legacy Adoption + Basket Health + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1140,6 +1140,24 @@ METALS_BROKER_ONLY_RECOVERY_XAU_PRICE_DIFF_PCT = max(
 )
 METALS_BROKER_ONLY_RECOVERY_XAG_PRICE_DIFF_PCT = max(
     0.02, min(float(os.getenv("METALS_BROKER_ONLY_RECOVERY_XAG_PRICE_DIFF_PCT", "1.00")), 5.0)
+)
+
+# v1.6.21: final recovery fallback for a real OANDA Metals trade whose
+# original local ownership row was lost. This does NOT infer a production
+# candidate. Instead, OANDA's exact ORDER_FILL transaction must prove the
+# opening trade ID, instrument, side and fill price. A nearby same-asset signal
+# is required only as a forward manager path anchor.
+METALS_BROKER_ONLY_LEGACY_ADOPTION_ENABLED = env_bool(
+    "METALS_BROKER_ONLY_LEGACY_ADOPTION_ENABLED", True
+)
+METALS_BROKER_ONLY_LEGACY_ANCHOR_WINDOW_MINUTES = max(
+    30.0, min(float(os.getenv("METALS_BROKER_ONLY_LEGACY_ANCHOR_WINDOW_MINUTES", "120")), 360.0)
+)
+METALS_BROKER_ONLY_LEGACY_FILL_PRICE_DIFF_PCT = max(
+    0.001, min(float(os.getenv("METALS_BROKER_ONLY_LEGACY_FILL_PRICE_DIFF_PCT", "0.05")), 1.0)
+)
+METALS_BROKER_ONLY_LEGACY_OPEN_TIME_DIFF_MINUTES = max(
+    0.5, min(float(os.getenv("METALS_BROKER_ONLY_LEGACY_OPEN_TIME_DIFF_MINUTES", "5")), 60.0)
 )
 
 
@@ -8259,6 +8277,8 @@ def _init_db_full() -> None:
             ("recovery_confidence", "TEXT"),
             ("recovered_at_utc", "TEXT"),
             ("recovery_note", "TEXT"),
+            ("broker_open_time_utc", "TEXT"),
+            ("recovery_path_anchor_signal_id", "INTEGER"),
         ]:
             add_column_if_missing(conn, "metals_demo_trade_links", col, typ)
 
@@ -23997,7 +24017,7 @@ def _metals_demo_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
         c=cleaned_metal_long_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate")); reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
     else:
         c=cleaned_metal_short_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate") or int(c.get("short_watch") or 0)==1); reversal=bool((_raw_bool_value(latest["forward_test_candidate"]) if latest else False) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
-    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c}
+    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c,"path_anchor_signal_id":int(link.get("entry_signal_id") or link.get("raw_signal_id") or 0),"recovery_source":safe_str(link.get("recovery_source")),"path_anchor_is_legacy_approximation":1 if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" else 0}
 
 def _metals_demo_phase(hold: int) -> str:
     if hold<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES: return "PRE_48_MIN_HOLD"
@@ -25923,6 +25943,485 @@ def _metals_recovery_risk_basis(
     }
 
 
+def _metals_oanda_opening_fill_for_trade(
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Fetch OANDA's exact transaction whose id equals the trade id.
+
+    OANDA trade IDs are transaction IDs. For a normal MARKET entry, the
+    opening ORDER_FILL transaction should contain tradeOpened.tradeID equal to
+    the still-open broker trade id. This is authoritative broker evidence and
+    is much stronger than inferring ownership from candidate logic.
+    """
+    bid = safe_str(broker_trade.get("id"))
+    if not bid:
+        return {"ok": False, "reason": "missing_broker_trade_id"}
+
+    resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/transactions/{urllib.parse.quote(bid)}",
+        "GET",
+    )
+    if not resp.get("ok"):
+        return {
+            "ok": False,
+            "reason": "oanda_opening_transaction_fetch_failed",
+            "response": resp,
+        }
+
+    data = resp.get("data") or {}
+    tx = data.get("transaction") or data
+    if not isinstance(tx, dict):
+        return {"ok": False, "reason": "oanda_opening_transaction_missing", "response": resp}
+
+    tx_type = safe_str(tx.get("type")).upper()
+    trade_opened = tx.get("tradeOpened") or {}
+    opened_id = safe_str((trade_opened or {}).get("tradeID"))
+    tx_id = safe_str(tx.get("id"))
+    instrument = safe_str(tx.get("instrument")).upper()
+
+    if tx_type != "ORDER_FILL":
+        return {
+            "ok": False,
+            "reason": f"transaction_{bid}_is_not_order_fill",
+            "transaction_type": tx_type,
+            "transaction": tx,
+        }
+    if opened_id != bid:
+        return {
+            "ok": False,
+            "reason": "order_fill_does_not_open_this_trade_id",
+            "opened_trade_id": opened_id,
+            "transaction": tx,
+        }
+    if tx_id and tx_id != bid:
+        return {
+            "ok": False,
+            "reason": "order_fill_transaction_id_mismatch",
+            "transaction_id": tx_id,
+            "transaction": tx,
+        }
+    if instrument not in {"XAU_USD", "XAG_USD"}:
+        return {
+            "ok": False,
+            "reason": "order_fill_is_not_metals_instrument",
+            "instrument": instrument,
+            "transaction": tx,
+        }
+
+    return {
+        "ok": True,
+        "transaction": tx,
+        "trade_opened": trade_opened,
+        "response": resp,
+        "confidence": "EXACT_OANDA_OPENING_ORDER_FILL",
+    }
+
+
+def _metals_legacy_anchor_signal(
+    asset: str,
+    broker_open_time: Any,
+) -> Dict[str, Any]:
+    """
+    Find exactly one nearest same-asset signal around the OANDA open time.
+
+    This row is NOT claimed to be the historical production trigger. It is only
+    used to anchor future hourly path/hold calculations for the recovered
+    legacy trade. Ties are rejected.
+    """
+    open_dt = parse_dt(broker_open_time)
+    if open_dt is None:
+        return {"ok": False, "reason": "missing_broker_open_time"}
+
+    a, b = _metals_demo_pair_variants(asset)
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM raw_signals
+            WHERE UPPER(pair) IN (?,?)
+              AND received_at_utc IS NOT NULL
+              AND received_at_utc != ''
+            ORDER BY id DESC
+            LIMIT ?
+        """, (a, b, int(METALS_BROKER_ONLY_RECOVERY_SCAN_LIMIT))).fetchall()]
+
+    candidates = []
+    max_min = float(METALS_BROKER_ONLY_LEGACY_ANCHOR_WINDOW_MINUTES)
+    for row in rows:
+        dt = parse_dt(row.get("received_at_utc"))
+        if dt is None:
+            continue
+        delta = abs((dt - open_dt).total_seconds()) / 60.0
+        if delta <= max_min:
+            candidates.append((delta, int(row.get("id") or 0), row))
+
+    if not candidates:
+        return {"ok": False, "reason": "no_same_asset_signal_near_broker_open_time"}
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    best_delta, best_id, best = candidates[0]
+
+    # Reject a genuine timing tie so we never arbitrarily select an anchor.
+    if len(candidates) > 1 and abs(candidates[1][0] - best_delta) < 1e-9:
+        return {
+            "ok": False,
+            "reason": "nearest_signal_anchor_tie",
+            "candidate_ids": [best_id, candidates[1][1]],
+        }
+
+    return {
+        "ok": True,
+        "raw_signal": best,
+        "anchor_signal_id": best_id,
+        "delta_minutes": best_delta,
+        "confidence": "NEAREST_SAME_ASSET_SIGNAL_PATH_ANCHOR",
+    }
+
+
+def _metals_fill_home_loss_factor(tx: Dict[str, Any]) -> Optional[float]:
+    """
+    Prefer the exact loss-side quote->home conversion captured on the opening
+    OANDA fill when present. OANDA field names vary slightly by API vintage.
+    """
+    direct_keys = (
+        "lossQuoteHomeConversionFactor",
+        "lossQuoteHome",
+        "quoteHomeConversionFactor",
+    )
+    for key in direct_keys:
+        v = safe_float(tx.get(key))
+        if v is not None and v > 0:
+            return float(v)
+
+    factors = tx.get("homeConversionFactors") or {}
+    if isinstance(factors, dict):
+        for key in (
+            "lossQuoteHome",
+            "lossQuoteHomeConversionFactor",
+            "quoteHomeConversionFactor",
+        ):
+            v = safe_float(factors.get(key))
+            if v is not None and v > 0:
+                return float(v)
+    return None
+
+
+def _metals_legacy_adoption_risk_basis(
+    asset: str,
+    side: str,
+    broker_trade: Dict[str, Any],
+    fill_tx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Reconstruct the original hard-stop risk from broker-authoritative fill
+    price/units and the frozen Metals per-asset hard-SL percentage.
+
+    We do not use a possibly-tightened current broker stop as the original risk
+    basis. Exact fill home conversion is preferred; current OANDA conversion is
+    only a fallback and is explicitly labelled.
+    """
+    entry = (
+        safe_float((fill_tx.get("tradeOpened") or {}).get("price"))
+        or safe_float(fill_tx.get("price"))
+        or safe_float(broker_trade.get("price"))
+    )
+    units = abs(float(
+        safe_float((fill_tx.get("tradeOpened") or {}).get("units"))
+        or safe_float(fill_tx.get("units"))
+        or safe_float(broker_trade.get("initialUnits"))
+        or safe_float(broker_trade.get("currentUnits"))
+        or 0.0
+    ))
+    if entry is None or entry <= 0 or units <= 0:
+        return {"ok": False, "reason": "fill_entry_or_units_missing"}
+
+    sl_pct = float(_metals_demo_sl_pct(asset))
+    if sl_pct <= 0:
+        return {"ok": False, "reason": "configured_strategy_sl_pct_invalid"}
+
+    original_stop = (
+        entry * (1.0 - sl_pct / 100.0)
+        if _metals_demo_side(side) == "long"
+        else entry * (1.0 + sl_pct / 100.0)
+    )
+    quote_loss = units * abs(entry - original_stop)
+
+    factor = _metals_fill_home_loss_factor(fill_tx)
+    factor_source = "opening_order_fill_home_conversion"
+    if factor is None or factor <= 0:
+        try:
+            preview = metals_demo_sizing_preview(asset, side)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": f"home_conversion_unavailable:{type(exc).__name__}:{exc}",
+            }
+        factor = safe_float(preview.get("usd_to_gbp_account_loss_factor"))
+        factor_source = "current_oanda_home_conversion_fallback"
+
+    if factor is None or factor <= 0:
+        return {"ok": False, "reason": "home_conversion_factor_missing"}
+
+    estimated = quote_loss * float(factor)
+    if estimated <= 0:
+        return {"ok": False, "reason": "legacy_effective_risk_nonpositive"}
+
+    return {
+        "ok": True,
+        "entry_price": float(entry),
+        "filled_units": float(units),
+        "sl_pct": sl_pct,
+        "original_stop_price": float(original_stop),
+        "estimated_risk_gbp": float(estimated),
+        "home_conversion_factor": float(factor),
+        "home_conversion_source": factor_source,
+        "quote_loss_at_original_stop": float(quote_loss),
+    }
+
+
+def _metals_validate_legacy_fill_against_open_trade(
+    broker_trade: Dict[str, Any],
+    fill_tx: Dict[str, Any],
+) -> Dict[str, Any]:
+    bid = safe_str(broker_trade.get("id"))
+    instrument = safe_str(broker_trade.get("instrument")).upper()
+    side = _metals_broker_trade_side(broker_trade)
+    open_dt = parse_dt(broker_trade.get("openTime"))
+    trade_entry = safe_float(broker_trade.get("price"))
+
+    fill_instr = safe_str(fill_tx.get("instrument")).upper()
+    fill_dt = parse_dt(fill_tx.get("time"))
+    fill_entry = (
+        safe_float((fill_tx.get("tradeOpened") or {}).get("price"))
+        or safe_float(fill_tx.get("price"))
+    )
+    fill_units = (
+        safe_float((fill_tx.get("tradeOpened") or {}).get("units"))
+        or safe_float(fill_tx.get("units"))
+    )
+    fill_side = "short" if fill_units is not None and fill_units < 0 else "long"
+
+    if fill_instr != instrument:
+        return {"ok": False, "reason": "fill_instrument_conflicts_with_open_trade"}
+    if fill_side != side:
+        return {"ok": False, "reason": "fill_direction_conflicts_with_open_trade"}
+    if trade_entry is None or fill_entry is None or trade_entry <= 0 or fill_entry <= 0:
+        return {"ok": False, "reason": "fill_or_trade_entry_missing"}
+
+    price_diff = abs(fill_entry / trade_entry - 1.0) * 100.0
+    if price_diff > float(METALS_BROKER_ONLY_LEGACY_FILL_PRICE_DIFF_PCT):
+        return {
+            "ok": False,
+            "reason": "fill_price_conflicts_with_open_trade",
+            "price_diff_pct": price_diff,
+        }
+
+    if open_dt is None or fill_dt is None:
+        return {"ok": False, "reason": "fill_or_trade_open_time_missing"}
+    time_diff = abs((fill_dt - open_dt).total_seconds()) / 60.0
+    if time_diff > float(METALS_BROKER_ONLY_LEGACY_OPEN_TIME_DIFF_MINUTES):
+        return {
+            "ok": False,
+            "reason": "fill_time_conflicts_with_open_trade",
+            "time_diff_minutes": time_diff,
+        }
+
+    opened_id = safe_str((fill_tx.get("tradeOpened") or {}).get("tradeID"))
+    if opened_id != bid:
+        return {"ok": False, "reason": "fill_trade_id_conflict"}
+
+    return {
+        "ok": True,
+        "price_diff_pct": price_diff,
+        "time_diff_minutes": time_diff,
+    }
+
+
+def _metals_legacy_synthetic_raw_signal_id(broker_trade_id: str) -> int:
+    """
+    Synthetic negative ownership id. It deliberately cannot collide with normal
+    positive raw_signals ids and makes clear that we are NOT claiming a missing
+    raw signal was the original trigger.
+    """
+    try:
+        n = abs(int(float(safe_str(broker_trade_id))))
+        return -max(1, n)
+    except Exception:
+        # Stable small hash without depending on Python's salted hash().
+        total = 0
+        for ch in safe_str(broker_trade_id):
+            total = (total * 131 + ord(ch)) % 2_000_000_000
+        return -max(1, total)
+
+
+def _metals_adopt_broker_only_legacy_trade(
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not METALS_BROKER_ONLY_LEGACY_ADOPTION_ENABLED:
+        return {"ok": False, "status": "UNRESOLVED", "reason": "legacy_adoption_disabled"}
+
+    bid = safe_str(broker_trade.get("id"))
+    instrument = safe_str(broker_trade.get("instrument")).upper()
+    asset = _metals_demo_asset(instrument)
+    side = _metals_broker_trade_side(broker_trade)
+
+    fill = _metals_oanda_opening_fill_for_trade(broker_trade)
+    if not fill.get("ok"):
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": safe_str(fill.get("reason")),
+            "fill_evidence": fill,
+        }
+    fill_tx = dict(fill["transaction"])
+
+    validate = _metals_validate_legacy_fill_against_open_trade(broker_trade, fill_tx)
+    if not validate.get("ok"):
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": safe_str(validate.get("reason")),
+            "fill_validation": validate,
+        }
+
+    anchor = _metals_legacy_anchor_signal(asset, broker_trade.get("openTime"))
+    if not anchor.get("ok"):
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": safe_str(anchor.get("reason")),
+            "path_anchor": anchor,
+        }
+
+    risk = _metals_legacy_adoption_risk_basis(asset, side, broker_trade, fill_tx)
+    if not risk.get("ok"):
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": safe_str(risk.get("reason")),
+            "risk": risk,
+        }
+
+    synthetic_id = _metals_legacy_synthetic_raw_signal_id(bid)
+    anchor_id = int(anchor["anchor_signal_id"])
+    anchor_row = dict(anchor["raw_signal"])
+    now = now_utc_iso()
+    current_stop = _metals_broker_trade_stop_price(broker_trade) or risk["original_stop_price"]
+    order_id = safe_str(fill_tx.get("orderID"))
+    filled_units = float(risk["filled_units"])
+    entry_price = float(risk["entry_price"])
+    estimated_risk = float(risk["estimated_risk_gbp"])
+
+    with get_conn() as conn:
+        # Synthetic ownership id and broker trade id must both be unique.
+        conflict = conn.execute("""
+            SELECT *
+            FROM metals_demo_trade_links
+            WHERE raw_signal_id=? OR broker_trade_id=?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (synthetic_id, bid)).fetchone()
+        if conflict:
+            return {
+                "ok": safe_str(conflict["status"]).upper() == "OPEN",
+                "status": "ALREADY_LINKED",
+                "link_id": int(conflict["id"]),
+                "reason": "legacy adoption already present",
+            }
+
+        link_id = db_insert_returning_id(conn, """
+            INSERT INTO metals_demo_trade_links (
+                created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,
+                model_version,signal_time,entry_signal_id,requested_risk_amount,
+                estimated_risk_amount,requested_units,filled_units,entry_price,
+                stop_price,current_stop_price,broker_trade_id,broker_order_id,status,
+                last_known_unrealized_pl,last_reconciled_at_utc,
+                active_exit_policy,active_exit_policy_version,
+                active_exit_policy_started_at_utc,recovery_source,
+                recovery_confidence,recovered_at_utc,recovery_note,
+                broker_open_time_utc,recovery_path_anchor_signal_id,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now, now, synthetic_id, asset, instrument, side,
+            "BROKER_ADOPTED_LEGACY_V1",
+            safe_str(broker_trade.get("openTime")),
+            anchor_id,
+            estimated_risk, estimated_risk,
+            filled_units, filled_units, entry_price,
+            risk["original_stop_price"], current_stop,
+            bid, order_id, "OPEN",
+            safe_float(broker_trade.get("unrealizedPL")), now,
+            "CURRENT_MANAGER", METALS_DEMO_MANAGER_VERSION,
+            safe_str(broker_trade.get("openTime")) or now,
+            "BROKER_LEGACY_ADOPTION",
+            "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+            now,
+            (
+                "Explicit broker-authoritative legacy adoption: exact OANDA opening fill "
+                "proved trade identity; nearest same-asset signal is only a forward path "
+                "anchor; CURRENT_MANAGER retained; no exit-shadow backfill."
+            ),
+            safe_str(broker_trade.get("openTime")),
+            anchor_id,
+            json.dumps({
+                "legacy_adoption": True,
+                "broker_trade": broker_trade,
+                "opening_fill": fill_tx,
+                "fill_validation": validate,
+                "path_anchor": {
+                    "signal_id": anchor_id,
+                    "received_at_utc": anchor_row.get("received_at_utc"),
+                    "timestamp_readable": anchor_row.get("timestamp_readable"),
+                    "delta_minutes": anchor.get("delta_minutes"),
+                    "not_claimed_as_original_trigger": True,
+                },
+                "risk_basis": risk,
+                "active_exit_policy": {
+                    "policy": "CURRENT_MANAGER",
+                    "version": METALS_DEMO_MANAGER_VERSION,
+                    "reason": "conservative_legacy_adoption_no_retroactive_mfe50",
+                },
+                "exit_shadow_backfill": False,
+            }, default=str),
+        ))
+        conn.commit()
+
+    _metals_broker_recovery_audit(
+        broker_trade, "RECOVERED_LEGACY_ADOPTION",
+        confidence="EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+        raw_signal_id=synthetic_id,
+        recovered_link_id=link_id,
+        reason=(
+            "Exact OANDA opening fill plus nearby same-asset path anchor. "
+            "CURRENT_MANAGER retained; no historical exit-shadow backfill."
+        ),
+        evidence={
+            "opening_fill": fill_tx,
+            "fill_validation": validate,
+            "path_anchor": anchor,
+            "risk": risk,
+            "synthetic_raw_signal_id": synthetic_id,
+        },
+    )
+
+    return {
+        "ok": True,
+        "status": "RECOVERED_LEGACY_ADOPTION",
+        "broker_trade_id": bid,
+        "link_id": link_id,
+        "raw_signal_id": synthetic_id,
+        "entry_signal_id": anchor_id,
+        "asset": asset,
+        "side": side,
+        "confidence": "EXACT_OANDA_FILL_PLUS_PATH_ANCHOR",
+        "active_exit_policy": "CURRENT_MANAGER",
+        "estimated_risk_gbp": estimated_risk,
+        "shadow_backfill": False,
+        "broker_write_authority": False,
+    }
+
+
+
 def _metals_recover_one_broker_only_trade(
     broker_trade: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -25987,16 +26486,36 @@ def _metals_recover_one_broker_only_trade(
         match = _metals_signal_match_for_broker_trade(trade)
         match_evidence["signal_match"] = match
         if not match.get("ok"):
+            # v1.6.21 final safe fallback: do not keep waiting forever for a
+            # local candidate record that no longer exists. OANDA itself must
+            # prove the exact opening ORDER_FILL, then we explicitly adopt the
+            # trade as legacy Current Manager with no shadow backfill.
+            legacy = _metals_adopt_broker_only_legacy_trade(trade)
+            if legacy.get("ok"):
+                return legacy
+
+            match_evidence["legacy_adoption"] = legacy
             _metals_broker_recovery_audit(
                 trade, "UNRESOLVED",
-                reason=safe_str(match.get("reason") or exact.get("reason")),
+                reason=(
+                    safe_str(legacy.get("reason"))
+                    or safe_str(match.get("reason"))
+                    or safe_str(exact.get("reason"))
+                ),
                 evidence=match_evidence,
             )
             return {
                 "ok": False,
                 "status": "UNRESOLVED",
-                "reason": safe_str(match.get("reason") or exact.get("reason")),
-                "evidence": match,
+                "reason": (
+                    safe_str(legacy.get("reason"))
+                    or safe_str(match.get("reason"))
+                    or safe_str(exact.get("reason"))
+                ),
+                "evidence": {
+                    "signal_match": match,
+                    "legacy_adoption": legacy,
+                },
             }
         signal = dict(match["raw_signal"])
         raw_signal_id = int(match["raw_signal_id"])
@@ -26168,7 +26687,14 @@ def metals_demo_reconcile_broker_only_links(
                 "error": f"{type(exc).__name__}: {exc}",
             })
 
-    recovered = sum(1 for r in results if r.get("status") == "RECOVERED")
+    recovered = sum(
+        1 for r in results
+        if safe_str(r.get("status")).upper() in {"RECOVERED","RECOVERED_LEGACY_ADOPTION"}
+    )
+    legacy_adopted = sum(
+        1 for r in results
+        if safe_str(r.get("status")).upper() == "RECOVERED_LEGACY_ADOPTION"
+    )
     unresolved = sum(1 for r in results if not r.get("ok"))
 
     # Verify against a fresh local read; broker state itself was never modified.
@@ -26192,6 +26718,7 @@ def metals_demo_reconcile_broker_only_links(
         "broker_open_count": len(owned),
         "broker_only_found": len(broker_only),
         "recovered": recovered,
+        "legacy_adopted": legacy_adopted,
         "unresolved": unresolved,
         "remaining_broker_only_ids": remaining,
         "results": results,
@@ -36235,7 +36762,7 @@ def _metals_std_open_trades_html() -> str:
         </tr></thead>
         <tbody>{rows or '<tr><td colspan="20">No open Metals trades.</td></tr>'}</tbody>
       </table></div>
-      {f'<h3>Broker-Only Metals Trades — Attention Required</h3><div class="section-note small">Automatic recovery runs in the manager maintenance worker and only adopts a trade when ownership evidence is unique. Ambiguous rows remain blocked. <a href="/broker/metals-reconcile-broker-only">run recovery now</a> · <a href="/export/metals-broker-only-recovery.csv">recovery audit CSV</a></div><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
+      {f'<h3>Broker-Only Metals Trades — Attention Required</h3><div class="section-note small">Automatic recovery runs in the manager maintenance worker. It first looks for the original execution/signal evidence; if that is unavailable, an exact OANDA opening ORDER_FILL plus a nearby same-asset path anchor may be adopted explicitly as legacy CURRENT_MANAGER. Ambiguous rows remain blocked. <a href="/broker/metals-reconcile-broker-only">run recovery now</a> · <a href="/export/metals-broker-only-recovery.csv">recovery audit CSV</a></div><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
     """
 
 def _metals_std_basket_manager_html() -> str:
@@ -36289,7 +36816,7 @@ def _metals_std_basket_manager_html() -> str:
         "EXACT"
         if recon.get("execution_safe")
         else "BLOCKED: " + "; ".join(recon.get("block_reasons") or [])
-        + " · broker-only auto-recovery requires exact evidence"
+        + " · broker-only recovery requires exact evidence; exact OANDA opening fills may be adopted as legacy CURRENT_MANAGER"
     )
 
     return f"""
