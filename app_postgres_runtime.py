@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.19"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.18 / 2026-08-27"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — MFE50 + Broker-HWM Harvest Ladder + Exit Shadows"
+METALS_APP_VERSION = "v1.6.20"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.19 / 2026-08-27"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Broker Link Recovery + Basket Health + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1115,6 +1115,34 @@ METALS_HARVEST_MAX_LEVEL_R = max(
 )
 
 
+# ============================================================
+# v1.6.20 — BROKER-ONLY METALS LINK RECOVERY
+# ============================================================
+# Operational self-heal only. It never opens, closes or modifies an OANDA trade.
+#
+# Auto-recovery requires unambiguous evidence:
+# 1) preferably an exact metals_demo_execution_audit row containing the OANDA
+#    broker trade id and raw_signal_id; otherwise
+# 2) exactly one actual Metals candidate whose RECEIVED time and price match the
+#    OANDA open trade, plus a broker stop price and usable GBP risk conversion.
+#
+# Ambiguous/unproven trades remain broker-only and therefore KEEP harvesting
+# safety-blocked. Recovered historical trades do NOT receive exit-shadow backfill.
+METALS_BROKER_ONLY_RECOVERY_ENABLED = env_bool("METALS_BROKER_ONLY_RECOVERY_ENABLED", True)
+METALS_BROKER_ONLY_RECOVERY_SIGNAL_WINDOW_MINUTES = max(
+    2.0, min(float(os.getenv("METALS_BROKER_ONLY_RECOVERY_SIGNAL_WINDOW_MINUTES", "20")), 120.0)
+)
+METALS_BROKER_ONLY_RECOVERY_SCAN_LIMIT = max(
+    100, min(int(float(os.getenv("METALS_BROKER_ONLY_RECOVERY_SCAN_LIMIT", "5000"))), 50000)
+)
+METALS_BROKER_ONLY_RECOVERY_XAU_PRICE_DIFF_PCT = max(
+    0.02, min(float(os.getenv("METALS_BROKER_ONLY_RECOVERY_XAU_PRICE_DIFF_PCT", "0.50")), 5.0)
+)
+METALS_BROKER_ONLY_RECOVERY_XAG_PRICE_DIFF_PCT = max(
+    0.02, min(float(os.getenv("METALS_BROKER_ONLY_RECOVERY_XAG_PRICE_DIFF_PCT", "1.00")), 5.0)
+)
+
+
 # v1.6.17 — Postgres-safe Metals manager reconciliation repair.
 # Fixes two operational faults observed in the live demo evidence export:
 # - existing metals_demo_trade_links schemas did not have last_reconciled_at_utc;
@@ -1365,6 +1393,7 @@ EXPORT_TABLES = {
     "metals-exit-challenger-shadow": "metals_exit_challenger_shadow",
     "metals-demo-harvest-stages": "metals_demo_harvest_stages",
     "metals-demo-harvest-events": "metals_demo_harvest_events",
+    "metals-broker-only-recovery": "metals_demo_broker_only_recovery_audit",
 }
 
 # v10.1.09: production/live-only bundle. Research-only tables are deliberately
@@ -1398,6 +1427,7 @@ LIVE_ANALYSIS_EXPORT_TABLES = {
     "metals-signal-processing": "metals_signal_processing_audit",
     "metals-demo-harvest-stages": "metals_demo_harvest_stages",
     "metals-demo-harvest-events": "metals_demo_harvest_events",
+    "metals-broker-only-recovery": "metals_demo_broker_only_recovery_audit",
 }
 
 
@@ -8135,6 +8165,28 @@ def _init_db_full() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_harvest_event_stage ON metals_demo_harvest_events(stage_id, created_at_utc)")
 
+        # v1.6.20 immutable broker-only recovery evidence.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_demo_broker_only_recovery_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                broker_trade_id TEXT NOT NULL,
+                instrument TEXT,
+                asset TEXT,
+                side TEXT,
+                broker_open_time TEXT,
+                status TEXT NOT NULL,
+                confidence TEXT,
+                raw_signal_id INTEGER,
+                execution_audit_id INTEGER,
+                recovered_link_id INTEGER,
+                reason TEXT,
+                raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_broker_recovery_trade ON metals_demo_broker_only_recovery_audit(broker_trade_id, created_at_utc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_broker_recovery_status ON metals_demo_broker_only_recovery_audit(status, created_at_utc)")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS metals_demo_broker_transactions (
                 transaction_id TEXT PRIMARY KEY,
@@ -8202,6 +8254,11 @@ def _init_db_full() -> None:
             ("active_exit_policy", "TEXT"),
             ("active_exit_policy_version", "TEXT"),
             ("active_exit_policy_started_at_utc", "TEXT"),
+            # v1.6.20: durable provenance for broker-only local-link recovery.
+            ("recovery_source", "TEXT"),
+            ("recovery_confidence", "TEXT"),
+            ("recovered_at_utc", "TEXT"),
+            ("recovery_note", "TEXT"),
         ]:
             add_column_if_missing(conn, "metals_demo_trade_links", col, typ)
 
@@ -24683,18 +24740,52 @@ def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
             mature=sum(1 for x in items if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
             losing=sum(1 for x in rs if x<0)
             phase="TINY" if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN else "EARLY" if len(items)<METALS_DEMO_BASKET_NORMAL_MIN_OPEN else "DEVELOPING" if len(items)<METALS_DEMO_BASKET_MATURE_MIN_OPEN else "MATURE"
-            if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN:
-                state,action,reason="OBSERVE","HOLD","Young/small basket: no basket-level trim."
-            elif br<=METALS_DEMO_BASKET_SEVERE_LOSS_R and mature:
-                state,action,reason="CRITICAL","REDUCE_WEAKEST_50_PERCENT_MATURE_ONLY","Severe asset-side basket loss."
-            elif len(items)>=METALS_DEMO_BASKET_NORMAL_MIN_OPEN and br<=METALS_DEMO_BASKET_NORMAL_LOSS_R and mature:
-                state,action,reason="RED","REDUCE_WEAKEST_25_PERCENT_MATURE_ONLY","Developed basket loss breached defence level."
-            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R and mature:
-                state,action,reason="AMBER","REDUCE_WEAKEST_10_PERCENT_MATURE_ONLY","Basket loss warning."
-            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and mature and hwm>0:
-                state,action,reason="AMBER","PROTECT_OR_REDUCE_WEAKEST_MATURE_ONLY","Basket giveback warning."
+            # v1.6.20: STATE = financial health; ACTION = whether the
+            # existing basket-defence rules are currently eligible to act.
+            # A young -5R basket must not be labelled GREEN merely because its
+            # trades have not reached the 48h minimum.
+            if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R:
+                state="CRITICAL"
+                health_reason="Severe asset-side basket loss."
+            elif br<=METALS_DEMO_BASKET_NORMAL_LOSS_R:
+                state="RED"
+                health_reason="Asset-side basket loss breached the normal defence level."
+            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R:
+                state="AMBER"
+                health_reason="Asset-side basket loss warning."
+            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and hwm>0:
+                state="AMBER"
+                health_reason="Asset-side basket giveback warning."
             else:
-                state,action,reason="GREEN","HOLD","Basket within normal tolerance."
+                state="GREEN"
+                health_reason="Basket within normal financial tolerance."
+
+            # Preserve the prior execution contract exactly: small/young baskets
+            # do not get mechanically trimmed before the existing eligibility
+            # gates are satisfied.
+            if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN:
+                action="YOUNG_HOLD_SMALL_BASKET"
+                action_reason="Small basket: no basket-level trim."
+            elif mature<=0:
+                action="YOUNG_HOLD_48H_MIN"
+                action_reason="No mature 48h+ trades: health is visible but basket defence is not yet eligible."
+            elif br<=METALS_DEMO_BASKET_SEVERE_LOSS_R:
+                action="REDUCE_WEAKEST_50_PERCENT_MATURE_ONLY"
+                action_reason="Existing severe-loss defence is eligible on mature trades."
+            elif len(items)>=METALS_DEMO_BASKET_NORMAL_MIN_OPEN and br<=METALS_DEMO_BASKET_NORMAL_LOSS_R:
+                action="REDUCE_WEAKEST_25_PERCENT_MATURE_ONLY"
+                action_reason="Existing developed-basket defence is eligible on mature trades."
+            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R:
+                action="REDUCE_WEAKEST_10_PERCENT_MATURE_ONLY"
+                action_reason="Existing light-loss defence is eligible on mature trades."
+            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and hwm>0:
+                action="PROTECT_OR_REDUCE_WEAKEST_MATURE_ONLY"
+                action_reason="Existing giveback defence is eligible on mature trades."
+            else:
+                action="HOLD"
+                action_reason="No basket-level defensive action required."
+
+            reason=f"HEALTH={state}: {health_reason} ACTION={action}: {action_reason}"
             snap={"scope":"ASSET_SIDE","basket_key":key,"asset":asset,"side":side,"open_count":len(items),
                   "matured_count":mature,"losing_count":losing,"losing_pct":losing/len(rs)*100 if rs else 0,
                   "basket_r":br,"basket_pnl_gbp":basket_gbp,"high_water_r":hwm,"high_water_pnl_gbp":hwm_gbp,
@@ -25180,9 +25271,20 @@ def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
                 "ok": False, "error": f"{type(exc).__name__}: {exc}"
             }
 
-        # v1.6.19 family harvesting is independent of individual exits.
-        # It gets first chance after ghost reconciliation; survivors then flow
-        # through the unchanged per-asset manager below.
+        # v1.6.20: repair the opposite reconciliation direction too.
+        # This NEVER writes to OANDA. Exact/auditable evidence is required;
+        # ambiguity deliberately leaves harvesting safety-blocked.
+        try:
+            result["broker_only_recovery"] = metals_demo_reconcile_broker_only_links()
+        except Exception as exc:
+            result["ok"] = False
+            result["broker_only_recovery"] = {
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"
+            }
+
+        # v1.6.19 family harvesting remains independent of individual exits.
+        # It now runs after both reconciliation directions have had a chance to
+        # self-heal; survivors then flow through the unchanged per-asset manager.
         try:
             result["harvest"] = _metals_harvest_maintenance_tick(
                 allow_execution=(market.get("tradeable") is True),
@@ -25496,6 +25598,627 @@ def metals_demo_broker_realized_summary() -> Dict[str, Any]:
         "sync": sync,
     }
 
+
+
+def _metals_broker_recovery_price_tolerance_pct(asset: str) -> float:
+    return (
+        float(METALS_BROKER_ONLY_RECOVERY_XAU_PRICE_DIFF_PCT)
+        if _metals_demo_asset(asset) == "XAUUSD"
+        else float(METALS_BROKER_ONLY_RECOVERY_XAG_PRICE_DIFF_PCT)
+    )
+
+
+def _metals_broker_trade_side(trade: Dict[str, Any]) -> str:
+    units = safe_float(trade.get("currentUnits"))
+    if units is None:
+        units = safe_float(trade.get("initialUnits"))
+    return "short" if units is not None and units < 0 else "long"
+
+
+def _metals_broker_trade_stop_price(trade: Dict[str, Any]) -> Optional[float]:
+    for key in ("stopLossOrder", "guaranteedStopLossOrder"):
+        row = trade.get(key)
+        if isinstance(row, dict):
+            px = safe_float(row.get("price"))
+            if px is not None and px > 0:
+                return float(px)
+    return None
+
+
+def _metals_broker_trade_detail(
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Best available OANDA state for one broker-only trade."""
+    bid = safe_str(broker_trade.get("id"))
+    if not bid:
+        return {"ok": False, "trade": dict(broker_trade), "reason": "missing_broker_trade_id"}
+
+    resp = metals_demo_request(
+        f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/trades/{urllib.parse.quote(bid)}"
+    )
+    detail = (resp.get("data") or {}).get("trade") if resp.get("ok") else None
+    if isinstance(detail, dict) and safe_str(detail.get("id")) == bid:
+        merged = dict(broker_trade)
+        merged.update(detail)
+        return {"ok": True, "trade": merged, "response": resp, "source": "oanda_trade_endpoint"}
+
+    return {
+        "ok": True,
+        "trade": dict(broker_trade),
+        "response": resp,
+        "source": "openTrades_fallback",
+        "warning": "trade_detail_endpoint_unavailable",
+    }
+
+
+def _metals_broker_recovery_audit(
+    broker_trade: Dict[str, Any],
+    status: str,
+    confidence: str = "",
+    raw_signal_id: Optional[int] = None,
+    execution_audit_id: Optional[int] = None,
+    recovered_link_id: Optional[int] = None,
+    reason: str = "",
+    evidence: Optional[Dict[str, Any]] = None,
+) -> int:
+    instrument = safe_str(broker_trade.get("instrument")).upper()
+    asset = _metals_demo_asset(instrument)
+    side = _metals_broker_trade_side(broker_trade)
+    with get_conn() as conn:
+        rid = db_insert_returning_id(conn, """
+            INSERT INTO metals_demo_broker_only_recovery_audit (
+                created_at_utc,broker_trade_id,instrument,asset,side,broker_open_time,
+                status,confidence,raw_signal_id,execution_audit_id,recovered_link_id,
+                reason,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_utc_iso(), safe_str(broker_trade.get("id")), instrument, asset, side,
+            safe_str(broker_trade.get("openTime")), safe_str(status), safe_str(confidence),
+            raw_signal_id, execution_audit_id, recovered_link_id, safe_str(reason)[:2000],
+            json.dumps(evidence or {}, default=str),
+        ))
+        conn.commit()
+    return rid
+
+
+def _metals_exact_entry_audit_for_broker_trade(
+    broker_trade_id: str,
+) -> Dict[str, Any]:
+    """
+    Prefer exact OANDA trade-id evidence. The OPENED audit is generated only
+    after the broker has confirmed tradeOpened.tradeID.
+    """
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM metals_demo_execution_audit
+            WHERE broker_trade_id=?
+              AND LOWER(COALESCE(action,''))='entry'
+              AND UPPER(COALESCE(status,''))='OPENED'
+              AND COALESCE(raw_signal_id,0)>0
+            ORDER BY id DESC
+        """, (safe_str(broker_trade_id),)).fetchall()]
+
+    distinct = {}
+    for row in rows:
+        distinct[int(row.get("raw_signal_id") or 0)] = row
+
+    if len(distinct) == 1:
+        row = next(iter(distinct.values()))
+        return {
+            "ok": True,
+            "unique": True,
+            "audit": row,
+            "raw_signal_id": int(row.get("raw_signal_id") or 0),
+            "confidence": "EXACT_EXECUTION_AUDIT",
+        }
+    if len(distinct) > 1:
+        return {
+            "ok": False,
+            "unique": False,
+            "reason": "multiple_raw_signal_ids_for_same_broker_trade",
+            "rows": rows,
+        }
+    return {"ok": False, "unique": False, "reason": "no_exact_execution_audit"}
+
+
+def _metals_raw_signal_for_recovery(raw_signal_id: Any) -> Optional[Dict[str, Any]]:
+    rid = int(safe_float(raw_signal_id) or 0)
+    if rid <= 0:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM raw_signals WHERE id=? LIMIT 1",
+            (rid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _metals_signal_match_for_broker_trade(
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Secondary recovery path. Requires exactly one production Metals candidate
+    close to the authoritative OANDA open time and fill price.
+    """
+    instrument = safe_str(broker_trade.get("instrument")).upper()
+    asset = _metals_demo_asset(instrument)
+    side = _metals_broker_trade_side(broker_trade)
+    open_dt = parse_dt(broker_trade.get("openTime"))
+    entry = safe_float(broker_trade.get("price"))
+    if asset not in {"XAUUSD", "XAGUSD"} or open_dt is None or entry is None or entry <= 0:
+        return {"ok": False, "reason": "missing_asset_open_time_or_entry"}
+
+    a, b = _metals_demo_pair_variants(asset)
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT *
+            FROM raw_signals
+            WHERE UPPER(pair) IN (?,?)
+            ORDER BY id DESC
+            LIMIT ?
+        """, (a, b, int(METALS_BROKER_ONLY_RECOVERY_SCAN_LIMIT))).fetchall()]
+
+    matches = []
+    tol_minutes = float(METALS_BROKER_ONLY_RECOVERY_SIGNAL_WINDOW_MINUTES)
+    price_tol = _metals_broker_recovery_price_tolerance_pct(asset)
+
+    for row in rows:
+        received_dt = parse_dt(row.get("received_at_utc"))
+        if received_dt is None:
+            continue
+        delta_min = abs((received_dt - open_dt).total_seconds()) / 60.0
+        if delta_min > tol_minutes:
+            continue
+
+        try:
+            candidate = metals_demo_candidate_for_row(_raw_signal_json(row), row)
+        except Exception:
+            continue
+        if not candidate.get("demo_candidate"):
+            continue
+        candidate_side = _metals_demo_side(candidate.get("demo_side"))
+        if candidate_side != side:
+            continue
+
+        px = safe_float(row.get("exec_close"))
+        if px is None or px <= 0:
+            continue
+        diff_pct = abs(px / entry - 1.0) * 100.0
+        if diff_pct > price_tol:
+            continue
+
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT id,broker_trade_id,status FROM metals_demo_trade_links WHERE raw_signal_id=? LIMIT 1",
+                (int(row["id"]),),
+            ).fetchone()
+        if existing:
+            continue
+
+        matches.append({
+            "row": row,
+            "candidate": candidate,
+            "delta_minutes": delta_min,
+            "price_diff_pct": diff_pct,
+        })
+
+    if len(matches) != 1:
+        return {
+            "ok": False,
+            "reason": "signal_match_not_unique",
+            "match_count": len(matches),
+            "matches": [
+                {
+                    "raw_signal_id": int(x["row"]["id"]),
+                    "received_at_utc": x["row"].get("received_at_utc"),
+                    "delta_minutes": x["delta_minutes"],
+                    "price_diff_pct": x["price_diff_pct"],
+                }
+                for x in matches[:10]
+            ],
+        }
+
+    m = matches[0]
+    return {
+        "ok": True,
+        "unique": True,
+        "raw_signal": m["row"],
+        "candidate": m["candidate"],
+        "raw_signal_id": int(m["row"]["id"]),
+        "confidence": "UNIQUE_SIGNAL_TIME_PRICE_MATCH",
+        "delta_minutes": m["delta_minutes"],
+        "price_diff_pct": m["price_diff_pct"],
+    }
+
+
+def _metals_recovery_policy_from_audit(
+    asset: str,
+    side: str,
+    audit: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """
+    Never infer MFE50 merely because the current code uses it.
+    Only an exact historical OPENED audit explicitly naming MFE50 can recover
+    that policy. Otherwise CURRENT_MANAGER is the conservative legacy policy.
+    """
+    message = safe_str((audit or {}).get("message")).upper()
+    if (
+        _metals_demo_asset(asset) == "XAUUSD"
+        and _metals_demo_side(side) == "long"
+        and METALS_XAU_LONG_MFE50_POLICY in message
+    ):
+        return {
+            "policy": METALS_XAU_LONG_MFE50_POLICY,
+            "version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
+            "source": "exact_opened_audit_message",
+        }
+    return {
+        "policy": "CURRENT_MANAGER",
+        "version": METALS_DEMO_MANAGER_VERSION,
+        "source": "conservative_recovery_default_no_retroactive_mfe50",
+    }
+
+
+def _metals_recovery_risk_basis(
+    asset: str,
+    side: str,
+    trade: Dict[str, Any],
+    audit: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Recover actual/effective GBP risk without guessing from requested £ risk."""
+    if audit:
+        estimated = safe_float(audit.get("estimated_risk_amount"))
+        requested = safe_float(audit.get("requested_risk_amount"))
+        stop = safe_float(audit.get("stop_price")) or _metals_broker_trade_stop_price(trade)
+        if estimated is not None and estimated > 0:
+            return {
+                "ok": True,
+                "requested_risk_gbp": requested or _metals_demo_risk(asset),
+                "estimated_risk_gbp": estimated,
+                "stop_price": stop,
+                "source": "exact_execution_audit",
+            }
+
+    entry = safe_float(trade.get("price"))
+    stop = _metals_broker_trade_stop_price(trade)
+    units = abs(
+        float(
+            safe_float(trade.get("initialUnits"))
+            or safe_float(trade.get("currentUnits"))
+            or 0.0
+        )
+    )
+    if entry is None or entry <= 0 or stop is None or stop <= 0 or units <= 0:
+        return {
+            "ok": False,
+            "reason": "broker_entry_stop_or_units_missing",
+            "entry": entry,
+            "stop": stop,
+            "units": units,
+        }
+
+    # We only use the sizing preview for the current USD->GBP account-loss
+    # conversion factor, never for entry price/units/stop.
+    preview = metals_demo_sizing_preview(asset, side)
+    fx = safe_float(preview.get("usd_to_gbp_account_loss_factor"))
+    if fx is None or fx <= 0:
+        return {
+            "ok": False,
+            "reason": "gbp_home_conversion_unavailable",
+            "preview": preview,
+        }
+
+    estimated = units * abs(entry - stop) * fx
+    if estimated <= 0:
+        return {"ok": False, "reason": "reconstructed_effective_risk_nonpositive"}
+
+    return {
+        "ok": True,
+        "requested_risk_gbp": _metals_demo_risk(asset),
+        "estimated_risk_gbp": estimated,
+        "stop_price": stop,
+        "source": "broker_entry_stop_units_plus_current_oanda_home_conversion",
+        "usd_to_gbp_account_loss_factor": fx,
+    }
+
+
+def _metals_recover_one_broker_only_trade(
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    bid = safe_str(broker_trade.get("id"))
+    detail = _metals_broker_trade_detail(broker_trade)
+    trade = dict(detail.get("trade") or broker_trade)
+    instrument = safe_str(trade.get("instrument")).upper()
+    asset = _metals_demo_asset(instrument)
+    side = _metals_broker_trade_side(trade)
+
+    if not bid or asset not in {"XAUUSD", "XAGUSD"}:
+        return {"ok": False, "status": "UNRESOLVED", "reason": "unsupported_or_missing_broker_trade"}
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE broker_trade_id=? ORDER BY id DESC LIMIT 1",
+            (bid,),
+        ).fetchone()
+    if existing:
+        status = safe_str(existing["status"]).upper()
+        reason = f"broker trade already has local link id={existing['id']} status={status}"
+        _metals_broker_recovery_audit(
+            trade, "ALREADY_LINKED" if status == "OPEN" else "CONFLICT_EXISTING_NONOPEN_LINK",
+            recovered_link_id=int(existing["id"]), reason=reason,
+            evidence={"existing_link": dict(existing), "trade_detail": detail},
+        )
+        return {
+            "ok": status == "OPEN",
+            "status": "ALREADY_LINKED" if status == "OPEN" else "UNRESOLVED",
+            "reason": reason,
+            "link_id": int(existing["id"]),
+        }
+
+    exact = _metals_exact_entry_audit_for_broker_trade(bid)
+    audit = dict(exact.get("audit") or {}) if exact.get("ok") else None
+    signal = None
+    raw_signal_id = 0
+    confidence = ""
+    match_evidence: Dict[str, Any] = {"exact_audit": exact, "trade_detail": detail}
+
+    if audit:
+        raw_signal_id = int(audit.get("raw_signal_id") or 0)
+        signal = _metals_raw_signal_for_recovery(raw_signal_id)
+        confidence = "EXACT_EXECUTION_AUDIT"
+        if not signal:
+            _metals_broker_recovery_audit(
+                trade, "UNRESOLVED", confidence=confidence,
+                raw_signal_id=raw_signal_id, execution_audit_id=int(audit.get("id") or 0),
+                reason="exact execution audit found but raw signal is missing",
+                evidence=match_evidence,
+            )
+            return {"ok": False, "status": "UNRESOLVED", "reason": "raw_signal_missing_for_exact_audit"}
+        if _metals_demo_asset(signal.get("pair")) != asset:
+            _metals_broker_recovery_audit(
+                trade, "UNRESOLVED", confidence=confidence,
+                raw_signal_id=raw_signal_id, execution_audit_id=int(audit.get("id") or 0),
+                reason="exact execution audit/raw signal asset conflicts with OANDA instrument",
+                evidence=match_evidence,
+            )
+            return {"ok": False, "status": "UNRESOLVED", "reason": "asset_conflict_exact_audit"}
+    else:
+        match = _metals_signal_match_for_broker_trade(trade)
+        match_evidence["signal_match"] = match
+        if not match.get("ok"):
+            _metals_broker_recovery_audit(
+                trade, "UNRESOLVED",
+                reason=safe_str(match.get("reason") or exact.get("reason")),
+                evidence=match_evidence,
+            )
+            return {
+                "ok": False,
+                "status": "UNRESOLVED",
+                "reason": safe_str(match.get("reason") or exact.get("reason")),
+                "evidence": match,
+            }
+        signal = dict(match["raw_signal"])
+        raw_signal_id = int(match["raw_signal_id"])
+        confidence = safe_str(match.get("confidence"))
+
+    with get_conn() as conn:
+        conflict = conn.execute(
+            "SELECT id,broker_trade_id,status FROM metals_demo_trade_links WHERE raw_signal_id=? LIMIT 1",
+            (raw_signal_id,),
+        ).fetchone()
+    if conflict:
+        reason = (
+            f"raw signal {raw_signal_id} already belongs to link {conflict['id']} "
+            f"broker {safe_str(conflict['broker_trade_id'])}"
+        )
+        _metals_broker_recovery_audit(
+            trade, "UNRESOLVED", confidence=confidence, raw_signal_id=raw_signal_id,
+            execution_audit_id=int(audit.get("id") or 0) if audit else None,
+            reason=reason, evidence=match_evidence,
+        )
+        return {"ok": False, "status": "UNRESOLVED", "reason": reason}
+
+    risk = _metals_recovery_risk_basis(asset, side, trade, audit)
+    match_evidence["risk"] = risk
+    if not risk.get("ok"):
+        _metals_broker_recovery_audit(
+            trade, "UNRESOLVED", confidence=confidence, raw_signal_id=raw_signal_id,
+            execution_audit_id=int(audit.get("id") or 0) if audit else None,
+            reason=f"risk basis unresolved: {safe_str(risk.get('reason'))}",
+            evidence=match_evidence,
+        )
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": f"risk_basis_unresolved:{safe_str(risk.get('reason'))}",
+        }
+
+    policy = _metals_recovery_policy_from_audit(asset, side, audit)
+    now = now_utc_iso()
+    fill_units = abs(
+        float(
+            safe_float(trade.get("initialUnits"))
+            or safe_float(trade.get("currentUnits"))
+            or safe_float((audit or {}).get("actual_units"))
+            or 0.0
+        )
+    )
+    entry_price = (
+        safe_float(trade.get("price"))
+        or safe_float((audit or {}).get("entry_price"))
+        or safe_float(signal.get("exec_close"))
+    )
+    stop_price = safe_float(risk.get("stop_price"))
+    broker_order_id = safe_str((audit or {}).get("broker_order_id"))
+    signal_time = safe_str(signal.get("timestamp_readable") or signal.get("timestamp"))
+    model_version = safe_str(signal.get("model_version") or METALS_DEMO_MANAGER_VERSION)
+
+    requested_units = abs(float(safe_float((audit or {}).get("requested_units")) or fill_units))
+    requested_risk = float(safe_float(risk.get("requested_risk_gbp")) or _metals_demo_risk(asset))
+    estimated_risk = float(safe_float(risk.get("estimated_risk_gbp")) or 0.0)
+
+    recovery_payload = {
+        "recovery": {
+            "source": "exact_execution_audit" if audit else "unique_signal_time_price_match",
+            "confidence": confidence,
+            "no_exit_shadow_backfill": True,
+            "active_exit_policy": policy,
+            "risk_basis": risk,
+            "evidence": match_evidence,
+        },
+        "broker_trade": trade,
+        "raw_signal_id": raw_signal_id,
+    }
+
+    with get_conn() as conn:
+        link_id = db_insert_returning_id(conn, """
+            INSERT INTO metals_demo_trade_links (
+                created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,
+                model_version,signal_time,entry_signal_id,requested_risk_amount,
+                estimated_risk_amount,requested_units,filled_units,entry_price,
+                stop_price,current_stop_price,broker_trade_id,broker_order_id,status,
+                last_known_unrealized_pl,last_reconciled_at_utc,
+                active_exit_policy,active_exit_policy_version,
+                active_exit_policy_started_at_utc,recovery_source,
+                recovery_confidence,recovered_at_utc,recovery_note,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now, now, raw_signal_id, asset, instrument, side, model_version,
+            signal_time, raw_signal_id, requested_risk, estimated_risk,
+            requested_units, fill_units, entry_price, stop_price, stop_price,
+            bid, broker_order_id, "OPEN",
+            safe_float(trade.get("unrealizedPL")), now,
+            policy["policy"], policy["version"],
+            safe_str(trade.get("openTime")) or now,
+            "EXACT_EXECUTION_AUDIT" if audit else "UNIQUE_SIGNAL_TIME_PRICE_MATCH",
+            confidence, now,
+            "Recovered from existing OANDA trade; no historical exit-shadow backfill.",
+            json.dumps(recovery_payload, default=str),
+        ))
+        conn.commit()
+
+    _metals_broker_recovery_audit(
+        trade, "RECOVERED", confidence=confidence, raw_signal_id=raw_signal_id,
+        execution_audit_id=int(audit.get("id") or 0) if audit else None,
+        recovered_link_id=link_id,
+        reason=(
+            f"Reconstructed local ownership link from {confidence}; "
+            f"policy={policy['policy']}; exit shadows intentionally not backfilled."
+        ),
+        evidence=recovery_payload,
+    )
+
+    return {
+        "ok": True,
+        "status": "RECOVERED",
+        "broker_trade_id": bid,
+        "link_id": link_id,
+        "raw_signal_id": raw_signal_id,
+        "asset": asset,
+        "side": side,
+        "confidence": confidence,
+        "active_exit_policy": policy,
+        "estimated_risk_gbp": estimated_risk,
+        "shadow_backfill": False,
+    }
+
+
+def metals_demo_reconcile_broker_only_links(
+    broker_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Safely reconstruct missing local links for actual open OANDA XAU/XAG trades.
+    This is DB reconciliation only: ZERO broker-write authority.
+    """
+    if not METALS_BROKER_ONLY_RECOVERY_ENABLED:
+        return {"ok": True, "enabled": False, "skipped": True, "reason": "disabled"}
+
+    broker = broker_snapshot or metals_demo_live_broker_snapshot()
+    if not broker.get("ok"):
+        return {
+            "ok": False, "enabled": True, "skipped": True,
+            "reason": "fresh_oanda_metals_snapshot_failed",
+            "broker": broker,
+        }
+
+    owned = broker.get("owned_open_trades") or []
+    with get_conn() as conn:
+        local_rows = [dict(r) for r in conn.execute(
+            "SELECT id,broker_trade_id,status FROM metals_demo_trade_links"
+        ).fetchall()]
+
+    any_local_ids = {safe_str(r.get("broker_trade_id")) for r in local_rows if safe_str(r.get("broker_trade_id"))}
+    broker_only = [t for t in owned if safe_str(t.get("id")) not in any_local_ids]
+
+    results = []
+    for trade in broker_only:
+        try:
+            results.append(_metals_recover_one_broker_only_trade(dict(trade)))
+        except Exception as exc:
+            _metals_broker_recovery_audit(
+                dict(trade), "ERROR",
+                reason=f"{type(exc).__name__}: {exc}",
+                evidence={"traceback": traceback.format_exc(limit=8)},
+            )
+            results.append({
+                "ok": False,
+                "status": "ERROR",
+                "broker_trade_id": safe_str(trade.get("id")),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    recovered = sum(1 for r in results if r.get("status") == "RECOVERED")
+    unresolved = sum(1 for r in results if not r.get("ok"))
+
+    # Verify against a fresh local read; broker state itself was never modified.
+    with get_conn() as conn:
+        open_ids = {
+            safe_str(r["broker_trade_id"])
+            for r in conn.execute(
+                "SELECT broker_trade_id FROM metals_demo_trade_links WHERE status='OPEN'"
+            ).fetchall()
+            if safe_str(r["broker_trade_id"])
+        }
+    remaining = [
+        safe_str(t.get("id"))
+        for t in owned
+        if safe_str(t.get("id")) not in open_ids
+    ]
+
+    return {
+        "ok": len(remaining) == 0,
+        "enabled": True,
+        "broker_open_count": len(owned),
+        "broker_only_found": len(broker_only),
+        "recovered": recovered,
+        "unresolved": unresolved,
+        "remaining_broker_only_ids": remaining,
+        "results": results,
+        "broker_write_authority": False,
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/broker/metals-reconcile-broker-only")
+def metals_demo_reconcile_broker_only_endpoint() -> Dict[str, Any]:
+    return metals_demo_reconcile_broker_only_links()
+
+
+@app.get("/export/metals-broker-only-recovery.csv")
+def export_metals_broker_only_recovery(limit: int = 5000) -> Response:
+    init_db()
+    limit = max(1, min(int(limit or 5000), 50000))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_broker_only_recovery_audit ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()]
+    return Response(
+        dicts_to_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="metals-broker-only-recovery.csv"'},
+    )
 
 
 def metals_demo_reconcile_local_ghosts(asset: str = "") -> Dict[str, Any]:
@@ -33773,7 +34496,7 @@ def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
 @app.get("/export/metals-focused-research.zip")
 def export_metals_focused_research_zip(limit:int=25000):
     ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","harvest-stages.csv":"metals_demo_harvest_stages","harvest-events.csv":"metals_demo_harvest_events","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
+    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","harvest-stages.csv":"metals_demo_harvest_stages","harvest-events.csv":"metals_demo_harvest_events","broker-only-recovery.csv":"metals_demo_broker_only_recovery_audit","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_mf_rows(tbl,limit);out=io.StringIO()
@@ -35477,6 +36200,7 @@ def _metals_std_open_trades_html() -> str:
           <td>{esc(t.get('manager_last_reason') or '-')}</td>
           <td>{esc(t.get('current_stop_price') or t.get('stop_price') or '-')}</td>
           <td>{money(risk,'GBP')}</td>
+          <td>{esc(t.get('recovery_confidence') or 'native link')}</td>
         </tr>
         """
 
@@ -35507,11 +36231,11 @@ def _metals_std_open_trades_html() -> str:
           <th>Asset</th><th>Side</th><th>Local ID</th><th>Broker ID</th><th>Entry Time</th>
           <th>Entry</th><th>Current</th><th>Age</th><th>Zone</th><th>Current R</th>
           <th>HWM R</th><th>MFE R</th><th>MAE R</th><th>48h Baseline</th><th>OANDA UPL</th>
-          <th>Decision</th><th>Reason</th><th>Current SL</th><th>Effective Risk</th>
+          <th>Decision</th><th>Reason</th><th>Current SL</th><th>Effective Risk</th><th>Link Provenance</th>
         </tr></thead>
-        <tbody>{rows or '<tr><td colspan="19">No open Metals trades.</td></tr>'}</tbody>
+        <tbody>{rows or '<tr><td colspan="20">No open Metals trades.</td></tr>'}</tbody>
       </table></div>
-      {f'<h3>Broker-Only Metals Trades — Attention Required</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
+      {f'<h3>Broker-Only Metals Trades — Attention Required</h3><div class="section-note small">Automatic recovery runs in the manager maintenance worker and only adopts a trade when ownership evidence is unique. Ambiguous rows remain blocked. <a href="/broker/metals-reconcile-broker-only">run recovery now</a> · <a href="/export/metals-broker-only-recovery.csv">recovery audit CSV</a></div><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
     """
 
 def _metals_std_basket_manager_html() -> str:
@@ -35550,12 +36274,13 @@ def _metals_std_basket_manager_html() -> str:
         cls = "pos" if state in ("GREEN", "OBSERVE") else "warn" if state == "AMBER" else "neg"
         cards += f"""
         <div class="mini-card">
-          <div class="k">{esc(key.replace(':',' '))}</div>
+          <div class="k">{esc(key.replace(':',' '))} HEALTH</div>
           <div class="v {cls}">{esc(state)}</div>
           <div class="small">
             {_metals_fmt(b.get('basket_r'),2,'R')} · model HWM {_metals_fmt(b.get('high_water_r'),2,'R')} ·
             giveback {_metals_fmt(b.get('giveback_pct'),1,'%')} · open {int(safe_float(b.get('open_count')) or 0)}
           </div>
+          <div class="small"><strong>Action:</strong> {esc(b.get('action') or 'HOLD')} · mature {int(safe_float(b.get('matured_count')) or 0)} · {esc(b.get('basket_phase') or '')}</div>
         </div>
         """
 
@@ -35564,6 +36289,7 @@ def _metals_std_basket_manager_html() -> str:
         "EXACT"
         if recon.get("execution_safe")
         else "BLOCKED: " + "; ".join(recon.get("block_reasons") or [])
+        + " · broker-only auto-recovery requires exact evidence"
     )
 
     return f"""
@@ -35574,6 +36300,9 @@ def _metals_std_basket_manager_html() -> str:
         The family harvest ladder is independent: broker-authoritative 50R checkpoints
         can bank profitable exposure while surviving trades continue under their own exit policy.
         Hard SL and asset/side defence remain separate safety layers.
+        <strong>Health colour and management eligibility are deliberately separate:</strong>
+        a young losing basket can be RED/CRITICAL while its action remains YOUNG_HOLD until
+        the existing maturity/size gates permit defence.
       </div>
       <div class="section-note small">
         <strong>Harvest ladder:</strong> 50R = 20%, 100R = 20%, 150R = 25%,
