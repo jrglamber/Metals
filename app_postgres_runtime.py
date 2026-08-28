@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.23"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.22 / 2026-08-28"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Manual Basket Cycle Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.24"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.23 / 2026-08-28"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Reconciliation Repair + Manual Basket Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -26528,6 +26528,154 @@ def _metals_adopt_broker_only_legacy_trade(
 
 
 
+def _metals_reopen_existing_nonopen_link_from_broker(
+    existing: Dict[str, Any],
+    broker_trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Repair a stale local CLOSED/non-OPEN row when OANDA authoritatively proves
+    the exact same broker trade ID is still open.
+
+    This is a local DB reconciliation only. ZERO OANDA write authority.
+
+    Existing trade identity, raw-signal ownership, individual MFE/MAE, stop
+    history, active exit policy and existing shadow rows are preserved.
+    """
+    link = dict(existing or {})
+    bid = safe_str(broker_trade.get("id"))
+    local_bid = safe_str(link.get("broker_trade_id"))
+    if not bid or local_bid != bid:
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": "broker_trade_id_mismatch_for_reopen",
+        }
+
+    broker_asset = _metals_demo_asset(broker_trade.get("instrument"))
+    broker_side = _metals_broker_trade_side(broker_trade)
+    local_asset = _metals_demo_asset(link.get("asset") or link.get("instrument"))
+    local_side = _metals_demo_side(link.get("side"))
+
+    if broker_asset not in {"XAUUSD", "XAGUSD"}:
+        return {"ok": False, "status": "UNRESOLVED", "reason": "broker_asset_not_metals"}
+    if local_asset and local_asset != broker_asset:
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": f"existing_link_asset_conflict:{local_asset}!={broker_asset}",
+        }
+    if local_side and local_side != broker_side:
+        return {
+            "ok": False,
+            "status": "UNRESOLVED",
+            "reason": f"existing_link_side_conflict:{local_side}!={broker_side}",
+        }
+
+    broker_entry = safe_float(broker_trade.get("price"))
+    local_entry = safe_float(link.get("entry_price"))
+    if (
+        broker_entry is not None and broker_entry > 0
+        and local_entry is not None and local_entry > 0
+    ):
+        diff_pct = abs(broker_entry / local_entry - 1.0) * 100.0
+        tol = _metals_broker_recovery_price_tolerance_pct(broker_asset)
+        if diff_pct > tol:
+            return {
+                "ok": False,
+                "status": "UNRESOLVED",
+                "reason": f"existing_link_entry_conflict:{diff_pct:.4f}%>{tol:.4f}%",
+            }
+
+    # Do not silently switch an old trade onto a newer manager.
+    active_policy = safe_str(link.get("active_exit_policy")).upper()
+    active_version = safe_str(link.get("active_exit_policy_version"))
+    if not active_policy:
+        active_policy = "CURRENT_MANAGER"
+        active_version = METALS_DEMO_MANAGER_VERSION
+
+    current_stop = _metals_broker_trade_stop_price(broker_trade)
+    now = now_utc_iso()
+    note = (
+        "OANDA confirms this exact broker trade ID is still OPEN. "
+        "Local non-OPEN status restored; original ownership/policy/history retained; "
+        "no broker order sent and no exit-shadow backfill performed."
+    )
+
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE metals_demo_trade_links
+            SET updated_at_utc=?,
+                status='OPEN',
+                realized_pl=NULL,
+                closed_at_utc=NULL,
+                close_reason=NULL,
+                last_known_unrealized_pl=?,
+                last_reconciled_at_utc=?,
+                current_stop_price=COALESCE(?,current_stop_price,stop_price),
+                active_exit_policy=?,
+                active_exit_policy_version=?,
+                active_exit_policy_started_at_utc=COALESCE(
+                    active_exit_policy_started_at_utc,
+                    broker_open_time_utc,
+                    signal_time,
+                    created_at_utc
+                ),
+                recovery_source='BROKER_STATUS_REOPEN',
+                recovery_confidence='EXACT_BROKER_TRADE_ID_OPEN',
+                recovered_at_utc=?,
+                recovery_note=?,
+                broker_open_time_utc=COALESCE(broker_open_time_utc,?)
+            WHERE id=?
+        """, (
+            now,
+            safe_float(broker_trade.get("unrealizedPL")),
+            now,
+            current_stop,
+            active_policy,
+            active_version,
+            now,
+            note,
+            safe_str(broker_trade.get("openTime")),
+            int(link.get("id") or 0),
+        ))
+        conn.commit()
+
+    _metals_broker_recovery_audit(
+        broker_trade,
+        "RECOVERED_REOPEN_EXISTING_LINK",
+        confidence="EXACT_BROKER_TRADE_ID_OPEN",
+        raw_signal_id=int(safe_float(link.get("raw_signal_id")) or 0) or None,
+        recovered_link_id=int(link.get("id") or 0),
+        reason=note,
+        evidence={
+            "previous_local_status": safe_str(link.get("status")),
+            "existing_link_id": int(link.get("id") or 0),
+            "broker_trade_id": bid,
+            "broker_asset": broker_asset,
+            "broker_side": broker_side,
+            "active_exit_policy_preserved": active_policy,
+            "exit_shadow_backfill": False,
+            "broker_write_authority": False,
+        },
+    )
+
+    return {
+        "ok": True,
+        "status": "RECOVERED_REOPEN_EXISTING_LINK",
+        "broker_trade_id": bid,
+        "link_id": int(link.get("id") or 0),
+        "raw_signal_id": int(safe_float(link.get("raw_signal_id")) or 0),
+        "asset": broker_asset,
+        "side": broker_side,
+        "confidence": "EXACT_BROKER_TRADE_ID_OPEN",
+        "active_exit_policy": active_policy,
+        "shadow_backfill": False,
+        "broker_write_authority": False,
+        "previous_local_status": safe_str(link.get("status")),
+    }
+
+
+
 def _metals_recover_one_broker_only_trade(
     broker_trade: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -26542,24 +26690,57 @@ def _metals_recover_one_broker_only_trade(
         return {"ok": False, "status": "UNRESOLVED", "reason": "unsupported_or_missing_broker_trade"}
 
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT * FROM metals_demo_trade_links WHERE broker_trade_id=? ORDER BY id DESC LIMIT 1",
+        existing_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE broker_trade_id=? ORDER BY id DESC",
             (bid,),
-        ).fetchone()
-    if existing:
-        status = safe_str(existing["status"]).upper()
-        reason = f"broker trade already has local link id={existing['id']} status={status}"
-        _metals_broker_recovery_audit(
-            trade, "ALREADY_LINKED" if status == "OPEN" else "CONFLICT_EXISTING_NONOPEN_LINK",
-            recovered_link_id=int(existing["id"]), reason=reason,
-            evidence={"existing_link": dict(existing), "trade_detail": detail},
+        ).fetchall()]
+
+    if existing_rows:
+        open_rows = [r for r in existing_rows if safe_str(r.get("status")).upper() == "OPEN"]
+        if len(open_rows) == 1:
+            row = open_rows[0]
+            reason = f"broker trade already has OPEN local link id={row['id']}"
+            _metals_broker_recovery_audit(
+                trade, "ALREADY_LINKED",
+                raw_signal_id=int(safe_float(row.get("raw_signal_id")) or 0) or None,
+                recovered_link_id=int(row["id"]),
+                reason=reason,
+                evidence={"existing_link": row, "trade_detail": detail},
+            )
+            return {
+                "ok": True,
+                "status": "ALREADY_LINKED",
+                "reason": reason,
+                "link_id": int(row["id"]),
+            }
+
+        if len(open_rows) > 1:
+            reason = f"multiple OPEN local links already reference broker trade {bid}"
+            _metals_broker_recovery_audit(
+                trade, "UNRESOLVED",
+                reason=reason,
+                evidence={"existing_links": existing_rows, "trade_detail": detail},
+            )
+            return {"ok": False, "status": "UNRESOLVED", "reason": reason}
+
+        # No OPEN row exists, but this exact OANDA trade ID is currently open.
+        # Reopen only when there is exactly one historical local ownership row.
+        if len(existing_rows) == 1:
+            return _metals_reopen_existing_nonopen_link_from_broker(
+                existing_rows[0],
+                trade,
+            )
+
+        reason = (
+            f"{len(existing_rows)} non-OPEN local rows reference broker trade {bid}; "
+            "automatic reopen is ambiguous"
         )
-        return {
-            "ok": status == "OPEN",
-            "status": "ALREADY_LINKED" if status == "OPEN" else "UNRESOLVED",
-            "reason": reason,
-            "link_id": int(existing["id"]),
-        }
+        _metals_broker_recovery_audit(
+            trade, "UNRESOLVED",
+            reason=reason,
+            evidence={"existing_links": existing_rows, "trade_detail": detail},
+        )
+        return {"ok": False, "status": "UNRESOLVED", "reason": reason}
 
     exact = _metals_exact_entry_audit_for_broker_trade(bid)
     audit = dict(exact.get("audit") or {}) if exact.get("ok") else None
@@ -26786,8 +26967,16 @@ def metals_demo_reconcile_broker_only_links(
             "SELECT id,broker_trade_id,status FROM metals_demo_trade_links"
         ).fetchall()]
 
-    any_local_ids = {safe_str(r.get("broker_trade_id")) for r in local_rows if safe_str(r.get("broker_trade_id"))}
-    broker_only = [t for t in owned if safe_str(t.get("id")) not in any_local_ids]
+    # v1.6.24: only an OPEN local row proves ownership of a currently OPEN
+    # OANDA position. Previous versions incorrectly included CLOSED rows here,
+    # which could mask exactly the broker-only mismatch shown on the dashboard.
+    open_local_ids = {
+        safe_str(r.get("broker_trade_id"))
+        for r in local_rows
+        if safe_str(r.get("broker_trade_id"))
+        and safe_str(r.get("status")).upper() == "OPEN"
+    }
+    broker_only = [t for t in owned if safe_str(t.get("id")) not in open_local_ids]
 
     results = []
     for trade in broker_only:
@@ -26808,11 +26997,19 @@ def metals_demo_reconcile_broker_only_links(
 
     recovered = sum(
         1 for r in results
-        if safe_str(r.get("status")).upper() in {"RECOVERED","RECOVERED_LEGACY_ADOPTION"}
+        if safe_str(r.get("status")).upper() in {
+            "RECOVERED",
+            "RECOVERED_LEGACY_ADOPTION",
+            "RECOVERED_REOPEN_EXISTING_LINK",
+        }
     )
     legacy_adopted = sum(
         1 for r in results
         if safe_str(r.get("status")).upper() == "RECOVERED_LEGACY_ADOPTION"
+    )
+    reopened_existing = sum(
+        1 for r in results
+        if safe_str(r.get("status")).upper() == "RECOVERED_REOPEN_EXISTING_LINK"
     )
     unresolved = sum(1 for r in results if not r.get("ok"))
 
@@ -26838,6 +27035,7 @@ def metals_demo_reconcile_broker_only_links(
         "broker_only_found": len(broker_only),
         "recovered": recovered,
         "legacy_adopted": legacy_adopted,
+        "reopened_existing": reopened_existing,
         "unresolved": unresolved,
         "remaining_broker_only_ids": remaining,
         "results": results,
@@ -36988,7 +37186,7 @@ def _metals_std_basket_manager_html() -> str:
                 if detail_bits else
                 ""
             )
-            + " · exact OANDA opening fill is sufficient for legacy CURRENT_MANAGER adoption; historical signal is optional"
+            + " · stale CLOSED local rows are reopened when the exact broker trade ID is still OPEN; otherwise exact OANDA opening fill can create a legacy CURRENT_MANAGER adoption"
         )
 
     return f"""
@@ -37473,12 +37671,19 @@ def metals_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
             detail="Cannot start a new Metals basket cycle: fresh OANDA XAU/XAG snapshot failed."
         )
 
-    # Give broker-only recovery one chance before demanding exact reconciliation.
+    # Give both broker-only recovery paths one explicit chance before demanding
+    # exact reconciliation. Never swallow the recovery outcome: if reset remains
+    # blocked, show the exact reason on the dashboard.
+    recovery_attempt: Dict[str, Any] = {}
     try:
-        metals_demo_reconcile_broker_only_links(broker)
+        recovery_attempt = metals_demo_reconcile_broker_only_links(broker)
         broker = metals_demo_live_broker_snapshot()
-    except Exception:
-        pass
+    except Exception as exc:
+        recovery_attempt = {
+            "ok": False,
+            "status": "RECOVERY_EXCEPTION",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     recon = _metals_harvest_reconciliation_snapshot(broker)
     if not recon.get("execution_safe"):
@@ -37488,12 +37693,21 @@ def metals_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
                 f"broker {safe_str(d.get('broker_trade_id'))}: "
                 f"{safe_str(d.get('last_recovery_reason') or d.get('last_recovery_status') or 'unresolved')}"
             )
+        attempt_bits = []
+        if recovery_attempt.get("error"):
+            attempt_bits.append(f"recovery exception: {safe_str(recovery_attempt.get('error'))}")
+        for rr in recovery_attempt.get("results") or []:
+            attempt_bits.append(
+                f"broker {safe_str(rr.get('broker_trade_id'))}: "
+                f"{safe_str(rr.get('reason') or rr.get('error') or rr.get('status'))}"
+            )
         raise HTTPException(
             status_code=409,
             detail=(
                 "Cannot reset the economic basket cycle until Metals ownership reconciliation is exact. "
                 + "; ".join(recon.get("block_reasons") or [])
                 + ((" | " + " | ".join(details)) if details else "")
+                + ((" | recovery attempt: " + " | ".join(attempt_bits)) if attempt_bits else "")
             )
         )
 
