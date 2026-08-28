@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.22"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.21 / 2026-08-27"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — OANDA Fill Adoption + Basket Health + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.23"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.22 / 2026-08-28"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Manual Basket Cycle Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -25114,7 +25114,32 @@ def _metals_hwm_observation_time(conn: Optional[Any] = None) -> str:
 
 
 def _metals_current_cycle_boundary(conn: Any) -> Dict[str, Any]:
-    """Best persisted flat boundary for the currently active local Metals cycle."""
+    """
+    Best persisted boundary for the currently active Metals economic cycle.
+
+    v1.6.23 adds an explicit MANUAL economic-cycle boundary. This is essential:
+    after the user deliberately starts a new basket cycle, old family snapshots
+    and old manager-review highs must not immediately resurrect the archived HWM.
+    """
+    manual = None
+    try:
+        manual_snapshot_id = int(safe_float(
+            _metals_runtime_get(conn, "metals_manual_cycle_reset_snapshot_id", "0")
+        ) or 0)
+        manual_signal_id = int(safe_float(
+            _metals_runtime_get(conn, "metals_manual_cycle_reset_signal_id", "0")
+        ) or 0)
+        manual_at = _metals_runtime_get(conn, "metals_manual_cycle_reset_at", "")
+        if manual_snapshot_id > 0 or manual_at:
+            manual = {
+                "snapshot_id": manual_snapshot_id or None,
+                "review_signal_id": manual_signal_id,
+                "created_at_utc": manual_at,
+                "boundary_type": "MANUAL_ECONOMIC_RESET",
+            }
+    except Exception:
+        manual = None
+
     try:
         row = conn.execute("""
             SELECT id,review_signal_id,created_at_utc
@@ -25126,14 +25151,28 @@ def _metals_current_cycle_boundary(conn: Any) -> Dict[str, Any]:
         """).fetchone()
     except Exception:
         row = None
+
+    flat = None
     if row:
-        return {
+        flat = {
             "snapshot_id": int(row["id"]),
             "review_signal_id": int(safe_float(row["review_signal_id"]) or 0),
             "created_at_utc": safe_str(row["created_at_utc"]),
+            "boundary_type": "BROKER_FLAT",
         }
 
-    # If there is no explicit flat snapshot, the earliest currently-open link is
+    if manual and flat:
+        md = parse_dt(manual.get("created_at_utc"))
+        fd = parse_dt(flat.get("created_at_utc"))
+        if md is not None and fd is not None:
+            return manual if md >= fd else flat
+        return manual if int(manual.get("snapshot_id") or 0) >= int(flat.get("snapshot_id") or 0) else flat
+    if manual:
+        return manual
+    if flat:
+        return flat
+
+    # If there is no explicit flat/manual snapshot, the earliest currently-open link is
     # the safest lower-bound start for the active cycle.
     try:
         row = conn.execute("""
@@ -36703,6 +36742,25 @@ def _metals_std_broker_html() -> str:
       <div class="table-scroll"><table><thead><tr><th>Asset</th><th>Side</th><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>State</th><th>Warnings</th></tr></thead>
       <tbody>{preview_rows}</tbody></table></div>
 
+      <h3>Manual Economic Basket Cycle</h3>
+      <div class="section-note">
+        <strong>Start New Basket Cycle / Reset HWM</strong><br>
+        Use this only when the previous family campaign has economically ended but some
+        positions remain open. It archives the old family HWM/harvest cycle and seeds a
+        fresh cycle from the current broker basket. The next harvest becomes <strong>50R</strong>.
+        <br><strong>No trades are closed or modified.</strong> Existing trade ages, MFE/MAE,
+        stops, MFE50/Current Manager assignments and exit-shadow rows remain unchanged.
+      </div>
+      <div style="padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <button type="button"
+          onclick="startNewMetalsBasketCycle()"
+          style="padding:10px 14px;border:1px solid #38bdf8;border-radius:8px;background:#0f172a;color:#e0f2fe;cursor:pointer;font-weight:800;">
+          Start new basket cycle / reset HWM
+        </button>
+        <span class="small">Requires exact OANDA ↔ local reconciliation and WEBHOOK_SECRET confirmation.</span>
+      </div>
+      <div id="metals-new-cycle-result" class="section-note small" style="display:none;"></div>
+
       <h3>Actual OANDA Metals Open Trades</h3>
       <div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
       <tbody>{broker_rows or '<tr><td colspan="7">No OANDA Metals trades open.</td></tr>'}</tbody></table></div>
@@ -37020,6 +37078,25 @@ def _metals_std_broker_html() -> str:
         <div class="mini-card"><div class="k">Scope</div><div class="v">XAU + XAG</div><div class="small">No BCO / index writes</div></div>
       </div>
 
+      <h3>Manual Economic Basket Cycle</h3>
+      <div class="section-note">
+        <strong>Start New Basket Cycle / Reset HWM</strong><br>
+        Use this only when the previous family campaign has economically ended but some
+        positions remain open. It archives the old family HWM/harvest cycle and seeds a
+        fresh cycle from the current broker basket. The next harvest becomes <strong>50R</strong>.
+        <br><strong>No trades are closed or modified.</strong> Existing trade ages, MFE/MAE,
+        stops, MFE50/Current Manager assignments and exit-shadow rows remain unchanged.
+      </div>
+      <div style="padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <button type="button"
+          onclick="startNewMetalsBasketCycle()"
+          style="padding:10px 14px;border:1px solid #38bdf8;border-radius:8px;background:#0f172a;color:#e0f2fe;cursor:pointer;font-weight:800;">
+          Start new basket cycle / reset HWM
+        </button>
+        <span class="small">Requires exact OANDA ↔ local reconciliation and WEBHOOK_SECRET confirmation.</span>
+      </div>
+      <div id="metals-new-cycle-result" class="section-note small" style="display:none;"></div>
+
       <h3>Actual OANDA Metals Open Trades</h3>
       <div class="table-scroll"><table>
         <thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
@@ -37310,6 +37387,319 @@ def _metals_std_placeholder(key: str, title: str, note: str = "") -> str:
 
 
 
+
+def _metals_latest_raw_signal_id(conn: Any) -> int:
+    row = conn.execute("""
+        SELECT MAX(id) AS max_id
+        FROM raw_signals
+        WHERE UPPER(pair) IN ('XAUUSD','XAGUSD','XAU','XAG')
+    """).fetchone()
+    return int(safe_float(row["max_id"] if row else None) or 0)
+
+
+def _metals_insert_manual_family_reset_snapshot(
+    conn: Any,
+    current_r: float,
+    current_gbp: float,
+    open_count: int,
+    review_signal_id: int,
+    observed_at: str,
+) -> int:
+    """
+    Insert a new FAMILY snapshot whose HWM begins at the current economic state.
+    Asset/side snapshots are deliberately untouched because they remain part of
+    the existing defence evidence. This resets only the family-cycle diagnostic.
+    """
+    hwm_r = max(0.0, float(current_r))
+    hwm_gbp = max(0.0, float(current_gbp))
+    state = "RED" if current_r <= METALS_DEMO_BASKET_SEVERE_LOSS_R else (
+        "AMBER" if current_r < 0 else "GREEN"
+    )
+    reason = (
+        "MANUAL_ECONOMIC_CYCLE_RESET: family HWM rebased to current broker basket. "
+        "No trades/stops/ages/exit policies changed."
+    )
+    return db_insert_returning_id(conn, """
+        INSERT INTO metals_demo_basket_snapshots (
+            created_at_utc,review_signal_id,scope,basket_key,asset,side,
+            open_count,matured_count,losing_count,losing_pct,
+            basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json,
+            basket_pnl_gbp,high_water_pnl_gbp,high_water_seen_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        observed_at, review_signal_id, "FAMILY", "METALS_BASKET", "", "MIXED",
+        int(open_count), 0, 0, 0.0,
+        float(current_r), hwm_r, 0.0, "MANUAL_NEW_CYCLE",
+        state, "ADVISORY_ONLY", reason,
+        json.dumps({
+            "manual_economic_cycle_reset": True,
+            "broker_current_r": current_r,
+            "broker_current_gbp": current_gbp,
+            "open_count": open_count,
+            "no_broker_orders": True,
+            "individual_trade_state_unchanged": True,
+        }, default=str),
+        float(current_gbp), hwm_gbp, observed_at if hwm_gbp > 0 else "",
+    ))
+
+
+def metals_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
+    """
+    Start a NEW ECONOMIC/FAMILY basket cycle without touching any OANDA trade.
+
+    Effects:
+      - archive old broker HWM in immutable HWM event history;
+      - seed broker HWM to current positive broker basket P&L/R (0 if negative);
+      - establish a manual evidence boundary so old 74.6R-era snapshots cannot
+        repair the HWM back upward;
+      - archive unfinished harvest stages from the prior cycle;
+      - create a fresh harvest cycle with 50R as the next checkpoint;
+      - reset only the FAMILY manager-model HWM diagnostic.
+
+    Explicitly NOT changed:
+      - OANDA positions / orders;
+      - trade ages;
+      - individual trade MFE/MAE/high-water;
+      - hard or managed stops;
+      - stored MFE50 / Current Manager exit policy;
+      - exit-shadow rows.
+    """
+    init_db()
+
+    broker = metals_demo_live_broker_snapshot()
+    if not broker.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot start a new Metals basket cycle: fresh OANDA XAU/XAG snapshot failed."
+        )
+
+    # Give broker-only recovery one chance before demanding exact reconciliation.
+    try:
+        metals_demo_reconcile_broker_only_links(broker)
+        broker = metals_demo_live_broker_snapshot()
+    except Exception:
+        pass
+
+    recon = _metals_harvest_reconciliation_snapshot(broker)
+    if not recon.get("execution_safe"):
+        details = []
+        for d in recon.get("broker_only_details") or []:
+            details.append(
+                f"broker {safe_str(d.get('broker_trade_id'))}: "
+                f"{safe_str(d.get('last_recovery_reason') or d.get('last_recovery_status') or 'unresolved')}"
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot reset the economic basket cycle until Metals ownership reconciliation is exact. "
+                + "; ".join(recon.get("block_reasons") or [])
+                + ((" | " + " | ".join(details)) if details else "")
+            )
+        )
+
+    r_state = _metals_broker_basket_r(broker)
+    current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
+    current_gbp = float(safe_float(broker.get("owned_unrealized_pl")) or 0.0)
+    open_count = int(broker.get("owned_open_count") or 0)
+
+    # This control is for an economically exhausted-but-still-open basket.
+    # If already >=50R, rebasing would make the absolute 50R checkpoint
+    # ambiguous; refuse rather than silently skip protection.
+    if current_r >= METALS_HARVEST_FIRST_LEVEL_R:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Current broker basket is already {current_r:.2f}R. "
+                "Manual new-cycle reset is only allowed below the first 50R harvest checkpoint."
+            )
+        )
+
+    observed_at = now_utc_iso()
+    new_hwm_gbp = max(0.0, current_gbp)
+    new_hwm_r = max(0.0, current_r)
+
+    with get_conn() as conn:
+        previous = {
+            "open_count": int(safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0),
+            "high_water_gbp": float(safe_float(_metals_runtime_get(conn, "broker_hwm_gbp", "0")) or 0.0),
+            "high_water_r": float(safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0),
+            "seen_at": _metals_runtime_get(conn, "broker_hwm_seen_at", ""),
+            "source": _metals_runtime_get(conn, "broker_hwm_source", ""),
+            "harvest_cycle_id": _metals_runtime_get(conn, "metals_harvest_cycle_id", ""),
+        }
+
+        latest_signal_id = _metals_latest_raw_signal_id(conn)
+
+        # Archive any unfinished stage in the old economic cycle. Executed and
+        # historical/legacy stages remain immutable evidence.
+        old_cycle = safe_str(previous.get("harvest_cycle_id"))
+        if old_cycle:
+            conn.execute("""
+                UPDATE metals_demo_harvest_stages
+                SET updated_at_utc=?,
+                    status=CASE
+                        WHEN status IN (
+                            'EXECUTED','LEGACY_PASSED_UNBANKED',
+                            'RECOVERY_PASSED_UNBANKED','EXPIRED_FLAT'
+                        ) THEN status
+                        ELSE 'MANUAL_ECONOMIC_RESET_ARCHIVED'
+                    END,
+                    reason=CASE
+                        WHEN status IN (
+                            'EXECUTED','LEGACY_PASSED_UNBANKED',
+                            'RECOVERY_PASSED_UNBANKED','EXPIRED_FLAT'
+                        ) THEN reason
+                        ELSE COALESCE(reason,'') || ' | archived by manual economic basket-cycle reset'
+                    END
+                WHERE cycle_id=?
+            """, (observed_at, old_cycle))
+
+        # Insert the new family diagnostic snapshot first. Its id is the
+        # evidence boundary: recovery logic will only look at snapshots AFTER it.
+        reset_snapshot_id = _metals_insert_manual_family_reset_snapshot(
+            conn,
+            current_r=current_r,
+            current_gbp=current_gbp,
+            open_count=open_count,
+            review_signal_id=latest_signal_id,
+            observed_at=observed_at,
+        )
+
+        _metals_runtime_set(conn, "metals_manual_cycle_reset_snapshot_id", reset_snapshot_id)
+        _metals_runtime_set(conn, "metals_manual_cycle_reset_signal_id", latest_signal_id)
+        _metals_runtime_set(conn, "metals_manual_cycle_reset_at", observed_at)
+
+        # Broker-authoritative HWM rebased to current economic state.
+        _metals_runtime_set(conn, "broker_hwm_open_count", open_count)
+        _metals_runtime_set(conn, "broker_hwm_gbp", new_hwm_gbp)
+        _metals_runtime_set(conn, "broker_hwm_r", new_hwm_r)
+        _metals_runtime_set(conn, "broker_hwm_seen_at", observed_at if new_hwm_gbp > 0 else "")
+        _metals_runtime_set(conn, "broker_hwm_source", "manual_economic_cycle_reset")
+
+        # Create a fresh family harvest cycle immediately. Existing trades remain
+        # the same trades; only the family accounting/protection cycle is new.
+        new_cycle_id = (
+            f"METALS_MANUAL_{reset_snapshot_id}_"
+            f"{re.sub(r'[^0-9A-Za-z]+','',observed_at)[-18:]}"
+        )
+        _metals_runtime_set(conn, "metals_harvest_cycle_id", new_cycle_id)
+        _metals_runtime_set(conn, "metals_harvest_cycle_started_at", observed_at)
+        _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", new_hwm_r)
+        _metals_runtime_set(conn, "metals_harvest_ever_initialized", "1")
+        _metals_runtime_set(conn, "metals_harvest_policy_version", METALS_HARVEST_POLICY_VERSION)
+
+        _record_metals_hwm_event(
+            conn,
+            "MANUAL_ECONOMIC_RESET",
+            observed_at,
+            open_count,
+            current_gbp,
+            current_r,
+            new_hwm_gbp,
+            new_hwm_r,
+            "manual_economic_cycle_reset",
+            {
+                "previous": previous,
+                "new_cycle_id": new_cycle_id,
+                "reset_snapshot_id": reset_snapshot_id,
+                "latest_signal_id": latest_signal_id,
+                "next_harvest_r": METALS_HARVEST_FIRST_LEVEL_R,
+                "no_broker_orders": True,
+                "individual_trade_state_unchanged": True,
+            },
+        )
+        conn.commit()
+
+    try:
+        log_system_event(
+            "metals_manual_economic_cycle_reset",
+            "Manual Metals economic basket-cycle/HWM reset from dashboard",
+            {
+                "previous_hwm_gbp": previous.get("high_water_gbp"),
+                "previous_hwm_r": previous.get("high_water_r"),
+                "new_hwm_gbp": new_hwm_gbp,
+                "new_hwm_r": new_hwm_r,
+                "current_broker_gbp": current_gbp,
+                "current_broker_r": current_r,
+                "open_count": open_count,
+                "old_harvest_cycle_id": previous.get("harvest_cycle_id"),
+                "new_harvest_cycle_id": new_cycle_id,
+                "next_harvest_r": METALS_HARVEST_FIRST_LEVEL_R,
+                "no_broker_orders": True,
+            },
+        )
+    except Exception:
+        pass
+
+    # Clear top-tile cache so the reset is visible immediately.
+    try:
+        with _METALS_STD_TOP_LOCK:
+            _METALS_STD_TOP_CACHE["payload"] = None
+            _METALS_STD_TOP_CACHE["expires_at"] = 0.0
+    except Exception:
+        pass
+
+    # Prove the old HWM does not immediately repair back upward.
+    verify_broker = metals_demo_live_broker_snapshot()
+    verified = _metals_broker_highwater_state(verify_broker)
+
+    return {
+        "ok": True,
+        "status": "NEW_ECONOMIC_BASKET_STARTED",
+        "message": (
+            "New Metals economic basket cycle started. No broker orders were sent; "
+            "all surviving trades retain their existing age, stops and exit policy."
+        ),
+        "previous_hwm_gbp": previous.get("high_water_gbp"),
+        "previous_hwm_r": previous.get("high_water_r"),
+        "current_broker_gbp": current_gbp,
+        "current_broker_r": current_r,
+        "new_hwm_gbp": verified.get("high_water_gbp"),
+        "new_hwm_r": verified.get("high_water_r"),
+        "new_hwm_source": verified.get("source"),
+        "open_count": open_count,
+        "old_harvest_cycle_id": previous.get("harvest_cycle_id"),
+        "new_harvest_cycle_id": new_cycle_id,
+        "next_harvest_r": METALS_HARVEST_FIRST_LEVEL_R,
+        "reset_snapshot_id": reset_snapshot_id,
+        "reconciliation": {
+            k: v for k, v in recon.items() if k != "matched"
+        },
+        "broker_write_authority": False,
+        "individual_trade_state_unchanged": True,
+        "time_utc": observed_at,
+    }
+
+
+@app.post("/broker/metals-demo/start-new-basket-cycle")
+async def metals_manual_start_new_basket_cycle(
+    request: Request,
+    x_webhook_secret: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+
+    body_secret = safe_str(body.get("webhook_secret") or body.get("secret"))
+    query_secret = safe_str(request.query_params.get("secret") or "")
+    if (
+        x_webhook_secret != WEBHOOK_SECRET
+        and body_secret != WEBHOOK_SECRET
+        and query_secret != WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid WEBHOOK_SECRET")
+
+    if safe_str(body.get("confirm")) != "START_NEW_METALS_BASKET":
+        raise HTTPException(
+            status_code=400,
+            detail="Missing confirm=START_NEW_METALS_BASKET",
+        )
+
+    return metals_manual_start_new_basket_cycle_impl()
+
+
 @app.get("/broker/metals-demo/highwater-recovery-preview")
 def metals_hwm_recovery_preview() -> Dict[str, Any]:
     """Read-only HWM repair evidence. Never changes broker or strategy state."""
@@ -37357,6 +37747,7 @@ def metals_build_integrity() -> Dict[str, Any]:
         "_metals_latest_30_signals_html",
         "_metals_recently_closed_trades_html",
         "_metals_profit_harvesting_html",
+        "metals_manual_start_new_basket_cycle_impl",
         "metals_standard_dashboard",
     ]
     present = {name: callable(globals().get(name)) for name in critical}
@@ -37459,6 +37850,38 @@ async function loadSection(d){{
  if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';
  try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}
 }}
+async function startNewMetalsBasketCycle(){{
+ const box=document.getElementById('metals-new-cycle-result');
+ const msg='Start a NEW Metals economic basket cycle?\\n\\nThis archives the old family HWM/harvest cycle and makes 50R the next harvest again.\\n\\nNO OANDA trades, stops, ages or individual exit policies will be changed.';
+ if(!window.confirm(msg))return;
+ const secret=window.prompt('Enter WEBHOOK_SECRET to confirm the economic basket-cycle reset:','');
+ if(!secret){{if(box){{box.style.display='block';box.textContent='Cancelled: WEBHOOK_SECRET not supplied.';}}return;}}
+ if(box){{box.style.display='block';box.textContent='Starting new Metals economic basket cycle…';}}
+ try{{
+   const r=await fetch('/broker/metals-demo/start-new-basket-cycle',{{
+     method:'POST',
+     headers:{{'Content-Type':'application/json','x-webhook-secret':secret}},
+     body:JSON.stringify({{confirm:'START_NEW_METALS_BASKET'}}),
+     cache:'no-store'
+   }});
+   const txt=await r.text();
+   let d={{}};try{{d=JSON.parse(txt)}}catch(_e){{}}
+   if(!r.ok)throw new Error(d.detail||d.error||txt||`HTTP ${{r.status}}`);
+   if(box){{
+     box.innerHTML='<strong>New basket cycle started.</strong> Previous HWM '
+       +Number(d.previous_hwm_r||0).toFixed(2)+'R → new HWM '
+       +Number(d.new_hwm_r||0).toFixed(2)+'R. Next harvest: '
+       +Number(d.next_harvest_r||50).toFixed(0)+'R. No broker orders sent.';
+   }}
+   await loadTop(true);
+   for(const key of ['broker','manager-protection']){{
+     const el=document.querySelector(`details.lazy-section[data-section="${{key}}"]`);
+     if(el){{el.dataset.loaded='0';if(el.open)await loadSection(el);}}
+   }}
+ }}catch(e){{
+   if(box){{box.style.display='block';box.innerHTML='<span class="neg"><strong>Reset blocked:</strong> '+eh(e.message||e)+'</span>';}}
+ }}
+}}
 document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));
 loadTop(false);setInterval(()=>loadTop(true),60000);
 </script>
@@ -37481,6 +37904,7 @@ def metals_standard_status() -> Dict[str, Any]:
             "hourly_post_48h_review": True,
             "forced_max_hold_candles": METALS_DEMO_MANAGER_MAX_HOLD_CANDLES,
             "family_overlay": "advisory",
+            "manual_economic_basket_cycle_reset": True,
             "fixed_48h_control": True,
             "persistent_close_queue": True,
         },
