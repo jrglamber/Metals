@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.24"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.23 / 2026-08-28"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Reconciliation Repair + Manual Basket Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.25"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.24 / 2026-08-28"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAG Guard Integrity + Manual Basket Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -23873,6 +23873,171 @@ def _record_xag_guard_decision(conn: Any, signal_row: Any, result: Dict[str, Any
         pass
 
 
+def _metals_xag_guard_row(conn: Any, raw_signal_id: Any) -> Dict[str, Any]:
+    rid = int(safe_float(raw_signal_id) or 0)
+    if rid <= 0:
+        return {}
+    row = conn.execute('''
+        SELECT *
+        FROM metals_demo_xag_confirmation_guard
+        WHERE raw_signal_id=?
+        LIMIT 1
+    ''', (rid,)).fetchone()
+    return dict(row) if row else {}
+
+
+def metals_demo_production_candidate_for_row(
+    conn: Any,
+    row: Any,
+    selected: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    '''Single source of truth for post-guard production candidate state.
+
+    A model candidate is the deterministic signal before the XAG peer gate.
+    A production candidate is eligible only after all entry guards. Guard-blocked
+    XAG remains research evidence but must not count toward production consumers.
+    '''
+    if not row:
+        return {
+            'model_candidate': False,
+            'production_candidate': False,
+            'production_state': 'NO_DATA',
+            'side': '',
+            'reason': 'no_signal_row',
+            'guard': {},
+        }
+
+    selected = dict(selected or metals_demo_candidate_for_row(_raw_signal_json(row), row) or {})
+    pair_value = row.get('pair') if isinstance(row, dict) else row['pair']
+    asset = _metals_demo_asset(pair_value)
+    side = _metals_demo_side(selected.get('demo_side'))
+    model_candidate = bool(int(safe_float(selected.get('demo_candidate')) or 0))
+    base = {
+        'asset': asset,
+        'side': side,
+        'model_candidate': model_candidate,
+        'model_state': safe_str(selected.get('demo_state')),
+        'model_reason': safe_str(selected.get('demo_reason')),
+        'model_blockers': safe_str(selected.get('demo_blockers')),
+        'production_candidate': model_candidate,
+        'production_state': 'ACCEPTED_MODEL_CANDIDATE' if model_candidate else 'NOT_MODEL_CANDIDATE',
+        'reason': safe_str(selected.get('demo_reason') or selected.get('demo_blockers')),
+        'guard': {},
+        'selected_model_candidate': selected,
+    }
+
+    if asset != 'XAGUSD' or not model_candidate:
+        return base
+
+    rid = int((row.get('id') if isinstance(row, dict) else row['id']) or 0)
+    guard = _metals_xag_guard_row(conn, rid)
+    if not guard:
+        return {
+            **base,
+            'production_candidate': False,
+            'production_state': 'XAG_GUARD_PENDING_FAIL_CLOSED',
+            'reason': (
+                'XAG model candidate exists but no persisted confirmation-guard decision '
+                'is available yet; excluded from production candidate consumers.'
+            ),
+            'guard': {},
+        }
+
+    allowed = bool(int(safe_float(guard.get('allow_entry')) or 0))
+    reason = safe_str(guard.get('reason'))
+    return {
+        **base,
+        'production_candidate': allowed,
+        'production_state': 'ACCEPTED_XAG_GUARD' if allowed else 'BLOCKED_XAG_WAIT_XAU_CONFIRMATION',
+        'reason': reason,
+        'guard': guard,
+        'guard_decision': safe_str(guard.get('decision')),
+        'campaign_entry_count_before': int(safe_float(guard.get('campaign_entry_count_before')) or 0),
+        'solo_cap': int(safe_float(guard.get('solo_cap')) or METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP),
+        'lookback_hours': float(safe_float(guard.get('lookback_hours')) or METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS),
+        'xau_confirmation_found': bool(int(safe_float(guard.get('xau_confirmation_found')) or 0)),
+        'xau_confirmation_time': safe_str(guard.get('xau_confirmation_time')),
+        'xau_confirmation_age_hours': safe_float(guard.get('xau_confirmation_age_hours')),
+    }
+
+
+def _metals_production_candidate_side_for_row(conn: Any, row: Any) -> str:
+    if not row:
+        return ''
+    try:
+        eff = metals_demo_production_candidate_for_row(conn, row)
+        if eff.get('production_candidate'):
+            return _metals_demo_side(eff.get('side'))
+    except Exception:
+        return ''
+    return ''
+
+
+def metals_xag_candidate_guard_status() -> Dict[str, Any]:
+    '''Read-only current Silver raw-vs-production candidate status.'''
+    init_db()
+    with get_conn() as conn:
+        row = _metals_demo_latest_signal_row(conn, 'XAGUSD')
+        if not row:
+            return {
+                'ok': True, 'asset': 'XAGUSD', 'model_candidate': False,
+                'production_candidate': False, 'production_state': 'NO_DATA',
+                'message': 'No XAG signal stored yet.', 'broker_write_authority': False,
+            }
+        selected = metals_demo_candidate_for_row(_raw_signal_json(row), row)
+        eff = metals_demo_production_candidate_for_row(conn, row, selected)
+        open_xag = int(conn.execute(
+            "SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE asset='XAGUSD' AND status='OPEN'"
+        ).fetchone()['c'] or 0)
+        recent_blocked = int(conn.execute('''
+            SELECT COUNT(*) AS c FROM metals_demo_xag_confirmation_guard
+            WHERE allow_entry=0 AND decision='BLOCK_WAIT_XAU_CONFIRMATION'
+              AND created_at_utc>=?
+        ''', ((now_utc() - timedelta(hours=24)).isoformat(),)).fetchone()['c'] or 0)
+
+    if eff.get('model_candidate') and not eff.get('production_candidate'):
+        count_before = int(eff.get('campaign_entry_count_before') or 0)
+        cap = int(eff.get('solo_cap') or METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP)
+        lookback = float(eff.get('lookback_hours') or METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS)
+        side = safe_str(eff.get('side')).upper() or 'SAME-DIRECTION'
+        message = (
+            f'XAG MODEL CANDIDATE BLOCKED: campaign entries {count_before}/{cap}; '
+            f'no qualifying XAU {side} candidate within the previous {lookback:g}h. '
+            'Excluded from production Candidate Support, entries, Current-Manager '
+            'candidate-supported extension, AI candidate flags and broker-recovery matching.'
+        )
+    elif eff.get('production_candidate'):
+        message = f"XAG production candidate ACCEPTED ({safe_str(eff.get('production_state'))})."
+    else:
+        message = 'Latest XAG row is not a production entry candidate.'
+
+    return {
+        'ok': True,
+        'asset': 'XAGUSD',
+        'raw_signal_id': int(row['id']),
+        'signal_time': safe_str(row['timestamp_readable']),
+        'open_xag_trades': open_xag,
+        'blocked_last_24h': recent_blocked,
+        'message': message,
+        **eff,
+        'production_consumers': {
+            'entry_execution': 'POST_GUARD_ONLY',
+            'candidate_support_tile': 'POST_GUARD_ONLY',
+            'current_manager_direction_support': 'POST_GUARD_ONLY',
+            'ai_regime_candidate_flag': 'POST_GUARD_ONLY',
+            'broker_recovery_candidate_match': 'POST_GUARD_ONLY',
+            'raw_candidate_research': 'RETAINED_MODEL_ONLY',
+        },
+        'broker_write_authority': False,
+        'time_utc': now_utc_iso(),
+    }
+
+
+@app.get('/broker/metals-demo/xag-candidate-guard')
+def metals_xag_candidate_guard_status_route() -> Dict[str, Any]:
+    return metals_xag_candidate_guard_status()
+
+
 def update_xag_guard_counterfactual_outcomes(raw_signal_id: int) -> None:
     """
     Research-only outcome capture for XAG candidates that reached this guard.
@@ -24061,11 +24226,36 @@ def _metals_demo_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
     if fixed_r is None and len(path)>=METALS_DEMO_FIXED_HOLD_CANDLES:
         fixed_price=safe_float(path[METALS_DEMO_FIXED_HOLD_CANDLES-1].get("exec_close")); fixed_r=_metals_demo_r_from_price(side,entry,fixed_price,sl)
     raw=_raw_signal_json(latest) if latest else {}
+    selected_model={}
+    effective_candidate={}
+    if latest:
+        with get_conn() as _candidate_conn:
+            selected_model=metals_demo_candidate_for_row(raw,latest)
+            effective_candidate=metals_demo_production_candidate_for_row(
+                _candidate_conn, latest, selected_model
+            )
     if side=="long":
-        c=cleaned_metal_long_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate")); reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
+        c=cleaned_metal_long_demo_candidate(raw,latest) if latest else {}
+        support=bool(
+            effective_candidate.get("production_candidate")
+            and _metals_demo_side(effective_candidate.get("side"))=="long"
+        )
+        reversal=bool(_raw_bool_value(raw.get("d_bear")) or (not _raw_bool_value(raw.get("exec_close_gt_ema20")) and not _raw_bool_value(raw.get("ctx_rsi_up"))))
     else:
-        c=cleaned_metal_short_demo_candidate(raw,latest) if latest else {}; support=bool(c.get("demo_candidate") or int(c.get("short_watch") or 0)==1); reversal=bool((_raw_bool_value(latest["forward_test_candidate"]) if latest else False) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
-    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c,"path_anchor_signal_id":path_anchor_id,"broker_open_time_utc":broker_open_time,"recovery_source":safe_str(link.get("recovery_source")),"path_anchor_is_legacy_approximation":1 if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id>0 else 0,"path_anchor_mode":"BROKER_OPEN_TIME_FORWARD" if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id<=0 else "SIGNAL_ID"}
+        c=cleaned_metal_short_demo_candidate(raw,latest) if latest else {}
+        if bool(selected_model.get("demo_candidate")):
+            # A guard-blocked XAG entry candidate must not sneak back in via
+            # short_watch and suppress a legitimate Current-Manager soft exit.
+            support=bool(
+                effective_candidate.get("production_candidate")
+                and _metals_demo_side(effective_candidate.get("side"))=="short"
+            )
+        else:
+            # Preserve existing watch-only soft support when there is no actual
+            # entry candidate being accepted/rejected by the guard.
+            support=bool(int(c.get("short_watch") or 0)==1)
+        reversal=bool((_raw_bool_value(latest["forward_test_candidate"]) if latest else False) or "obvious_rebound_or_bullish_reclaim" in safe_str(c.get("demo_blockers")))
+    return {"ok":True,"asset":asset,"side":side,"entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"mfe_price":mfe_price,"mae_price":mae_price,"high_water_r":hwm,"giveback_pct":giveback,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None,"direction_support":support,"adverse_reversal":reversal,"latest_candidate":c,"latest_model_selected_candidate":selected_model,"latest_production_candidate":effective_candidate,"path_anchor_signal_id":path_anchor_id,"broker_open_time_utc":broker_open_time,"recovery_source":safe_str(link.get("recovery_source")),"path_anchor_is_legacy_approximation":1 if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id>0 else 0,"path_anchor_mode":"BROKER_OPEN_TIME_FORWARD" if safe_str(link.get("recovery_source")).upper()=="BROKER_LEGACY_ADOPTION" and path_anchor_id<=0 else "SIGNAL_ID"}
 
 def _metals_demo_phase(hold: int) -> str:
     if hold<METALS_DEMO_MANAGER_MIN_HOLD_CANDLES: return "PRE_48_MIN_HOLD"
@@ -25880,11 +26070,15 @@ def _metals_signal_match_for_broker_trade(
 
         try:
             candidate = metals_demo_candidate_for_row(_raw_signal_json(row), row)
+            with get_conn() as _candidate_conn:
+                production_candidate = metals_demo_production_candidate_for_row(
+                    _candidate_conn, row, candidate
+                )
         except Exception:
             continue
-        if not candidate.get("demo_candidate"):
+        if not production_candidate.get("production_candidate"):
             continue
-        candidate_side = _metals_demo_side(candidate.get("demo_side"))
+        candidate_side = _metals_demo_side(production_candidate.get("side"))
         if candidate_side != side:
             continue
 
@@ -25906,6 +26100,7 @@ def _metals_signal_match_for_broker_trade(
         matches.append({
             "row": row,
             "candidate": candidate,
+            "production_candidate": production_candidate,
             "delta_minutes": delta_min,
             "price_diff_pct": diff_pct,
         })
@@ -27235,8 +27430,30 @@ def metals_demo_summary() -> Dict[str, Any]:
         for asset in ["XAUUSD","XAGUSD"]:
             row=_metals_demo_latest_signal_row(conn,asset)
             if row:
-                raw=_raw_signal_json(row); latest[asset]={"raw_signal_id":row["id"],"signal_time":row["timestamp_readable"],"price":row["exec_close"],"long":cleaned_metal_long_demo_candidate(raw,row),"short_v2":cleaned_metal_short_demo_candidate(raw,row),"selected_demo_candidate":metals_demo_candidate_for_row(raw,row)}
-            else: latest[asset]={"selected_demo_candidate":{"demo_state":"NO_DATA"}}
+                raw=_raw_signal_json(row)
+                model_selected=metals_demo_candidate_for_row(raw,row)
+                effective=metals_demo_production_candidate_for_row(conn,row,model_selected)
+                production_selected=dict(model_selected)
+                production_selected["demo_candidate"]=1 if effective.get("production_candidate") else 0
+                production_selected["demo_state"]=safe_str(effective.get("production_state"))
+                production_selected["demo_reason"]=safe_str(effective.get("reason"))
+                if model_selected.get("demo_candidate") and not effective.get("production_candidate"):
+                    production_selected["demo_blockers"]=safe_str(effective.get("reason"))
+                    production_selected["demo_side"]=""
+                latest[asset]={
+                    "raw_signal_id":row["id"],"signal_time":row["timestamp_readable"],"price":row["exec_close"],
+                    "long":cleaned_metal_long_demo_candidate(raw,row),
+                    "short_v2":cleaned_metal_short_demo_candidate(raw,row),
+                    "model_selected_candidate":model_selected,
+                    "production_candidate":effective,
+                    "selected_demo_candidate":production_selected,
+                }
+            else:
+                latest[asset]={
+                    "model_selected_candidate":{"demo_state":"NO_DATA"},
+                    "production_candidate":{"production_candidate":False,"production_state":"NO_DATA"},
+                    "selected_demo_candidate":{"demo_candidate":0,"demo_state":"NO_DATA"},
+                }
         links=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links ORDER BY id DESC LIMIT 1000").fetchall()]; audits=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_execution_audit ORDER BY id DESC LIMIT 100").fetchall()]; reviews=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_manager_reviews ORDER BY id DESC LIMIT 100").fetchall()]; baskets=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_basket_snapshots ORDER BY id DESC LIMIT 50").fetchall()]; queue_rows=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_action_queue ORDER BY id DESC LIMIT 100").fetchall()]
     for asset in ["XAUUSD","XAGUSD"]:
         for side in ["long","short"]:
@@ -27267,11 +27484,14 @@ def build_metals_demo_dashboard_html() -> str:
     cfg=snap["config"]; state="ENABLED" if cfg.get("orders_allowed") else "DISABLED / PREVIEW"; lane_class="status_green" if cfg.get("orders_allowed") else "status_amber"
     sig=""
     for asset in ["XAUUSD","XAGUSD"]:
-        item=snap["latest"].get(asset,{}); lc=item.get("long") or {}; sc=item.get("short_v2") or {}; sel=item.get("selected_demo_candidate") or {}; sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td><strong>{esc(sel.get('demo_side') or '-')}</strong></td></tr>"
+        item=snap["latest"].get(asset,{})
+        lc=item.get("long") or {}; sc=item.get("short_v2") or {}
+        model=item.get("model_selected_candidate") or {}; prod=item.get("production_candidate") or {}
+        sig+=f"<tr><td><strong>{esc(asset)}</strong></td><td>{esc(item.get('signal_time'))}</td><td>{esc(lc.get('demo_state'))}</td><td>{esc(lc.get('demo_blockers'))}</td><td>{esc(sc.get('demo_state'))}</td><td>{esc(sc.get('demo_blockers'))}</td><td>{'TRUE' if model.get('demo_candidate') else 'FALSE'}</td><td><strong>{'TRUE' if prod.get('production_candidate') else 'FALSE'}</strong></td><td>{esc(prod.get('production_state') or '-')}</td></tr>"
     opens=""
     for r in snap.get("open_trades",[]): opens+=f"<tr><td>{esc(r.get('asset'))}</td><td>{esc(r.get('side'))}</td><td>{esc(_metals_demo_link_exit_policy(r))}</td><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{_fmt_metric(r.get('manager_current_r'),'R',2)}</td><td>{_fmt_metric(r.get('manager_high_water_r'),'R',2)}</td><td>{_fmt_metric(r.get('fixed_48h_r'),'R',2)}</td><td>{esc(r.get('manager_last_decision'))}</td><td>{esc(r.get('current_stop_price') or r.get('stop_price'))}</td><td>{money(r.get('last_known_unrealized_pl'),'GBP')}</td></tr>"
     opens=opens or '<tr><td colspan="11">No open metals demo trades.</td></tr>'
-    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum. NEW XAU LONG trades use active MFE50; existing XAU trades, XAG LONG and both SHORT lanes retain the Current Manager. 72/96/120h remain Current-Manager protection milestones; Fixed48 remains a benchmark. Forward exit shadows have zero execution authority.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Selected</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Policy</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
+    return f"""<details class='priority dashboard-group' open><summary>Metals Demo Basket Manager — {esc(METALS_DEMO_LABEL)}</summary><div class='section-note warn'><strong>{esc(METALS_DEMO_LABEL)}</strong>. Long + short practice simulation only. Live NAS100/US500 lane remains isolated.</div><div class='section-note small'><strong>Management:</strong> 48h minimum. NEW XAU LONG trades use active MFE50; existing XAU trades, XAG LONG and both SHORT lanes retain the Current Manager. 72/96/120h remain Current-Manager protection milestones; Fixed48 remains a benchmark. Forward exit shadows have zero execution authority.</div><div class='cards three'><div class='card'><div class='label'>Lane state</div><div class='value {lane_class}'>{esc(state)}</div><div class='small'>Manager: {'ON' if cfg.get('basket_manager_enabled') else 'OFF'}</div></div><div class='card'><div class='label'>Open demo trades</div><div class='value'>{esc(snap.get('open_trade_count'))}</div><div class='small'>Long {esc(snap.get('open_long_count'))} | Short {esc(snap.get('open_short_count'))}</div></div><div class='card'><div class='label'>Actual demo P&amp;L (£)</div><div class='value {pnl_class(snap.get('actual_total_pnl'))}'>{money(snap.get('actual_total_pnl'),'GBP')}</div><div class='small'>GBP account verified: {esc(cfg.get('gbp_account_verified'))} | 48h baseline {esc(snap.get('fixed_48h_baseline_rows'))} rows / {_fmt_metric(snap.get('fixed_48h_baseline_total_R'),'R',2)}</div></div></div><h3>Latest Long / Short Signal State</h3><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Latest</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Model Candidate</th><th>Production Accepted</th><th>Production State</th></tr></thead><tbody>{sig}</tbody></table></div><details open><summary>Open Metals Demo Trades — Hourly Manager</summary><div class='table-scroll'><table><thead><tr><th>Asset</th><th>Side</th><th>Policy</th><th>Broker trade</th><th>Age h</th><th>Current R</th><th>HWM R</th><th>48h baseline</th><th>Decision</th><th>SL</th><th>P&amp;L</th></tr></thead><tbody>{opens}</tbody></table></div></details><div class='section-note small'>Previews: <a href='/broker/metals-demo/preview/XAUUSD?side=long'>XAU long</a> / <a href='/broker/metals-demo/preview/XAUUSD?side=short'>XAU short</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=long'>XAG long</a> / <a href='/broker/metals-demo/preview/XAGUSD?side=short'>XAG short</a> | exports: <a href='/export/metals-demo-manager-reviews.csv'>manager reviews</a> <a href='/export/metals-demo-basket-snapshots.csv'>basket snapshots</a> <a href='/export/metals-demo-action-queue.csv'>close queue</a> <a href='/export/metals-demo-summary.json'>summary</a></div></details>"""
 
 
 @app.get("/metals-short-shadow-v2")
@@ -33698,9 +33918,10 @@ def build_ai_regime_observer_html():
 def _metals_aiobs_candidate(conn, row):
     raw=_raw_signal_json(row)
     selected=metals_demo_candidate_for_row(raw,row)
-    candidate=int(selected.get("demo_candidate") or 0)==1
-    side=safe_str(selected.get("demo_side")).lower()
-    return candidate,side,raw,selected
+    effective=metals_demo_production_candidate_for_row(conn,row,selected)
+    candidate=bool(effective.get("production_candidate"))
+    side=safe_str(effective.get("side")).lower() if candidate else ""
+    return candidate,side,raw,{**selected,"production_candidate_state":effective}
 
 
 def _metals_aiobs_state(conn, raw_signal_id):
@@ -36604,16 +36825,31 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
         signal_coverage.get("status") or "UNKNOWN"
     ).upper()
 
-    # Candidate Support is current-candle only. A stale/missing asset cannot
-    # contribute to the current headline count.
+    # Candidate Support is current-candle AND post-guard only. A raw XAG
+    # model candidate blocked by the XAU<=6h rule is intentionally excluded.
     candidate_count = sum(
         1
         for a in ("XAUUSD", "XAGUSD")
         if a in received_pairs
-        and safe_str(
-            ((latest.get(a) or {}).get("selected_demo_candidate") or {}).get("demo_state")
-        ).upper() in ("CANDIDATE", "ACCEPTED", "TRUE")
+        and bool(
+            ((latest.get(a) or {}).get("production_candidate") or {}).get(
+                "production_candidate"
+            )
+        )
     )
+    xag_prod = ((latest.get("XAGUSD") or {}).get("production_candidate") or {})
+    xag_model = ((latest.get("XAGUSD") or {}).get("model_selected_candidate") or {})
+    xag_blocked = bool(
+        "XAGUSD" in received_pairs
+        and xag_model.get("demo_candidate")
+        and not xag_prod.get("production_candidate")
+    )
+    xag_candidate_note = ""
+    if xag_blocked:
+        xag_candidate_note = (
+            "XAG model candidate BLOCKED · "
+            + safe_str(xag_prod.get("reason") or "waiting for XAU confirmation")
+        )
 
     return {
         "status": "ok",
@@ -36673,6 +36909,10 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "received_assets": signal_count,
             "expected_assets": 2,
             "candidate_assets": candidate_count,
+            "candidate_assets_semantics": "PRODUCTION_ACCEPTED_POST_GUARD",
+            "xag_model_candidate_blocked": xag_blocked,
+            "xag_candidate_note": xag_candidate_note,
+            "xag_production_candidate": xag_prod,
             "coverage_status": signal_health_status,
             "coverage_candle": safe_str(latest_cov.get("candle_time")),
             "coverage_candle_display": safe_str(
@@ -36722,39 +36962,29 @@ def _metals_std_section_wrap(body: str) -> str:
 
 def _metals_std_signal_state_html() -> str:
     snap = metals_demo_summary()
-    rows = ""
-    for asset in ("XAUUSD", "XAGUSD"):
-        item = (snap.get("latest") or {}).get(asset) or {}
-        lc = item.get("long") or {}
-        sc = item.get("short_v2") or {}
-        sel = item.get("selected_demo_candidate") or {}
-        rows += f"""
-        <tr>
-          <td><strong>{esc(asset)}</strong></td>
-          <td>{esc(display_candle_time(item.get('signal_time')))}</td>
-          <td>{esc(item.get('price'))}</td>
-          <td>{esc(lc.get('demo_state') or '-')}</td>
-          <td>{esc(lc.get('demo_blockers') or '-')}</td>
-          <td>{esc(sc.get('demo_state') or '-')}</td>
-          <td>{esc(sc.get('demo_blockers') or '-')}</td>
-          <td><strong>{esc(sel.get('demo_side') or '-')}</strong></td>
-        </tr>
-        """
-    return f"""
-      <div class="section-note">
-        XAU/XAG signal models remain asset-specific. This section standardises presentation only.
-      </div>
-      <div class="table-scroll">
-        <table>
-          <thead><tr>
-            <th>Asset</th><th>Latest</th><th>Price</th>
-            <th>Long</th><th>Long blockers</th>
-            <th>Short v2</th><th>Short blockers</th><th>Selected</th>
-          </tr></thead>
-          <tbody>{rows or '<tr><td colspan="8">Waiting for signals.</td></tr>'}</tbody>
-        </table>
-      </div>
-    """
+    rows = ''
+    warning = ''
+    for asset in ('XAUUSD','XAGUSD'):
+        item=(snap.get('latest') or {}).get(asset) or {}
+        lc=item.get('long') or {}; sc=item.get('short_v2') or {}
+        model=item.get('model_selected_candidate') or {}; prod=item.get('production_candidate') or {}
+        model_cand=bool(model.get('demo_candidate')); accepted=bool(prod.get('production_candidate'))
+        state=safe_str(prod.get('production_state') or '-'); reason=safe_str(prod.get('reason') or '-')
+        guard_text='—'
+        if asset=='XAGUSD' and model_cand:
+            g=prod.get('guard') or {}
+            count=int(safe_float(g.get('campaign_entry_count_before')) or prod.get('campaign_entry_count_before') or 0)
+            cap=int(safe_float(g.get('solo_cap')) or prod.get('solo_cap') or METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP)
+            look=float(safe_float(g.get('lookback_hours')) or prod.get('lookback_hours') or METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS)
+            guard_text=f"{safe_str(g.get('decision') or state)} · campaign {count}/{cap} · XAU≤{look:g}h"
+            if not accepted:
+                warning=(
+                    '<div class="section-note warn"><strong>XAG MODEL CANDIDATE IS CURRENTLY BLOCKED FROM PRODUCTION.</strong> '
+                    + esc(reason)
+                    + '<br>It remains visible as model/research evidence, but it is <strong>not counted</strong> as Candidate Support, does not open a trade, does not suppress a Current-Manager soft exit, does not count as an AI production candidate and cannot be used as a broker-recovery candidate match.</div>'
+                )
+        rows += f'''<tr><td><strong>{esc(asset)}</strong></td><td>{esc(display_candle_time(item.get('signal_time')))}</td><td>{esc(item.get('price'))}</td><td>{esc(lc.get('demo_state') or '-')}</td><td>{esc(lc.get('demo_blockers') or '-')}</td><td>{esc(sc.get('demo_state') or '-')}</td><td>{esc(sc.get('demo_blockers') or '-')}</td><td class="{'warn' if model_cand and not accepted else 'pos' if model_cand else 'flat'}"><strong>{'TRUE' if model_cand else 'FALSE'}</strong></td><td class="{'pos' if accepted else 'neg'}"><strong>{'TRUE' if accepted else 'FALSE'}</strong></td><td>{esc(safe_str(prod.get('side') or model.get('demo_side') or '-').upper())}</td><td>{esc(guard_text)}</td><td>{esc(state)}</td></tr>'''
+    return f'''{warning}<div class="section-note"><strong>Production candidate semantics:</strong> raw/model candidate and production-accepted candidate are separate. XAG only counts after its campaign/XAU-confirmation guard allows it.</div><div class="table-scroll"><table><thead><tr><th>Asset</th><th>Latest</th><th>Price</th><th>Long</th><th>Long blockers</th><th>Short v2</th><th>Short blockers</th><th>Model Candidate</th><th>Production Accepted</th><th>Side</th><th>XAG Guard</th><th>Production State</th></tr></thead><tbody>{rows or '<tr><td colspan="12">Waiting for signals.</td></tr>'}</tbody></table></div><div class="section-note small"><a href="/broker/metals-demo/xag-candidate-guard">XAG candidate guard JSON</a> · <a href="/export/metals-demo-xag-confirmation-guard.csv">XAG guard CSV</a></div>'''
 
 
 def _metals_std_basket_manager_html() -> str:
@@ -37392,16 +37622,38 @@ def _metals_latest_30_signals_html(limit: int = 30) -> str:
     init_db(); limit=max(1,min(int(limit or 30),100))
     with get_conn() as conn:
         rows=[dict(r) for r in conn.execute("SELECT * FROM raw_signals WHERE UPPER(pair) IN ('XAUUSD','XAGUSD','XAU','XAG') ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+        effective_by_id={}
+        selected_by_id={}
+        for _r in rows:
+            _raw=_raw_signal_json(_r)
+            try:
+                _selected=metals_demo_candidate_for_row(_raw,_r)
+                _effective=metals_demo_production_candidate_for_row(conn,_r,_selected)
+            except Exception as exc:
+                _selected={'demo_candidate':0,'demo_side':'','demo_state':'ERROR','demo_blockers':str(exc)}
+                _effective={'model_candidate':False,'production_candidate':False,'production_state':'ERROR','reason':str(exc),'guard':{}}
+            selected_by_id[int(_r['id'])]=_selected
+            effective_by_id[int(_r['id'])]=_effective
     body=[]
     for r in rows:
         raw=_raw_signal_json(r)
-        try: selected=metals_demo_candidate_for_row(raw,r)
-        except Exception as exc: selected={'demo_candidate':0,'demo_side':'','demo_state':'ERROR','demo_blockers':str(exc)}
+        selected=selected_by_id.get(int(r['id'])) or {}
+        effective=effective_by_id.get(int(r['id'])) or {}
         asset=_project_scope_pair(r.get('pair')); lc=bool(raw.get('metal_long_candidate')) if 'metal_long_candidate' in raw else is_true(r.get('forward_test_candidate')); sc=bool(raw.get('metal_short_candidate')) if 'metal_short_candidate' in raw else False
-        contexts=raw.get('contexts') or []; ctx8=next((x for x in contexts if isinstance(x,dict) and safe_str(x.get('context_tf')).upper()=='8H'),{}); regime=safe_str(ctx8.get('ctx_trend_state') or raw.get('ctx_trend_state') or '-'); atr=safe_float(ctx8.get('ctx_atr_pct') or raw.get('ctx_atr_pct')); cand=bool(int(safe_float(selected.get('demo_candidate')) or 0)); blockers=selected.get('demo_blockers'); blockers='; '.join(str(x) for x in blockers) if isinstance(blockers,(list,tuple)) else safe_str(blockers or '-')
-        body.append(f'''<tr><td>{esc(r.get('id'))}</td><td>{esc(display_candle_time(r.get('timestamp_readable') or r.get('timestamp')))}</td><td><strong>{esc(asset)}</strong></td><td>{'TRUE' if lc else 'FALSE'}</td><td>{'TRUE' if sc else 'FALSE'}</td><td class="{'pos' if cand else 'neg'}"><strong>{'TRUE' if cand else 'FALSE'}</strong></td><td>{esc(safe_str(selected.get('demo_side') or '-').upper())}</td><td>{esc(regime)}</td><td>{'—' if atr is None else format(atr,'.3f')+'%'}</td><td>{esc(selected.get('demo_state') or '-')}</td><td>{esc(blockers)}</td><td>{_metals_fmt(r.get('exec_close'),3)}</td><td>{esc(r.get('signal_id'))}</td><td>{esc(r.get('received_at_utc'))}</td></tr>''')
+        contexts=raw.get('contexts') or []; ctx8=next((x for x in contexts if isinstance(x,dict) and safe_str(x.get('context_tf')).upper()=='8H'),{}); regime=safe_str(ctx8.get('ctx_trend_state') or raw.get('ctx_trend_state') or '-'); atr=safe_float(ctx8.get('ctx_atr_pct') or raw.get('ctx_atr_pct'))
+        model_cand=bool(effective.get('model_candidate')); prod_cand=bool(effective.get('production_candidate'))
+        state=safe_str(effective.get('production_state') or selected.get('demo_state') or '-')
+        blockers=safe_str(effective.get('reason') or selected.get('demo_blockers') or '-')
+        guard_txt='—'
+        if asset=='XAGUSD' and model_cand:
+            _g=effective.get('guard') or {}
+            _count=int(safe_float(_g.get('campaign_entry_count_before')) or effective.get('campaign_entry_count_before') or 0)
+            _cap=int(safe_float(_g.get('solo_cap')) or effective.get('solo_cap') or METALS_DEMO_XAG_SOLO_CAMPAIGN_CAP)
+            _look=float(safe_float(_g.get('lookback_hours')) or effective.get('lookback_hours') or METALS_DEMO_XAU_CONFIRMATION_LOOKBACK_HOURS)
+            guard_txt=f"{safe_str(_g.get('decision') or effective.get('guard_decision') or state)} · campaign {_count}/{_cap} · XAU≤{_look:g}h"
+        body.append(f'''<tr><td>{esc(r.get('id'))}</td><td>{esc(display_candle_time(r.get('timestamp_readable') or r.get('timestamp')))}</td><td><strong>{esc(asset)}</strong></td><td>{'TRUE' if lc else 'FALSE'}</td><td>{'TRUE' if sc else 'FALSE'}</td><td class="{'warn' if model_cand and not prod_cand else 'pos' if model_cand else 'flat'}"><strong>{'TRUE' if model_cand else 'FALSE'}</strong></td><td class="{'pos' if prod_cand else 'neg'}"><strong>{'TRUE' if prod_cand else 'FALSE'}</strong></td><td>{esc(safe_str(effective.get('side') or selected.get('demo_side') or '-').upper())}</td><td>{esc(guard_txt)}</td><td>{esc(regime)}</td><td>{'—' if atr is None else format(atr,'.3f')+'%'}</td><td>{esc(state)}</td><td>{esc(blockers)}</td><td>{_metals_fmt(r.get('exec_close'),3)}</td><td>{esc(r.get('signal_id'))}</td><td>{esc(r.get('received_at_utc'))}</td></tr>''')
     if not body: return '<div class="section-note">No Metals signals stored yet.</div>'
-    return f'''<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> XAU/XAG long, short and final selected candidate state from the current deterministic selector.</div><div class="table-scroll"><table><thead><tr><th>ID</th><th>Candle</th><th>Asset</th><th>Long</th><th>Short</th><th>Selected Candidate</th><th>Side</th><th>8H Regime</th><th>8H ATR</th><th>State</th><th>Blockers</th><th>Price</th><th>Signal ID</th><th>Received UTC</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+    return f'''<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> Model Candidate is the deterministic signal before the XAG peer guard. Production Accepted is the only candidate state allowed to count toward execution/support. Guard-blocked XAG rows remain visible for research but count as FALSE for production.</div><div class="table-scroll"><table><thead><tr><th>ID</th><th>Candle</th><th>Asset</th><th>Long</th><th>Short</th><th>Model Candidate</th><th>Production Accepted</th><th>Side</th><th>XAG Guard</th><th>8H Regime</th><th>8H ATR</th><th>Production State</th><th>Reason / Blocker</th><th>Price</th><th>Signal ID</th><th>Received UTC</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
 
 def _metals_recently_closed_trades_html(limit: int = 30) -> str:
     init_db(); limit=max(1,min(int(limit or 30),100))
@@ -38041,7 +38293,9 @@ async function loadTop(force=false){{
   const signalDetail=Number(g.received_assets||0)===2
       ? `Missing none · ${{eh(g.coverage_candle_display||'')}}`
       : `${{missing?'Missing '+eh(missing):'Incomplete current candle'}} · ${{eh(g.coverage_candle_display||'')}}`;
-  const candidateDetail=`Current candle only${{missing?' · '+eh(missing)+' missing':''}}`;
+  const candidateDetail=g.xag_model_candidate_blocked
+      ? eh(g.xag_candidate_note||'XAG model candidate blocked by production guard')
+      : `Production-accepted only · current candle${{missing?' · '+eh(missing)+' missing':''}}`;
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Account-wide UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
@@ -38119,6 +38373,12 @@ def metals_standard_status() -> Dict[str, Any]:
             "forced_max_hold_candles": METALS_DEMO_MANAGER_MAX_HOLD_CANDLES,
             "family_overlay": "advisory",
             "manual_economic_basket_cycle_reset": True,
+            "xag_candidate_semantics": "MODEL_CANDIDATE_SEPARATE_FROM_POST_GUARD_PRODUCTION_ACCEPTED",
+            "xag_blocked_candidate_counts_toward_entry": False,
+            "xag_blocked_candidate_counts_toward_candidate_support": False,
+            "xag_blocked_candidate_counts_toward_manager_direction_support": False,
+            "xag_blocked_candidate_counts_toward_ai_candidate": False,
+            "xag_blocked_candidate_counts_toward_broker_recovery_match": False,
             "fixed_48h_control": True,
             "persistent_close_queue": True,
         },
