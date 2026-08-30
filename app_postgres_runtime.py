@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.25"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.24 / 2026-08-28"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAG Guard Integrity + Manual Basket Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.26"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.25 / 2026-08-30"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Focused HWM Cycle Integrity + XAG Guard + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -35370,7 +35370,7 @@ async def broker_oanda_test_update_managed_stops(request: Request) -> Dict[str, 
 
 
 # ============================================================
-# v1.2.0 FOCUSED METALS RESEARCH — master v10.1.35 parity
+# v1.6.26: focused high-water cycle integrity repair. Durable economic/harvest\n# cycle ids now anchor focused HWM research; old-trade closures can no longer\n# manufacture fake new cycles that inherit the prior basket HWM.\n# v1.2.0 FOCUSED METALS RESEARCH — master v10.1.35 parity
 # Research-only. Never consumed by execution/management.
 # ============================================================
 METALS_FOCUSED_THRESHOLDS = [40,60,75,100,150,200,300,400,500,600]
@@ -35421,17 +35421,143 @@ def _mf_eff_state(x):
     return "CLEAN_TREND"
 
 def _mf_family_state():
+    """Cycle-safe focused-research family state.
+
+    v1.6.26 research-integrity fix:
+    - use the durable Metals harvest/economic cycle id when available;
+    - never derive a fresh research cycle merely because the oldest open trade
+      closed (the old MIN(created_at_utc) approach caused one real basket to be
+      split into multiple fake cycle ids);
+    - maintain a cycle-local focused HWM and seed it from the broker-authoritative
+      runtime HWM only when both belong to the same durable harvest cycle;
+    - reset the focused HWM only when the durable economic cycle changes or the
+      basket is genuinely flat.
+
+    Research-only. No broker, entry, exit, stop, sizing, harvest or manager rule
+    consumes these runtime keys.
+    """
     with get_conn() as conn:
-        s=conn.execute("SELECT * FROM metals_demo_basket_snapshots WHERE basket_key='METALS_BASKET' ORDER BY id DESC LIMIT 1").fetchone()
-        st=conn.execute("""SELECT MIN(created_at_utc) AS t FROM metals_demo_trade_links
-                           WHERE UPPER(COALESCE(status,'')) IN ('OPEN','LINKED','PENDING')""").fetchone()
-    d=dict(s) if s else {}
-    n=int(safe_float(d.get("open_count")) or 0); start=safe_str(st["t"] if st else "")
-    return {"cycle_id":("METALS_"+start) if n>0 and start else "","open_count":n,
-            "r":safe_float(d.get("basket_r")) or 0.0,"hwm":safe_float(d.get("high_water_r")) or 0.0,
-            "giveback":safe_float(d.get("giveback_pct")) or 0.0,
-            "status":safe_str(d.get("state") or ("FLAT" if n<=0 else "GREEN")).upper(),
-            "action":safe_str(d.get("action") or ""),"banked_r":0.0}
+        s = conn.execute(
+            "SELECT * FROM metals_demo_basket_snapshots "
+            "WHERE basket_key='METALS_BASKET' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        open_stats = conn.execute("""
+            SELECT COUNT(*) AS c, MIN(id) AS first_id, MIN(created_at_utc) AS t
+            FROM metals_demo_trade_links
+            WHERE UPPER(COALESCE(status,'')) IN ('OPEN','LINKED','PENDING')
+        """).fetchone()
+
+        d = dict(s) if s else {}
+        snapshot_open = int(safe_float(d.get("open_count")) or 0)
+        linked_open = int(safe_float(open_stats["c"] if open_stats else 0) or 0)
+        broker_hwm_open = int(
+            safe_float(_metals_runtime_get(conn, "broker_hwm_open_count", "0")) or 0
+        )
+        n = max(snapshot_open, linked_open, broker_hwm_open)
+
+        current_r = float(safe_float(d.get("basket_r")) or 0.0)
+        status = safe_str(
+            d.get("state") or ("FLAT" if n <= 0 else "GREEN")
+        ).upper()
+        action = safe_str(d.get("action") or "")
+
+        # The harvest cycle is the durable economic family cycle and survives
+        # individual trade closures. It also changes explicitly on a manual
+        # economic-cycle reset, which is exactly when focused research should reset.
+        harvest_cycle = _metals_runtime_get(conn, "metals_harvest_cycle_id", "")
+        harvest_started = _metals_runtime_get(
+            conn, "metals_harvest_cycle_started_at", ""
+        )
+        focused_cycle = _metals_runtime_get(
+            conn, "metals_focused_research_cycle_id", ""
+        )
+
+        if n <= 0:
+            _metals_runtime_set(conn, "metals_focused_research_cycle_id", "")
+            _metals_runtime_set(conn, "metals_focused_research_cycle_started_at", "")
+            _metals_runtime_set(conn, "metals_focused_research_hwm_r", 0.0)
+            conn.commit()
+            return {
+                "cycle_id": "",
+                "open_count": 0,
+                "r": 0.0,
+                "hwm": 0.0,
+                "giveback": 0.0,
+                "status": "FLAT",
+                "action": action,
+                "banked_r": 0.0,
+                "cycle_source": "flat_reset",
+            }
+
+        if harvest_cycle:
+            cycle_id = harvest_cycle
+            cycle_start = harvest_started
+            cycle_source = "durable_harvest_cycle"
+        elif focused_cycle:
+            # Fallback is persisted specifically so closing the oldest trade can
+            # never manufacture another cycle id.
+            cycle_id = focused_cycle
+            cycle_start = _metals_runtime_get(
+                conn, "metals_focused_research_cycle_started_at", ""
+            )
+            cycle_source = "persisted_focused_cycle_fallback"
+        else:
+            first_id = int(
+                safe_float(open_stats["first_id"] if open_stats else 0) or 0
+            )
+            start = safe_str(open_stats["t"] if open_stats else "")
+            compact = re.sub(r"[^0-9A-Za-z]+", "", start)[-20:] or str(first_id)
+            cycle_id = f"METALS_RESEARCH_{first_id}_{compact}"
+            cycle_start = start
+            cycle_source = "new_focused_cycle_fallback"
+
+        previous_cycle = focused_cycle
+        stored_hwm = float(
+            safe_float(
+                _metals_runtime_get(conn, "metals_focused_research_hwm_r", "0")
+            )
+            or 0.0
+        )
+
+        if previous_cycle != cycle_id:
+            # New economic cycle: do not inherit any prior cycle HWM.
+            hwm = max(0.0, current_r)
+        else:
+            hwm = max(stored_hwm, current_r, 0.0)
+
+        # Production broker HWM is the preferred seed only when the same durable
+        # harvest cycle is active. This keeps focused research aligned with the
+        # correct production HWM without allowing a prior cycle to leak forward.
+        if harvest_cycle and cycle_id == harvest_cycle and broker_hwm_open > 0:
+            broker_hwm_r = float(
+                safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0
+            )
+            hwm = max(hwm, broker_hwm_r)
+
+        _metals_runtime_set(conn, "metals_focused_research_cycle_id", cycle_id)
+        _metals_runtime_set(
+            conn, "metals_focused_research_cycle_started_at", cycle_start
+        )
+        _metals_runtime_set(conn, "metals_focused_research_hwm_r", hwm)
+        conn.commit()
+
+    giveback = (
+        max(0.0, hwm - current_r) / hwm * 100.0
+        if hwm > 0
+        else 0.0
+    )
+    return {
+        "cycle_id": cycle_id,
+        "open_count": n,
+        "r": current_r,
+        "hwm": hwm,
+        "giveback": giveback,
+        "status": status,
+        "action": action,
+        "banked_r": 0.0,
+        "cycle_source": cycle_source,
+    }
+
 
 def _mf_elapsed(conn, raw_id):
     row=conn.execute("""SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals
@@ -35481,7 +35607,15 @@ def record_metals_focused_research(raw_signal_id):
             for table in ("metals_focused_recovery","metals_focused_highwater"):
                 pending=conn.execute(f"SELECT * FROM {table} WHERE COALESCE(completed_48,0)=0 ORDER BY id ASC LIMIT 500").fetchall()
                 for pr in pending:
-                    pd=dict(pr);tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_mf_elapsed(conn,tid);sets=[];vals=[]
+                    pd=dict(pr)
+                    # Never write a later economic cycle's basket R into an
+                    # earlier cycle's research outcome. Flat is allowed to
+                    # complete an old cycle at 0R; a different active cycle is not.
+                    trigger_cycle=safe_str(pd.get("cycle_id"))
+                    current_cycle=safe_str(st.get("cycle_id"))
+                    if trigger_cycle and current_cycle and trigger_cycle != current_cycle:
+                        continue
+                    tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_mf_elapsed(conn,tid);sets=[];vals=[]
                     for h in METALS_FOCUSED_HORIZONS:
                         col=f"outcome_{h}_r"
                         if elapsed>=h and safe_float(pd.get(col)) is None:
