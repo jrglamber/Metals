@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.19 XAU LONG MFE50 + Broker-HWM Harvest Ladder + Exit Shadows
-# Cumulative on v1.6.18 XAU LONG MFE50 Active Exit + Exit Challenger Forward Shadows; all prior v1.6.17 reconciliation/recovery/webhook/dashboard/research updates retained
+# VERIFIED BUILD: Metals v1.6.29 Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest
+# Cumulative on user-supplied v1.6.28; all v1.6.27 direction-flip and v1.6.28 live broker-HWM functionality retained; adds broker-authoritative weekly/monthly accounting only.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.28"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.27 / 2026-09-02"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.29"
+METALS_BUILD_BASELINE = "cumulative user-supplied Metals v1.6.28 / 2026-09-02"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -26422,6 +26422,210 @@ def metals_demo_broker_realized_summary() -> Dict[str, Any]:
 
 
 
+# ============================================================
+# v1.6.29 — BROKER-AUTHORITATIVE WEEKLY / MONTHLY ACCOUNTING
+# ============================================================
+# Cash = durable OANDA Metals transaction ledger.
+# R / win-loss = broker-linked closed Metals trades.
+# Harvest is a realised subset and is never double-counted.
+# Realised + current UPL is MTM context, not a true period return.
+
+def _metals_accounting_period_boundaries(now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    now_dt = now_dt or now_utc()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    tz = _zone(DISPLAY_TIMEZONE)
+    local_now = now_dt.astimezone(tz)
+    week_start_local = (local_now - timedelta(days=local_now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    month_start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "timezone": DISPLAY_TIMEZONE,
+        "timezone_label": DISPLAY_TIME_LABEL,
+        "now_local": local_now,
+        "now_utc": now_dt.astimezone(timezone.utc),
+        "week_start_local": week_start_local,
+        "week_start_utc": week_start_local.astimezone(timezone.utc),
+        "month_start_local": month_start_local,
+        "month_start_utc": month_start_local.astimezone(timezone.utc),
+    }
+
+
+def _metals_period_contains(value: Any, start_utc: Optional[datetime], end_utc: Optional[datetime]) -> bool:
+    dt = parse_dt(value)
+    if dt is None:
+        return False
+    if start_utc is not None and dt < start_utc:
+        return False
+    if end_utc is not None and dt >= end_utc:
+        return False
+    return True
+
+
+def _metals_closed_trade_accounting_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    realised_rows = [r for r in rows if safe_float(r.get("realized_pl")) is not None]
+    wins = sum(1 for r in realised_rows if float(safe_float(r.get("realized_pl")) or 0.0) > 0)
+    losses = sum(1 for r in realised_rows if float(safe_float(r.get("realized_pl")) or 0.0) < 0)
+    flats = len(realised_rows) - wins - losses
+    total_r = 0.0
+    r_count = 0
+    local_realized = 0.0
+    for row in realised_rows:
+        pnl = float(safe_float(row.get("realized_pl")) or 0.0)
+        local_realized += pnl
+        risk = safe_float(row.get("estimated_risk_amount")) or safe_float(row.get("requested_risk_amount"))
+        if risk is not None and risk > 0:
+            total_r += pnl / float(risk)
+            r_count += 1
+    return {
+        "closed_trades": len(realised_rows),
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "win_rate_pct": wins / len(realised_rows) * 100.0 if realised_rows else None,
+        "realized_r": total_r,
+        "r_count": r_count,
+        "avg_r": total_r / r_count if r_count else None,
+        "local_realized_pl_gbp": local_realized,
+    }
+
+
+def _metals_accounting_period_summary(
+    label: str,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+    tx_rows: List[Dict[str, Any]],
+    closed_rows: List[Dict[str, Any]],
+    harvest_rows: List[Dict[str, Any]],
+    current_open_upl_gbp: float,
+) -> Dict[str, Any]:
+    tx = [r for r in tx_rows if _metals_period_contains(r.get("transaction_time"), start_utc, end_utc)]
+    closed = [r for r in closed_rows if _metals_period_contains(r.get("closed_at_utc"), start_utc, end_utc)]
+    harvest = [
+        r for r in harvest_rows
+        if _metals_period_contains(r.get("created_at_utc"), start_utc, end_utc)
+        and safe_float(r.get("realized_pl_gbp")) is not None
+        and safe_str(r.get("status")).upper() not in {"FAILED", "ERROR"}
+    ]
+    pl = sum(float(safe_float(r.get("pl_gbp")) or 0.0) for r in tx)
+    financing = sum(float(safe_float(r.get("financing_gbp")) or 0.0) for r in tx)
+    net = sum(float(safe_float(r.get("net_realized_gbp")) or 0.0) for r in tx)
+    harvest_banked = sum(float(safe_float(r.get("realized_pl_gbp")) or 0.0) for r in harvest)
+    trade_stats = _metals_closed_trade_accounting_stats(closed)
+    return {
+        "label": label,
+        "start_utc": start_utc.isoformat() if start_utc else "",
+        "end_utc": end_utc.isoformat() if end_utc else "",
+        "broker_pl_gbp": pl,
+        "financing_gbp": financing,
+        "net_realized_gbp": net,
+        "transaction_rows": len(tx),
+        "harvest_banked_gbp": harvest_banked,
+        "harvest_close_count": len(harvest),
+        "current_open_upl_gbp": float(current_open_upl_gbp or 0.0),
+        "realized_plus_current_upl_gbp": net + float(current_open_upl_gbp or 0.0),
+        **trade_stats,
+    }
+
+
+def _metals_month_start_offset(local_month_start: datetime, offset_months: int) -> datetime:
+    absolute = local_month_start.year * 12 + (local_month_start.month - 1) + int(offset_months)
+    year, month0 = divmod(absolute, 12)
+    return local_month_start.replace(year=year, month=month0 + 1, day=1)
+
+
+def metals_accounting_performance(broker_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    init_db()
+    try:
+        metals_demo_sync_broker_transactions()
+    except Exception:
+        pass
+    broker = broker_snapshot or metals_demo_live_broker_snapshot()
+    open_upl = float(safe_float(broker.get("owned_unrealized_pl")) or 0.0)
+    with get_conn() as conn:
+        tx_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_broker_transactions ORDER BY transaction_time ASC, transaction_id ASC"
+        ).fetchall()]
+        closed_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE UPPER(COALESCE(status,'')) <> 'OPEN' AND closed_at_utc IS NOT NULL AND closed_at_utc != '' ORDER BY closed_at_utc ASC, id ASC"
+        ).fetchall()]
+        harvest_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_harvest_events ORDER BY created_at_utc ASC, id ASC"
+        ).fetchall()]
+
+    bounds = _metals_accounting_period_boundaries()
+    now_end = bounds["now_utc"] + timedelta(microseconds=1)
+    periods = {
+        "week": _metals_accounting_period_summary(
+            "This Week", bounds["week_start_utc"], now_end, tx_rows, closed_rows, harvest_rows, open_upl
+        ),
+        "month": _metals_accounting_period_summary(
+            "This Month", bounds["month_start_utc"], now_end, tx_rows, closed_rows, harvest_rows, open_upl
+        ),
+        "all_time": _metals_accounting_period_summary(
+            "Ledger All-Time", None, now_end, tx_rows, closed_rows, harvest_rows, open_upl
+        ),
+    }
+
+    weekly_history = []
+    current_week = bounds["week_start_local"]
+    for offset in range(7, -1, -1):
+        start_local = current_week - timedelta(days=7 * offset)
+        end_local = start_local + timedelta(days=7)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = min(end_local.astimezone(timezone.utc), now_end)
+        if end_utc <= start_utc:
+            continue
+        row = _metals_accounting_period_summary(
+            start_local.strftime("W/C %d %b %Y"), start_utc, end_utc,
+            tx_rows, closed_rows, harvest_rows, open_upl
+        )
+        row["is_current"] = offset == 0
+        weekly_history.append(row)
+
+    monthly_history = []
+    current_month = bounds["month_start_local"]
+    for offset in range(5, -1, -1):
+        start_local = _metals_month_start_offset(current_month, -offset)
+        end_local = _metals_month_start_offset(start_local, 1)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = min(end_local.astimezone(timezone.utc), now_end)
+        if end_utc <= start_utc:
+            continue
+        row = _metals_accounting_period_summary(
+            start_local.strftime("%B %Y"), start_utc, end_utc,
+            tx_rows, closed_rows, harvest_rows, open_upl
+        )
+        row["is_current"] = offset == 0
+        monthly_history.append(row)
+
+    return {
+        "ok": True,
+        "currency": "GBP",
+        "timezone": DISPLAY_TIMEZONE,
+        "timezone_label": DISPLAY_TIME_LABEL,
+        "week_definition": "Monday 00:00 local time",
+        "month_definition": "calendar month from day 1 00:00 local time",
+        "week_start_local": bounds["week_start_local"].isoformat(),
+        "month_start_local": bounds["month_start_local"].isoformat(),
+        "as_of_local": bounds["now_local"].isoformat(),
+        "current_open_upl_gbp": open_upl,
+        "periods": periods,
+        "weekly_history": weekly_history,
+        "monthly_history": monthly_history,
+        "cash_source": "OANDA Metals transaction ledger",
+        "trade_r_source": "broker-linked closed Metals trades / effective GBP risk",
+        "harvest_note": "Harvest banked is a subset of broker realised and is not added twice.",
+        "mtm_note": "Realised + current UPL is context only, not a true period return, because current open positions may pre-date the period.",
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/broker/metals-demo/accounting-performance")
+def metals_accounting_performance_route() -> Dict[str, Any]:
+    return metals_accounting_performance()
+
 def _metals_broker_recovery_price_tolerance_pct(asset: str) -> float:
     return (
         float(METALS_BROKER_ONLY_RECOVERY_XAU_PRICE_DIFF_PCT)
@@ -37815,6 +38019,84 @@ def metals_live_readiness_endpoint():
     return metals_live_readiness()
 
 
+def _metals_accounting_performance_html(broker_snapshot: Optional[Dict[str, Any]] = None) -> str:
+    perf = metals_accounting_performance(broker_snapshot)
+    periods = perf.get("periods") or {}
+    week = periods.get("week") or {}
+    month = periods.get("month") or {}
+    all_time = periods.get("all_time") or {}
+
+    def _accounting_card(label: str, p: Dict[str, Any]) -> str:
+        net = float(safe_float(p.get("net_realized_gbp")) or 0.0)
+        rr = float(safe_float(p.get("realized_r")) or 0.0)
+        closed = int(p.get("closed_trades") or 0)
+        wr = safe_float(p.get("win_rate_pct"))
+        harvest = float(safe_float(p.get("harvest_banked_gbp")) or 0.0)
+        return f'''<div class="mini-card">
+          <div class="k">{esc(label)} Realised</div>
+          <div class="v {pnl_class(net)}">{money(net,'GBP')}</div>
+          <div class="small">{rr:+.2f}R · {closed} closed · {'—' if wr is None else format(wr,'.1f')+'% wins'}</div>
+          <div class="small">Harvest subset {money(harvest,'GBP')}</div>
+        </div>'''
+
+    weekly_rows = ""
+    for p in perf.get("weekly_history") or []:
+        net = float(safe_float(p.get("net_realized_gbp")) or 0.0)
+        rr = float(safe_float(p.get("realized_r")) or 0.0)
+        weekly_rows += f'''<tr>
+          <td><strong>{esc(p.get("label"))}</strong>{' <span class="pos">CURRENT</span>' if p.get("is_current") else ''}</td>
+          <td class="{pnl_class(net)}">{money(net,'GBP')}</td>
+          <td>{money(p.get("broker_pl_gbp"),'GBP')}</td>
+          <td>{money(p.get("financing_gbp"),'GBP')}</td>
+          <td>{rr:+.2f}R</td>
+          <td>{int(p.get("closed_trades") or 0)}</td>
+          <td>{int(p.get("wins") or 0)}/{int(p.get("losses") or 0)}</td>
+          <td>{money(p.get("harvest_banked_gbp"),'GBP')}</td>
+        </tr>'''
+
+    monthly_rows = ""
+    for p in perf.get("monthly_history") or []:
+        net = float(safe_float(p.get("net_realized_gbp")) or 0.0)
+        rr = float(safe_float(p.get("realized_r")) or 0.0)
+        monthly_rows += f'''<tr>
+          <td><strong>{esc(p.get("label"))}</strong>{' <span class="pos">CURRENT</span>' if p.get("is_current") else ''}</td>
+          <td class="{pnl_class(net)}">{money(net,'GBP')}</td>
+          <td>{money(p.get("broker_pl_gbp"),'GBP')}</td>
+          <td>{money(p.get("financing_gbp"),'GBP')}</td>
+          <td>{rr:+.2f}R</td>
+          <td>{int(p.get("closed_trades") or 0)}</td>
+          <td>{int(p.get("wins") or 0)}/{int(p.get("losses") or 0)}</td>
+          <td>{money(p.get("harvest_banked_gbp"),'GBP')}</td>
+        </tr>'''
+
+    week_net = float(safe_float(week.get("net_realized_gbp")) or 0.0)
+    month_net = float(safe_float(month.get("net_realized_gbp")) or 0.0)
+    open_upl = float(safe_float(perf.get("current_open_upl_gbp")) or 0.0)
+
+    return f'''<h3>Weekly / Monthly Profit Accounting</h3>
+      <div class="section-note">
+        <strong>Broker-authoritative cash accounting.</strong>
+        Week runs Monday 00:00 {esc(perf.get("timezone_label"))}; month runs from the 1st at 00:00 {esc(perf.get("timezone_label"))}.
+        Realised cash comes from the OANDA Metals transaction ledger. R and win/loss counts come from the corresponding closed broker-linked trades.
+      </div>
+      <div class="metric-grid">
+        {_accounting_card("This Week", week)}
+        {_accounting_card("This Month", month)}
+        {_accounting_card("Ledger All-Time", all_time)}
+        <div class="mini-card"><div class="k">Current Open P&amp;L</div><div class="v {pnl_class(open_upl)}">{money(open_upl,'GBP')}</div><div class="small">Current XAU/XAG OANDA positions</div></div>
+        <div class="mini-card"><div class="k">Week Realised + Open</div><div class="v {pnl_class(week_net+open_upl)}">{money(week_net+open_upl,'GBP')}</div><div class="small">MTM context only</div></div>
+        <div class="mini-card"><div class="k">Month Realised + Open</div><div class="v {pnl_class(month_net+open_upl)}">{money(month_net+open_upl,'GBP')}</div><div class="small">MTM context only</div></div>
+      </div>
+      <div class="section-note small">
+        <strong>Current boundaries:</strong> week starts {esc(perf.get("week_start_local"))} · month starts {esc(perf.get("month_start_local"))} · as of {esc(perf.get("as_of_local"))}.<br>
+        {esc(perf.get("mtm_note"))} Harvest banking is a subset of realised profit and is never double-counted.
+      </div>
+      <h3>Recent Weekly Accounting</h3>
+      <div class="table-scroll"><table><thead><tr><th>Week</th><th>Net Realised</th><th>Trade P/L</th><th>Financing</th><th>Realised R</th><th>Closed</th><th>W/L</th><th>Harvest Banked</th></tr></thead><tbody>{weekly_rows or '<tr><td colspan="8">No weekly accounting yet.</td></tr>'}</tbody></table></div>
+      <h3>Recent Monthly Accounting</h3>
+      <div class="table-scroll"><table><thead><tr><th>Month</th><th>Net Realised</th><th>Trade P/L</th><th>Financing</th><th>Realised R</th><th>Closed</th><th>W/L</th><th>Harvest Banked</th></tr></thead><tbody>{monthly_rows or '<tr><td colspan="8">No monthly accounting yet.</td></tr>'}</tbody></table></div>
+      <div class="section-note small"><a href="/broker/metals-demo/accounting-performance">accounting performance JSON</a></div>'''
+
 def _metals_std_broker_html() -> str:
     try:
         metals_demo_reconcile_local_ghosts()
@@ -37905,6 +38187,8 @@ def _metals_std_broker_html() -> str:
         <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
         <div class="mini-card"><div class="k">HWM Source</div><div class="v pos">OANDA</div><div class="small">XAU/XAG open P&amp;L · refreshed continuously</div></div>
       </div>
+
+      {_metals_accounting_performance_html(broker)}
 
       <h3>Live Promotion Readiness</h3>
       <div class="table-scroll"><table><thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
@@ -38965,6 +39249,8 @@ def metals_build_integrity() -> Dict[str, Any]:
         "_metals_latest_30_signals_html",
         "_metals_recently_closed_trades_html",
         "_metals_profit_harvesting_html",
+        "metals_accounting_performance",
+        "_metals_accounting_performance_html",
         "metals_manual_start_new_basket_cycle_impl",
         "metals_standard_dashboard",
     ]
@@ -39131,6 +39417,9 @@ def metals_standard_status() -> Dict[str, Any]:
             "xag_blocked_candidate_counts_toward_manager_direction_support": False,
             "xag_blocked_candidate_counts_toward_ai_candidate": False,
             "xag_blocked_candidate_counts_toward_broker_recovery_match": False,
+            "weekly_monthly_broker_accounting": True,
+            "accounting_week_definition": "Monday 00:00 Europe/London",
+            "accounting_month_definition": "calendar month",
             "fixed_48h_control": True,
             "persistent_close_queue": True,
         },
