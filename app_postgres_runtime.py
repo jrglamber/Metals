@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.27"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.26 / 2026-09-02"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Direction Flip Flat Reset + Cycle-Safe HWM + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.28"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.27 / 2026-09-02"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1199,6 +1199,16 @@ METALS_HWM_RECOVERY_FLOOR_GBP = max(
 METALS_HWM_RECOVERY_FLOOR_SEEN_AT = os.getenv(
     "METALS_HWM_RECOVERY_FLOOR_SEEN_AT", ""
 ).strip()
+
+# v1.6.28 — live broker HWM sampler.
+# The hourly TradingView/manager cadence must not define the basket high-water time.
+# While a Metals basket is open, a lightweight read-only OANDA sampler refreshes
+# broker UPL/HWM independently of signal arrival and stores the exact OANDA quote
+# timestamp whenever a new cash high is observed. No orders/stops/exits are sent.
+METALS_LIVE_HWM_SAMPLER_ENABLED = env_bool("METALS_LIVE_HWM_SAMPLER_ENABLED", True)
+METALS_LIVE_HWM_INTERVAL_SECONDS = max(
+    5.0, min(float(os.getenv("METALS_LIVE_HWM_INTERVAL_SECONDS", "15")), 60.0)
+)
 
 app = FastAPI(title=APP_NAME)
 
@@ -11148,6 +11158,14 @@ def startup() -> None:
     except Exception as exc:
         try:
             log_system_event("metals_manager_worker_start_warning", f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+    try:
+        if PROJECT_SCOPE == "METALS_ONLY":
+            start_metals_live_hwm_worker()
+    except Exception as exc:
+        try:
+            log_system_event("metals_live_hwm_worker_start_warning", f"{type(exc).__name__}: {exc}")
         except Exception:
             pass
 
@@ -25544,6 +25562,11 @@ _METALS_MANAGER_WORKER_THREAD: Optional[threading.Thread] = None
 _METALS_MANAGER_WORKER_LAST_HEARTBEAT_UTC = ""
 _METALS_MANAGER_WORKER_LAST_RESULT: Dict[str, Any] = {}
 
+_METALS_LIVE_HWM_WORKER_STOP = threading.Event()
+_METALS_LIVE_HWM_WORKER_THREAD: Optional[threading.Thread] = None
+_METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC = ""
+_METALS_LIVE_HWM_WORKER_LAST_RESULT: Dict[str, Any] = {}
+
 
 def ensure_metals_hwm_history_table() -> None:
     """Immutable audit trail for HWM repairs/new highs going forward."""
@@ -25685,10 +25708,18 @@ def _metals_latest_signal_observation_time(conn: Optional[Any] = None) -> str:
                 pass
 
 
-def _metals_hwm_observation_time(conn: Optional[Any] = None) -> str:
-    """Best market-time timestamp for a broker HWM observation."""
+def _metals_hwm_observation_time(
+    conn: Optional[Any] = None,
+    force_market_quote: bool = False,
+) -> str:
+    """Best market-time timestamp for a broker HWM observation.
+
+    v1.6.28: when a new broker cash high is being recorded, bypass the short
+    pricing cache so the persisted HWM time is the exact OANDA quote timestamp
+    observed at that high rather than the latest hourly TradingView candle.
+    """
     try:
-        market = _metals_demo_market_state()
+        market = _metals_demo_market_state(force=bool(force_market_quote))
         if safe_str(market.get("latest_price_time")):
             return safe_str(market.get("latest_price_time"))
     except Exception:
@@ -26136,6 +26167,92 @@ def start_metals_demo_manager_maintenance_worker() -> None:
         daemon=True,
     )
     _METALS_MANAGER_WORKER_THREAD.start()
+
+# ============================================================
+# v1.6.28 — LIVE BROKER HIGH-WATER SAMPLER
+# ============================================================
+def metals_live_hwm_worker_status() -> Dict[str, Any]:
+    thread = _METALS_LIVE_HWM_WORKER_THREAD
+    return {
+        "enabled": bool(METALS_LIVE_HWM_SAMPLER_ENABLED),
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+        "interval_seconds": METALS_LIVE_HWM_INTERVAL_SECONDS,
+        "last_heartbeat_utc": _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC,
+        "last_result": _METALS_LIVE_HWM_WORKER_LAST_RESULT,
+        "authority": "READ_ONLY_OANDA_HWM_ONLY",
+    }
+
+
+def metals_live_hwm_tick() -> Dict[str, Any]:
+    """Refresh broker HWM independently of hourly TradingView/manager signals.
+
+    Read-only against OANDA. It never creates/closes/modifies a trade. A new high
+    is persisted by _metals_broker_highwater_state with the exact OANDA quote time.
+    """
+    global _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC, _METALS_LIVE_HWM_WORKER_LAST_RESULT
+    result: Dict[str, Any] = {"ok": True, "time_utc": now_utc_iso()}
+    try:
+        if not METALS_LIVE_HWM_SAMPLER_ENABLED:
+            result.update({"skipped": True, "reason": "disabled"})
+            return result
+        cfg = metals_demo_config_status()
+        if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
+            result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
+            return result
+        broker = metals_demo_live_broker_snapshot(include_account_summary=False)
+        hwm = _metals_broker_highwater_state(broker)
+        result.update({
+            "broker_read_ok": bool(broker.get("ok")),
+            "open_count": int(broker.get("owned_open_count") or 0),
+            "current_gbp": float(safe_float(hwm.get("current_gbp")) or 0.0),
+            "high_water_gbp": float(safe_float(hwm.get("high_water_gbp")) or 0.0),
+            "high_water_r": float(safe_float(hwm.get("high_water_r")) or 0.0),
+            "high_water_seen_at": safe_str(hwm.get("high_water_seen_at")),
+            "source": safe_str(hwm.get("source")),
+        })
+        if not broker.get("ok"):
+            result["ok"] = False
+            result["error"] = safe_str(broker.get("error"))
+        return result
+    except Exception as exc:
+        result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return result
+    finally:
+        _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC = now_utc_iso()
+        _METALS_LIVE_HWM_WORKER_LAST_RESULT = dict(result)
+
+
+def _metals_live_hwm_loop() -> None:
+    try:
+        metals_live_hwm_tick()
+    except Exception:
+        pass
+    while not _METALS_LIVE_HWM_WORKER_STOP.wait(METALS_LIVE_HWM_INTERVAL_SECONDS):
+        try:
+            metals_live_hwm_tick()
+        except Exception as exc:
+            try:
+                log_system_event(
+                    "metals_live_hwm_worker_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+
+def start_metals_live_hwm_worker() -> None:
+    global _METALS_LIVE_HWM_WORKER_THREAD
+    if not METALS_LIVE_HWM_SAMPLER_ENABLED:
+        return
+    if _METALS_LIVE_HWM_WORKER_THREAD is not None and _METALS_LIVE_HWM_WORKER_THREAD.is_alive():
+        return
+    _METALS_LIVE_HWM_WORKER_STOP.clear()
+    _METALS_LIVE_HWM_WORKER_THREAD = threading.Thread(
+        target=_metals_live_hwm_loop,
+        name="metals-live-hwm",
+        daemon=True,
+    )
+    _METALS_LIVE_HWM_WORKER_THREAD.start()
 
 def _metals_tx_instrument(tx: Dict[str, Any]) -> str:
     instrument = safe_str(tx.get("instrument")).upper()
@@ -36171,10 +36288,14 @@ def _metals_standard_latest_family_snapshot() -> Dict[str, Any]:
 
 
 
-def metals_demo_live_broker_snapshot() -> Dict[str, Any]:
+def metals_demo_live_broker_snapshot(include_account_summary: bool = True) -> Dict[str, Any]:
     """
     Fresh read-only OANDA practice snapshot filtered strictly to XAU_USD/XAG_USD.
     Shared account NAV remains account-level; all trade/P&L metrics here are metals-only.
+
+    v1.6.28: the live-HWM sampler may set include_account_summary=False so its
+    frequent read-only polling needs only the openTrades request. Existing callers
+    retain the full account summary by default.
     """
     cfg = metals_demo_config_status()
     acct = {}
@@ -36186,15 +36307,16 @@ def metals_demo_live_broker_snapshot() -> Dict[str, Any]:
             "error": "metals_demo_credentials_missing",
         }
 
-    try:
-        acc_resp = metals_demo_request(
-            f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary", "GET"
-        )
-        if acc_resp.get("ok"):
-            raw = acc_resp.get("data") or {}
-            acct = raw.get("account") or raw
-    except Exception:
-        acct = {}
+    if include_account_summary:
+        try:
+            acc_resp = metals_demo_request(
+                f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/summary", "GET"
+            )
+            if acc_resp.get("ok"):
+                raw = acc_resp.get("data") or {}
+                acct = raw.get("account") or raw
+        except Exception:
+            acct = {}
 
     resp = metals_demo_request(
         f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/openTrades", "GET"
@@ -36376,7 +36498,12 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
 
         r_state = _metals_broker_basket_r(broker)
         current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
-        observed_at = _metals_hwm_observation_time(conn)
+        # v1.6.28 live HWM: a true new cash high gets a fresh OANDA pricing
+        # timestamp instead of inheriting the latest hourly signal time/cache.
+        current_is_new_cash_high = current_gbp > old_hwm_gbp + 0.005
+        observed_at = _metals_hwm_observation_time(
+            conn, force_market_quote=current_is_new_cash_high
+        )
 
         # Only a successful broker read proving flat may reset the cycle.
         if open_count == 0:
@@ -37519,6 +37646,7 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "broker_margin_used": safe_float(broker.get("owned_margin_used")) or 0.0,
             "broker_account_open_count": int(broker.get("account_open_count") or 0),
             "manager_worker": metals_demo_manager_worker_status(),
+            "live_hwm_worker": metals_live_hwm_worker_status(),
             "risk_visibility": snap.get("risk_visibility") or {},
         },
         "signals": {
@@ -38055,7 +38183,7 @@ def _metals_std_basket_manager_html() -> str:
       </div>
       <div class="metric-grid">
         <div class="mini-card"><div class="k">Broker Basket</div><div class="v {pnl_class(current_gbp)}">{current_r:.2f}R</div><div class="small">{money(current_gbp,'GBP')} · XAU/XAG OANDA source</div></div>
-        <div class="mini-card"><div class="k">Broker High-Water</div><div class="v {pnl_class(high_gbp)}">{high_r:.2f}R</div><div class="small">{money(high_gbp,'GBP')} · {esc(broker_hwm.get('high_water_seen_at') or 'time not recorded')}</div></div>
+        <div class="mini-card"><div class="k">Broker High-Water</div><div class="v {pnl_class(high_gbp)}">{high_r:.2f}R</div><div class="small">{money(high_gbp,'GBP')} · {esc(display_utc_time(broker_hwm.get('high_water_seen_at')) if broker_hwm.get('high_water_seen_at') else 'time not recorded')} · live sampler {METALS_LIVE_HWM_INTERVAL_SECONDS:g}s</div></div>
         <div class="mini-card"><div class="k">Broker Giveback</div><div class="v {'neg' if giveback_pct >= 50 else 'warn' if giveback_pct >= 25 else 'pos'}">{giveback_r:.2f}R</div><div class="small">{money(giveback_gbp,'GBP')} · {giveback_pct:.1f}%</div></div>
         <div class="mini-card"><div class="k">Next Harvest</div><div class="v {'pos' if METALS_HARVEST_EXECUTION_ENABLED else 'warn'}">{next_level:.0f}R</div><div class="small">Bank {next_fraction*100:.0f}% · {'ARMED' if METALS_HARVEST_EXECUTION_ENABLED else 'DISABLED'}</div></div>
         <div class="mini-card"><div class="k">Family State</div><div class="v">{esc(model_family.get('state') or 'FLAT')}</div><div class="small">{esc(model_family.get('action') or 'ADVISORY_ONLY')} · manager model only</div></div>
@@ -38823,6 +38951,8 @@ def metals_build_integrity() -> Dict[str, Any]:
         "metals_demo_reconcile_local_ghosts",
         "metals_demo_manager_maintenance_tick",
         "start_metals_demo_manager_maintenance_worker",
+        "start_metals_live_hwm_worker",
+        "metals_live_hwm_tick",
         "record_metals_focused_research",
         "build_metals_focused_research_html",
         "build_ai_regime_observer_html",
@@ -38922,7 +39052,7 @@ async function loadTop(force=false){{
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Account-wide UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
 ${{card('Broker P&L',money(s.headline_pnl),`Metals-only open P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
-${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
+${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}} · LIVE OANDA`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
@@ -38973,7 +39103,7 @@ async function startNewMetalsBasketCycle(){{
  }}
 }}
 document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));
-loadTop(false);setInterval(()=>loadTop(true),60000);
+loadTop(false);setInterval(()=>loadTop(true),15000);
 </script>
 </body></html>"""
 
