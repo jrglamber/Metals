@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.26"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.25 / 2026-08-30"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Focused HWM Cycle Integrity + XAG Guard + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.27"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.26 / 2026-09-02"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Direction Flip Flat Reset + Cycle-Safe HWM + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1035,6 +1035,16 @@ METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT = float(os.getenv("METALS_DEMO_MANAGER_MIN
 METALS_DEMO_MANAGER_CLOSE_IMMEDIATE_ATTEMPTS = max(1, min(int(float(os.getenv("METALS_DEMO_MANAGER_CLOSE_IMMEDIATE_ATTEMPTS", "3"))), 10))
 METALS_DEMO_MANAGER_CLOSE_RETRY_SLEEP_SECONDS = max(0.0, min(float(os.getenv("METALS_DEMO_MANAGER_CLOSE_RETRY_SLEEP_SECONDS", "1")), 5.0))
 METALS_DEMO_BLOCK_OPPOSITE_DIRECTION_SAME_ASSET = env_bool("METALS_DEMO_BLOCK_OPPOSITE_DIRECTION_SAME_ASSET", True)
+# v1.6.27 — family-direction transition integrity.
+# A Metals basket is one directional economic campaign. If a valid production
+# candidate arrives in the opposite direction while ANY XAU/XAG exposure from
+# the old direction remains open, the service must flatten the whole Metals
+# family first, prove OANDA is flat, reset the family HWM/harvest cycle, and
+# only then allow the new-direction candidate to open. This is hard-enabled:
+# mixed long/short family exposure is not a supported production state.
+METALS_DIRECTION_FLIP_POLICY_VERSION = "metals_family_direction_flip_flat_v1_2026_09_02"
+METALS_DEMO_FLATTEN_ON_DIRECTION_FLIP_ENABLED = True
+METALS_DEMO_DIRECTION_FLIP_REQUIRE_BROKER_FLAT = True
 METALS_DEMO_BASKET_LIGHT_MIN_OPEN = max(2, int(float(os.getenv("METALS_DEMO_BASKET_LIGHT_MIN_OPEN", "5"))))
 METALS_DEMO_BASKET_NORMAL_MIN_OPEN = max(METALS_DEMO_BASKET_LIGHT_MIN_OPEN, int(float(os.getenv("METALS_DEMO_BASKET_NORMAL_MIN_OPEN", "10"))))
 METALS_DEMO_BASKET_MATURE_MIN_OPEN = max(METALS_DEMO_BASKET_NORMAL_MIN_OPEN, int(float(os.getenv("METALS_DEMO_BASKET_MATURE_MIN_OPEN", "25"))))
@@ -23126,6 +23136,13 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "simulate_shorts": METALS_DEMO_SIMULATE_SHORTS,
         "basket_manager_enabled": METALS_DEMO_BASKET_MANAGER_ENABLED,
         "manager_version": METALS_DEMO_MANAGER_VERSION,
+        "direction_flip_policy": {
+            "version": METALS_DIRECTION_FLIP_POLICY_VERSION,
+            "flatten_before_opposite_entry": METALS_DEMO_FLATTEN_ON_DIRECTION_FLIP_ENABLED,
+            "broker_flat_confirmation_required": METALS_DEMO_DIRECTION_FLIP_REQUIRE_BROKER_FLAT,
+            "family_mixed_direction_supported": False,
+            "hwm_reset_before_new_direction_entry": True,
+        },
         "exit_policy": metals_exit_policy_status(),
         "model_version": METALS_DEMO_MODEL_VERSION,
         "risk_gbp": {"XAUUSD": METALS_DEMO_XAU_RISK_AMOUNT, "XAGUSD": METALS_DEMO_XAG_RISK_AMOUNT},
@@ -24077,6 +24094,282 @@ def update_xag_guard_counterfactual_outcomes(raw_signal_id: int) -> None:
     except Exception:
         pass
 
+
+def _metals_demo_broker_trade_side(trade: Dict[str, Any]) -> str:
+    """Return long/short from an OANDA open-trade payload."""
+    units = safe_float((trade or {}).get("currentUnits"))
+    if units is None:
+        units = safe_float((trade or {}).get("initialUnits"))
+    if units is None:
+        units = safe_float((trade or {}).get("units"))
+    if units is None or abs(float(units)) <= 1e-12:
+        return ""
+    return "long" if float(units) > 0 else "short"
+
+
+def _metals_demo_family_broker_direction(broker: Dict[str, Any]) -> Dict[str, Any]:
+    """Broker-authoritative direction of all owned XAU/XAG open trades."""
+    trades = list((broker or {}).get("owned_open_trades") or [])
+    sides = [_metals_demo_broker_trade_side(t) for t in trades]
+    unknown = sum(1 for s in sides if not s)
+    known = [s for s in sides if s]
+    if not trades:
+        direction = "FLAT"
+    elif unknown:
+        direction = "UNKNOWN"
+    elif len(set(known)) == 1:
+        direction = known[0].upper()
+    else:
+        direction = "MIXED"
+    return {
+        "direction": direction,
+        "open_count": len(trades),
+        "long_count": sum(1 for s in known if s == "long"),
+        "short_count": sum(1 for s in known if s == "short"),
+        "unknown_count": unknown,
+        "broker_trade_ids": [safe_str(t.get("id")) for t in trades],
+    }
+
+
+def _metals_demo_prepare_direction_flip(
+    target_side: str,
+    raw_signal_id: int,
+    source: str = "signal_worker",
+) -> Dict[str, Any]:
+    """Flatten the Metals family before an opposite-direction entry.
+
+    This is an execution rule, not research:
+      - same-direction stacking is unchanged;
+      - flat -> entry is unchanged;
+      - opposite or mixed family exposure -> close ALL owned XAU/XAG trades;
+      - require a fresh OANDA read proving zero Metals trades;
+      - reconcile local ghosts, reset broker HWM + harvest cycle, write a flat
+        family snapshot, then allow the triggering candidate to continue.
+
+    If any close/reconciliation/flat-confirmation step fails, the new entry is
+    blocked. The next valid candidate can retry the transition.
+    """
+    target = _metals_demo_side(target_side)
+    if target not in {"long", "short"}:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "invalid_direction_flip_target",
+            "target_side": target,
+        }
+
+    broker = metals_demo_live_broker_snapshot()
+    if not broker.get("ok"):
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "direction_flip_broker_snapshot_failed",
+            "target_side": target,
+            "broker": broker,
+        }
+
+    before = _metals_demo_family_broker_direction(broker)
+    before_dir = safe_str(before.get("direction")).upper()
+    target_dir = target.upper()
+
+    if before_dir == "FLAT":
+        return {
+            "ok": True, "flip_required": False, "flat_confirmed": True,
+            "from_direction": "FLAT", "to_direction": target_dir,
+            "before": before,
+        }
+    if before_dir == target_dir:
+        return {
+            "ok": True, "flip_required": False, "flat_confirmed": False,
+            "from_direction": before_dir, "to_direction": target_dir,
+            "before": before,
+        }
+    if before_dir == "UNKNOWN":
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "direction_flip_unknown_broker_trade_side",
+            "target_side": target,
+            "before": before,
+        }
+
+    # Opposite or already-mixed family exposure. First attempt to recover any
+    # broker-only trades so the durable local audit/close queue owns as much of
+    # the transition as possible.
+    recovery: Dict[str, Any] = {}
+    try:
+        recovery = metals_demo_reconcile_broker_only_links(broker)
+        broker = metals_demo_live_broker_snapshot()
+        if not broker.get("ok"):
+            return {
+                "ok": False, "blocked": True,
+                "reason": "direction_flip_post_recovery_broker_snapshot_failed",
+                "target_side": target, "before": before, "recovery": recovery,
+            }
+    except Exception as exc:
+        recovery = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    with get_conn() as conn:
+        open_links = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+            ).fetchall()
+        ]
+    links_by_broker = {
+        safe_str(l.get("broker_trade_id")): l
+        for l in open_links
+        if safe_str(l.get("broker_trade_id"))
+    }
+
+    close_results: List[Dict[str, Any]] = []
+    reason = (
+        f"METALS_DIRECTION_FLIP_FLATTEN:{before_dir}->{target_dir}:"
+        f"{METALS_DIRECTION_FLIP_POLICY_VERSION}:{source}"
+    )
+
+    for trade in list(broker.get("owned_open_trades") or []):
+        broker_trade_id = safe_str(trade.get("id"))
+        link = links_by_broker.get(broker_trade_id)
+        if link:
+            qid = _metals_demo_queue_close(link, reason, int(raw_signal_id or 0))
+            result = _metals_demo_close(link, qid)
+            close_results.append({
+                "broker_trade_id": broker_trade_id,
+                "link_id": int(link.get("id") or 0),
+                "path": "durable_link_close_queue",
+                "result": result,
+            })
+        else:
+            # Final ownership-recovery fallback. The standalone Metals service
+            # owns XAU_USD/XAG_USD; if a broker-only trade still cannot be linked,
+            # close that exact OANDA trade directly rather than permit a mixed
+            # direction family. The subsequent flat read is authoritative.
+            resp = metals_demo_request(
+                f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/trades/"
+                f"{urllib.parse.quote(broker_trade_id)}/close",
+                "PUT",
+                {"units": "ALL"},
+            )
+            close_results.append({
+                "broker_trade_id": broker_trade_id,
+                "link_id": None,
+                "path": "broker_only_direct_close",
+                "result": resp,
+            })
+            try:
+                _metals_demo_audit(
+                    int(raw_signal_id or 0),
+                    _metals_demo_asset(safe_str(trade.get("instrument"))),
+                    safe_str(trade.get("instrument")),
+                    "direction_flip_close_broker_only",
+                    "CLOSED" if resp.get("ok") else "FAILED",
+                    reason,
+                    response=resp,
+                    candidate_state="DIRECTION_FLIP",
+                )
+            except Exception:
+                pass
+
+    # A direction flip is not complete until OANDA itself proves the entire
+    # Metals family is flat. Local state is then reconciled to that fact.
+    after = metals_demo_live_broker_snapshot()
+    if not after.get("ok"):
+        return {
+            "ok": False, "blocked": True,
+            "reason": "direction_flip_flat_confirmation_read_failed",
+            "from_direction": before_dir, "to_direction": target_dir,
+            "before": before, "close_results": close_results,
+        }
+
+    after_state = _metals_demo_family_broker_direction(after)
+    if int(after_state.get("open_count") or 0) != 0:
+        try:
+            _metals_demo_audit(
+                int(raw_signal_id or 0), "", "",
+                "direction_flip_flatten", "RETRY",
+                "Opposite-direction transition remains blocked until OANDA Metals open count is zero.",
+                preview={"before": before, "after": after_state},
+                response={"close_results": close_results},
+                candidate_state="DIRECTION_FLIP",
+            )
+        except Exception:
+            pass
+        return {
+            "ok": False, "blocked": True,
+            "reason": "direction_flip_flatten_incomplete",
+            "from_direction": before_dir, "to_direction": target_dir,
+            "before": before, "after": after_state,
+            "close_results": close_results,
+        }
+
+    try:
+        ghost = metals_demo_reconcile_local_ghosts()
+    except Exception as exc:
+        ghost = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    with get_conn() as conn:
+        local_open = int(conn.execute(
+            "SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE status='OPEN'"
+        ).fetchone()["c"] or 0)
+
+    if local_open != 0:
+        return {
+            "ok": False, "blocked": True,
+            "reason": "direction_flip_local_reconciliation_not_flat",
+            "from_direction": before_dir, "to_direction": target_dir,
+            "broker_flat_confirmed": True,
+            "local_open_count": local_open,
+            "ghost_reconciliation": ghost,
+            "close_results": close_results,
+        }
+
+    # Explicitly reset all family-cycle accounting on the broker-confirmed flat
+    # state before the new side is allowed to open.
+    hwm_reset = _metals_broker_highwater_state(after)
+    with get_conn() as conn:
+        _metals_harvest_current_cycle_id(conn, hwm_reset)
+        _metals_runtime_set(conn, "metals_last_direction_flip_at", now_utc_iso())
+        _metals_runtime_set(conn, "metals_last_direction_flip_from", before_dir)
+        _metals_runtime_set(conn, "metals_last_direction_flip_to", target_dir)
+        _metals_runtime_set(
+            conn, "metals_last_direction_flip_policy_version",
+            METALS_DIRECTION_FLIP_POLICY_VERSION,
+        )
+        conn.commit()
+
+    flat_snapshot = _metals_demo_snapshot_baskets(int(raw_signal_id or 0))
+
+    try:
+        _metals_demo_audit(
+            int(raw_signal_id or 0), "", "",
+            "direction_flip_flatten", "FLAT_CONFIRMED",
+            reason,
+            preview={"before": before, "after": after_state, "hwm_reset": hwm_reset},
+            response={"close_results": close_results},
+            candidate_state="DIRECTION_FLIP",
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "flip_required": True,
+        "flat_confirmed": True,
+        "from_direction": before_dir,
+        "to_direction": target_dir,
+        "before": before,
+        "after": after_state,
+        "close_results": close_results,
+        "ghost_reconciliation": ghost,
+        "hwm_reset": hwm_reset,
+        "flat_snapshot": flat_snapshot,
+        "policy_version": METALS_DIRECTION_FLIP_POLICY_VERSION,
+    }
+
+
 def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_worker") -> Dict[str, Any]:
     init_db()
     with get_conn() as conn:
@@ -24116,6 +24409,29 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     if not METALS_DEMO_BROKER_ENABLED:
         _metals_demo_audit(raw_signal_id,asset,instrument,"entry_preview","DISABLED_PREVIEW_ONLY","METALS_DEMO_BROKER_ENABLED=false",preview,candidate_state="CANDIDATE")
         return {"ok":True,"preview_only":True,"asset":asset,"side":side,"candidate":candidate,"preview":preview}
+
+    direction_transition = _metals_demo_prepare_direction_flip(
+        side, int(raw_signal_id), source=source
+    )
+    if not direction_transition.get("ok"):
+        _metals_demo_audit(
+            raw_signal_id, asset, instrument, "direction_flip_guard", "BLOCKED",
+            safe_str(direction_transition.get("reason") or "direction_flip_not_flat"),
+            preview=preview,
+            response=direction_transition,
+            candidate_state="CANDIDATE",
+        )
+        return {
+            "ok": True,
+            "blocked": True,
+            "asset": asset,
+            "side": side,
+            "reason": safe_str(direction_transition.get("reason") or "direction_flip_not_flat"),
+            "direction_transition": direction_transition,
+            "preview": preview,
+            "candidate": candidate,
+        }
+
     with get_conn() as conn:
         count=conn.execute("SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE asset=? AND status='OPEN'",(asset,)).fetchone()["c"]
         opposite=conn.execute("SELECT COUNT(*) AS c FROM metals_demo_trade_links WHERE asset=? AND status='OPEN' AND LOWER(side) != ?",(asset,side)).fetchone()["c"]
@@ -24137,7 +24453,7 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
         er=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=?",(raw_signal_id,)).fetchone(); fill_units=abs(safe_float(fill.get("units")) or preview.get("units") or 0); fill_price=safe_float(fill.get("price")) or preview.get("entry_price")
         policy_info=_metals_demo_new_trade_exit_policy(asset,side); policy_started=now_utc_iso()
         link_id=db_insert_returning_id(conn,"""INSERT INTO metals_demo_trade_links (created_at_utc,updated_at_utc,raw_signal_id,asset,instrument,side,model_version,signal_time,entry_signal_id,requested_risk_amount,estimated_risk_amount,requested_units,filled_units,entry_price,stop_price,current_stop_price,broker_trade_id,broker_order_id,status,active_exit_policy,active_exit_policy_version,active_exit_policy_started_at_utc,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (policy_started,policy_started,raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",policy_info["policy"],policy_info["version"],policy_started,json.dumps({"candidate":candidate,"confirmation_guard":confirmation_guard,"preview":preview,"response":response,"active_exit_policy":policy_info},default=str)))
+            (policy_started,policy_started,raw_signal_id,asset,instrument,side,safe_str(candidate.get("model_version") or METALS_DEMO_MANAGER_VERSION),safe_str(er["timestamp_readable"] if er else ""),raw_signal_id,preview.get("risk_amount"),preview.get("estimated_risk_gbp"),preview.get("units"),fill_units,fill_price,preview.get("stop_price"),preview.get("stop_price"),broker_trade_id,broker_order_id,"OPEN",policy_info["policy"],policy_info["version"],policy_started,json.dumps({"candidate":candidate,"confirmation_guard":confirmation_guard,"direction_transition":direction_transition,"preview":preview,"response":response,"active_exit_policy":policy_info},default=str)))
         conn.commit()
     shadow_start={"ok":True,"enabled":False,"created":0}
     try:
@@ -24147,7 +24463,7 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     except Exception as _shadow_exc:
         shadow_start={"ok":False,"error":f"{type(_shadow_exc).__name__}: {_shadow_exc}","research_only":True}
     _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}; active_exit_policy={policy_info['policy']}",preview,response,link_id,"CANDIDATE")
-    return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate,"active_exit_policy":policy_info,"exit_challenger_shadow":shadow_start}
+    return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate,"direction_transition":direction_transition,"active_exit_policy":policy_info,"exit_challenger_shadow":shadow_start}
 
 
 def _metals_demo_pair_variants(asset: str) -> Tuple[str, str]:
@@ -24963,64 +25279,114 @@ def _metals_demo_refresh_closed(link: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
+    """Persist asset/side and family basket diagnostics with cycle-local HWM.
+
+    v1.6.27 fixes a cross-cycle leak: previous snapshots carried their old
+    high_water_* fields through flat periods, which let a later opposite-direction
+    basket inherit the prior basket's HWM. Raw point-in-time basket_r / cash P&L
+    are now used to reconstruct the peak only AFTER the most recent family-flat
+    snapshot. A flat family snapshot is always written with HWM=0.
+    """
     with get_conn() as conn:
-        links=[dict(r) for r in conn.execute("SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
+        links=[dict(r) for r in conn.execute(
+            "SELECT * FROM metals_demo_trade_links WHERE status='OPEN' ORDER BY id"
+        ).fetchall()]
     groups={}
     for l in links:
-        groups.setdefault((_metals_demo_asset(l.get("asset")),_metals_demo_side(l.get("side"))),[]).append(l)
+        groups.setdefault(
+            (_metals_demo_asset(l.get("asset")),_metals_demo_side(l.get("side"))),[]
+        ).append(l)
+
     snaps=[]
     with get_conn() as conn:
+        flat_row = conn.execute("""
+            SELECT id,created_at_utc,review_signal_id
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              AND COALESCE(open_count,0)=0
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+        flat_id = int(flat_row["id"]) if flat_row else 0
+
+        def cycle_peaks(key: str) -> Dict[str, Any]:
+            # Never trust a prior snapshot's stored high_water_* here. Those
+            # fields may have been created by an older build. Rebuild the
+            # current-cycle peak from raw point-in-time basket values instead.
+            peak_r = conn.execute("""
+                SELECT basket_r,created_at_utc
+                FROM metals_demo_basket_snapshots
+                WHERE basket_key=?
+                  AND id>?
+                  AND COALESCE(open_count,0)>0
+                  AND basket_r IS NOT NULL
+                ORDER BY basket_r DESC,id DESC
+                LIMIT 1
+            """,(key,flat_id)).fetchone()
+            peak_cash = conn.execute("""
+                SELECT basket_pnl_gbp,created_at_utc
+                FROM metals_demo_basket_snapshots
+                WHERE basket_key=?
+                  AND id>?
+                  AND COALESCE(open_count,0)>0
+                  AND basket_pnl_gbp IS NOT NULL
+                ORDER BY basket_pnl_gbp DESC,id DESC
+                LIMIT 1
+            """,(key,flat_id)).fetchone()
+            return {
+                "r": float(safe_float(peak_r["basket_r"] if peak_r else None) or 0.0),
+                "r_seen": safe_str(peak_r["created_at_utc"] if peak_r else ""),
+                "gbp": float(safe_float(peak_cash["basket_pnl_gbp"] if peak_cash else None) or 0.0),
+                "gbp_seen": safe_str(peak_cash["created_at_utc"] if peak_cash else ""),
+            }
+
         for (asset,side),items in groups.items():
             rs=[safe_float(x.get("manager_current_r")) for x in items]
             rs=[float(x) for x in rs if x is not None]
             br=sum(rs)
             basket_gbp=sum(
                 float(safe_float(x.get("manager_current_r")) or 0.0) *
-                float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(asset))
+                float(
+                    safe_float(x.get("estimated_risk_amount"))
+                    or safe_float(x.get("requested_risk_amount"))
+                    or _metals_demo_risk(asset)
+                )
                 for x in items
             )
             key=f"{asset}:{side.upper()}"
-            prev=conn.execute("""SELECT high_water_r,high_water_pnl_gbp,high_water_seen_at,created_at_utc
-                                 FROM metals_demo_basket_snapshots WHERE basket_key=?
-                                 ORDER BY id DESC LIMIT 1""",(key,)).fetchone()
-            old_hwm=float(safe_float(prev["high_water_r"] if prev else None) or 0.0)
-            if br>old_hwm:
-                hwm=br; hwm_gbp=basket_gbp; hwm_seen=now_utc_iso()
+            prior=cycle_peaks(key)
+            hwm=max(0.0,br,float(prior.get("r") or 0.0))
+            hwm_gbp=max(0.0,basket_gbp,float(prior.get("gbp") or 0.0))
+            if hwm_gbp <= 0:
+                hwm_seen=""
+            elif basket_gbp >= float(prior.get("gbp") or 0.0) - 1e-12:
+                hwm_seen=now_utc_iso()
             else:
-                hwm=old_hwm
-                hwm_gbp=safe_float(prev["high_water_pnl_gbp"] if prev else None)
-                if hwm_gbp is None:
-                    hwm_gbp=hwm*float(_metals_demo_risk(asset))
-                hwm_seen=safe_str(prev["high_water_seen_at"] if prev else "")
-                if not hwm_seen and hwm>0 and prev:
-                    hwm_seen=safe_str(prev["created_at_utc"])
+                hwm_seen=safe_str(prior.get("gbp_seen"))
             gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0
-            mature=sum(1 for x in items if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
+            mature=sum(
+                1 for x in items
+                if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES
+            )
             losing=sum(1 for x in rs if x<0)
-            phase="TINY" if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN else "EARLY" if len(items)<METALS_DEMO_BASKET_NORMAL_MIN_OPEN else "DEVELOPING" if len(items)<METALS_DEMO_BASKET_MATURE_MIN_OPEN else "MATURE"
-            # v1.6.20: STATE = financial health; ACTION = whether the
-            # existing basket-defence rules are currently eligible to act.
-            # A young -5R basket must not be labelled GREEN merely because its
-            # trades have not reached the 48h minimum.
-            if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R:
-                state="CRITICAL"
-                health_reason="Severe asset-side basket loss."
-            elif br<=METALS_DEMO_BASKET_NORMAL_LOSS_R:
-                state="RED"
-                health_reason="Asset-side basket loss breached the normal defence level."
-            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R:
-                state="AMBER"
-                health_reason="Asset-side basket loss warning."
-            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and hwm>0:
-                state="AMBER"
-                health_reason="Asset-side basket giveback warning."
-            else:
-                state="GREEN"
-                health_reason="Basket within normal financial tolerance."
+            phase=(
+                "TINY" if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN else
+                "EARLY" if len(items)<METALS_DEMO_BASKET_NORMAL_MIN_OPEN else
+                "DEVELOPING" if len(items)<METALS_DEMO_BASKET_MATURE_MIN_OPEN else
+                "MATURE"
+            )
 
-            # Preserve the prior execution contract exactly: small/young baskets
-            # do not get mechanically trimmed before the existing eligibility
-            # gates are satisfied.
+            if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R:
+                state="CRITICAL"; health_reason="Severe asset-side basket loss."
+            elif br<=METALS_DEMO_BASKET_NORMAL_LOSS_R:
+                state="RED"; health_reason="Asset-side basket loss breached the normal defence level."
+            elif br<=METALS_DEMO_BASKET_LIGHT_LOSS_R:
+                state="AMBER"; health_reason="Asset-side basket loss warning."
+            elif gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT and hwm>0:
+                state="AMBER"; health_reason="Asset-side basket giveback warning."
+            else:
+                state="GREEN"; health_reason="Basket within normal financial tolerance."
+
             if len(items)<METALS_DEMO_BASKET_LIGHT_MIN_OPEN:
                 action="YOUNG_HOLD_SMALL_BASKET"
                 action_reason="Small basket: no basket-level trim."
@@ -25044,11 +25410,15 @@ def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
                 action_reason="No basket-level defensive action required."
 
             reason=f"HEALTH={state}: {health_reason} ACTION={action}: {action_reason}"
-            snap={"scope":"ASSET_SIDE","basket_key":key,"asset":asset,"side":side,"open_count":len(items),
-                  "matured_count":mature,"losing_count":losing,"losing_pct":losing/len(rs)*100 if rs else 0,
-                  "basket_r":br,"basket_pnl_gbp":basket_gbp,"high_water_r":hwm,"high_water_pnl_gbp":hwm_gbp,
-                  "high_water_seen_at":hwm_seen,"giveback_pct":gb,"basket_phase":phase,
-                  "state":state,"action":action,"reason":reason}
+            snap={
+                "scope":"ASSET_SIDE","basket_key":key,"asset":asset,"side":side,
+                "open_count":len(items),"matured_count":mature,"losing_count":losing,
+                "losing_pct":losing/len(rs)*100 if rs else 0,
+                "basket_r":br,"basket_pnl_gbp":basket_gbp,
+                "high_water_r":hwm,"high_water_pnl_gbp":hwm_gbp,
+                "high_water_seen_at":hwm_seen,"giveback_pct":gb,
+                "basket_phase":phase,"state":state,"action":action,"reason":reason
+            }
             conn.execute("""INSERT INTO metals_demo_basket_snapshots
                 (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,
                  basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json,
@@ -25056,7 +25426,8 @@ def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (now_utc_iso(),review_signal_id,snap["scope"],key,asset,side,snap["open_count"],mature,
                  snap["losing_count"],snap["losing_pct"],br,hwm,gb,phase,state,action,reason,
-                 json.dumps({"link_ids":[x.get("id") for x in items]}),basket_gbp,hwm_gbp,hwm_seen))
+                 json.dumps({"link_ids":[x.get("id") for x in items],"cycle_flat_boundary_snapshot_id":flat_id}),
+                 basket_gbp,hwm_gbp,hwm_seen))
             snaps.append(snap)
 
         rs=[safe_float(x.get("manager_current_r")) for x in links]
@@ -25064,46 +25435,69 @@ def _metals_demo_snapshot_baskets(review_signal_id: Any=None) -> Dict[str, Any]:
         br=sum(rs)
         basket_gbp=sum(
             float(safe_float(x.get("manager_current_r")) or 0.0) *
-            float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(x.get("asset")))
+            float(
+                safe_float(x.get("estimated_risk_amount"))
+                or safe_float(x.get("requested_risk_amount"))
+                or _metals_demo_risk(x.get("asset"))
+            )
             for x in links
         )
         key="METALS_BASKET"
-        prev=conn.execute("""SELECT high_water_r,high_water_pnl_gbp,high_water_seen_at,created_at_utc
-                             FROM metals_demo_basket_snapshots WHERE basket_key=?
-                             ORDER BY id DESC LIMIT 1""",(key,)).fetchone()
-        old_hwm=float(safe_float(prev["high_water_r"] if prev else None) or 0.0)
-        if br>old_hwm:
-            hwm=br; hwm_gbp=basket_gbp; hwm_seen=now_utc_iso()
+        side_set={_metals_demo_side(x.get("side")) for x in links if _metals_demo_side(x.get("side"))}
+        family_side=(
+            "FLAT" if not side_set else
+            next(iter(side_set)).upper() if len(side_set)==1 else
+            "MIXED"
+        )
+
+        if not links:
+            hwm=0.0
+            hwm_gbp=0.0
+            hwm_seen=""
+            gb=0.0
+            state="GREEN"
+            phase="FLAT"
+            family_reason=(
+                "Local Metals family basket is flat; family diagnostic HWM reset to zero. "
+                "Broker-authoritative HWM still resets only after a successful OANDA flat read."
+            )
         else:
-            hwm=old_hwm
-            hwm_gbp=safe_float(prev["high_water_pnl_gbp"] if prev else None)
-            if hwm_gbp is None:
-                risk_basis=(
-                    sum(float(safe_float(x.get("estimated_risk_amount")) or safe_float(x.get("requested_risk_amount")) or _metals_demo_risk(x.get("asset"))) for x in links)/len(links)
-                    if links else (float(METALS_DEMO_XAU_RISK_AMOUNT)+float(METALS_DEMO_XAG_RISK_AMOUNT))/2.0
-                )
-                hwm_gbp=hwm*risk_basis
-            hwm_seen=safe_str(prev["high_water_seen_at"] if prev else "")
-            if not hwm_seen and hwm>0 and prev:
-                hwm_seen=safe_str(prev["created_at_utc"])
-        gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0
-        state="RED" if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R else "AMBER" if gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT else "GREEN"
+            prior=cycle_peaks(key)
+            hwm=max(0.0,br,float(prior.get("r") or 0.0))
+            hwm_gbp=max(0.0,basket_gbp,float(prior.get("gbp") or 0.0))
+            if hwm_gbp <= 0:
+                hwm_seen=""
+            elif basket_gbp >= float(prior.get("gbp") or 0.0) - 1e-12:
+                hwm_seen=now_utc_iso()
+            else:
+                hwm_seen=safe_str(prior.get("gbp_seen"))
+            gb=((hwm-br)/hwm*100) if hwm>0 and br<hwm else 0
+            state="RED" if br<=METALS_DEMO_BASKET_SEVERE_LOSS_R else (
+                "AMBER" if gb>=METALS_DEMO_BASKET_GIVEBACK_WARN_PCT else "GREEN"
+            )
+            phase="MIXED"
+            family_reason="Family overlay does not directly close XAU/XAG trades."
+
         conn.execute("""INSERT INTO metals_demo_basket_snapshots
             (created_at_utc,review_signal_id,scope,basket_key,asset,side,open_count,matured_count,losing_count,losing_pct,
              basket_r,high_water_r,giveback_pct,basket_phase,state,action,reason,raw_json,
              basket_pnl_gbp,high_water_pnl_gbp,high_water_seen_at)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_utc_iso(),review_signal_id,"FAMILY",key,"","MIXED",len(links),
+            (now_utc_iso(),review_signal_id,"FAMILY",key,"",family_side,len(links),
              sum(1 for x in links if int(x.get("manager_last_review_candles") or 0)>=METALS_DEMO_MANAGER_MIN_HOLD_CANDLES),
              sum(1 for x in rs if x<0),(sum(1 for x in rs if x<0)/len(rs)*100 if rs else 0),
-             br,hwm,gb,"MIXED",state,"ADVISORY_ONLY",
-             "Family overlay does not directly close XAU/XAG trades.","{}",
+             br,hwm,gb,phase,state,"ADVISORY_ONLY",
+             family_reason,
+             json.dumps({"cycle_flat_boundary_snapshot_id":flat_id,"family_direction":family_side}),
              basket_gbp,hwm_gbp,hwm_seen))
         conn.commit()
-        snaps.append({"scope":"FAMILY","basket_key":key,"open_count":len(links),
-                      "basket_r":br,"basket_pnl_gbp":basket_gbp,"high_water_r":hwm,
-                      "high_water_pnl_gbp":hwm_gbp,"high_water_seen_at":hwm_seen,
-                      "giveback_pct":gb,"state":state,"action":"ADVISORY_ONLY"})
+        snaps.append({
+            "scope":"FAMILY","basket_key":key,"side":family_side,
+            "open_count":len(links),"basket_r":br,"basket_pnl_gbp":basket_gbp,
+            "high_water_r":hwm,"high_water_pnl_gbp":hwm_gbp,
+            "high_water_seen_at":hwm_seen,"giveback_pct":gb,
+            "basket_phase":phase,"state":state,"action":"ADVISORY_ONLY"
+        })
     return {"ok":True,"snapshots":snaps}
 
 def _metals_demo_apply_basket_defence(asset: str,signal_id: Any) -> List[Dict[str, Any]]:
@@ -25395,27 +25789,35 @@ def _metals_hwm_recovery_evidence(conn: Any) -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
 
     # Family snapshot evidence.
+    # v1.6.27: use raw point-in-time current basket cash/R after the current
+    # cycle boundary, NOT stored high_water_* fields. Older builds allowed those
+    # HWM fields to leak across a flat boundary, which could resurrect a prior
+    # long basket HWM inside a new short basket.
     try:
         params: List[Any] = []
         clause = ""
         if boundary.get("snapshot_id"):
             clause = " AND id>?"
             params.append(int(boundary["snapshot_id"]))
+        elif boundary_time:
+            clause = " AND created_at_utc>?"
+            params.append(boundary_time)
         row = conn.execute(f"""
-            SELECT id,high_water_pnl_gbp,high_water_r,high_water_seen_at,created_at_utc
+            SELECT id,basket_pnl_gbp,basket_r,created_at_utc
             FROM metals_demo_basket_snapshots
             WHERE basket_key='METALS_BASKET'
               {clause}
-              AND COALESCE(high_water_pnl_gbp,0)>0
-            ORDER BY high_water_pnl_gbp DESC,id DESC
+              AND COALESCE(open_count,0)>0
+              AND COALESCE(basket_pnl_gbp,0)>0
+            ORDER BY basket_pnl_gbp DESC,id DESC
             LIMIT 1
         """, tuple(params)).fetchone()
         if row:
             candidates.append({
-                "gbp": float(safe_float(row["high_water_pnl_gbp"]) or 0.0),
-                "r": float(safe_float(row["high_water_r"]) or 0.0),
-                "seen_at": safe_str(row["high_water_seen_at"] or row["created_at_utc"]),
-                "source": f"family_snapshot:{int(row['id'])}",
+                "gbp": float(safe_float(row["basket_pnl_gbp"]) or 0.0),
+                "r": float(safe_float(row["basket_r"]) or 0.0),
+                "seen_at": safe_str(row["created_at_utc"]),
+                "source": f"family_snapshot_current_peak:{int(row['id'])}",
             })
     except Exception:
         pass
@@ -25428,6 +25830,12 @@ def _metals_hwm_recovery_evidence(conn: Any) -> Dict[str, Any]:
         if boundary_signal_id > 0:
             clause = " AND mr.review_signal_id>?"
             params.append(boundary_signal_id)
+        elif boundary_time:
+            # Some manually/operationally written flat snapshots may not carry
+            # a review_signal_id. Fall back to the persisted boundary timestamp
+            # so manager-review evidence from a prior basket cannot leak across.
+            clause = " AND mr.created_at_utc>?"
+            params.append(boundary_time)
         rows = conn.execute(f"""
             SELECT mr.id,mr.review_signal_id,mr.link_id,mr.current_r,mr.created_at_utc,
                    l.estimated_risk_amount,l.requested_risk_amount,l.asset
@@ -35512,22 +35920,35 @@ def _mf_family_state():
             cycle_source = "new_focused_cycle_fallback"
 
         previous_cycle = focused_cycle
-        stored_hwm = float(
-            safe_float(
-                _metals_runtime_get(conn, "metals_focused_research_hwm_r", "0")
-            )
-            or 0.0
+
+        # v1.6.27: rebuild the focused HWM from cycle-local raw basket_R
+        # observations rather than trusting the previously stored focused HWM.
+        # This self-heals a focused HWM that was seeded from a stale broker HWM
+        # before the flat-boundary leak was fixed.
+        flat_boundary = conn.execute("""
+            SELECT id
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              AND COALESCE(open_count,0)=0
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+        flat_id = int(flat_boundary["id"]) if flat_boundary else 0
+        peak_row = conn.execute("""
+            SELECT MAX(basket_r) AS peak_r
+            FROM metals_demo_basket_snapshots
+            WHERE basket_key='METALS_BASKET'
+              AND id>?
+              AND COALESCE(open_count,0)>0
+        """, (flat_id,)).fetchone()
+        cycle_snapshot_hwm = float(
+            safe_float(peak_row["peak_r"] if peak_row else None) or 0.0
         )
 
-        if previous_cycle != cycle_id:
-            # New economic cycle: do not inherit any prior cycle HWM.
-            hwm = max(0.0, current_r)
-        else:
-            hwm = max(stored_hwm, current_r, 0.0)
+        hwm = max(0.0, current_r, cycle_snapshot_hwm)
 
         # Production broker HWM is the preferred seed only when the same durable
-        # harvest cycle is active. This keeps focused research aligned with the
-        # correct production HWM without allowing a prior cycle to leak forward.
+        # harvest cycle is active. The broker HWM itself is cycle-boundary guarded.
         if harvest_cycle and cycle_id == harvest_cycle and broker_hwm_open > 0:
             broker_hwm_r = float(
                 safe_float(_metals_runtime_get(conn, "broker_hwm_r", "0")) or 0.0
@@ -35893,6 +36314,43 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         old_seen = _metals_runtime_get(conn, "broker_hwm_seen_at", "")
         old_source = _metals_runtime_get(conn, "broker_hwm_source", "legacy_runtime_state")
 
+        # v1.6.27 cross-cycle integrity guard.
+        # If a proven flat/manual boundary is newer than the timestamp attached
+        # to the stored HWM, that HWM belongs to an earlier economic basket and
+        # must not survive into the active basket. This also self-heals the
+        # current short basket that inherited the prior long-cycle HWM.
+        cycle_boundary = _metals_current_cycle_boundary(conn)
+        boundary_type = safe_str(cycle_boundary.get("boundary_type")).upper()
+        boundary_time = safe_str(cycle_boundary.get("created_at_utc"))
+        boundary_dt = parse_dt(boundary_time)
+        old_seen_dt = parse_dt(old_seen)
+        stale_cycle_hwm = False
+        stale_cycle_previous: Dict[str, Any] = {}
+        if (
+            broker_ok
+            and open_count > 0
+            and (old_hwm_gbp > 0 or old_hwm_r > 0)
+            and boundary_type in {"BROKER_FLAT", "MANUAL_ECONOMIC_RESET"}
+            and boundary_dt is not None
+            and (old_seen_dt is None or old_seen_dt <= boundary_dt)
+        ):
+            stale_cycle_hwm = True
+            stale_cycle_previous = {
+                "high_water_gbp": old_hwm_gbp,
+                "high_water_r": old_hwm_r,
+                "seen_at": old_seen,
+                "source": old_source,
+                "boundary": cycle_boundary,
+            }
+            old_hwm_gbp = 0.0
+            old_hwm_r = 0.0
+            old_seen = ""
+            old_source = "cycle_boundary_reset_pending_recovery"
+            # This watermark belongs to the contaminated HWM too. Reset it so
+            # the harvest layer can classify any genuinely crossed current-cycle
+            # threshold as recovery evidence rather than silently skipping it.
+            _metals_runtime_set(conn, "metals_harvest_last_seen_hwm_r", 0.0)
+
         # Never treat an API failure as a flat basket.
         if not broker_ok:
             return {
@@ -35960,18 +36418,30 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         hwm_r = max(old_hwm_r, current_r, evidence_r)
         seen = old_seen
         source = old_source or "legacy_runtime_state"
-        historical_repair = False
+        historical_repair = bool(stale_cycle_hwm)
 
         if evidence_gbp > max(old_hwm_gbp, current_gbp) + 0.005:
             seen = evidence_seen or observed_at
-            source = f"historical_repair:{evidence_source}"
+            source = (
+                f"cycle_boundary_repair:{evidence_source}"
+                if stale_cycle_hwm else
+                f"historical_repair:{evidence_source}"
+            )
             historical_repair = True
         elif current_gbp > old_hwm_gbp + 0.005 and current_gbp >= evidence_gbp:
             seen = observed_at
-            source = "broker_cash_new_high"
+            source = (
+                "cycle_boundary_repair:broker_current"
+                if stale_cycle_hwm else
+                "broker_cash_new_high"
+            )
         elif not seen and hwm_gbp > 0:
             seen = evidence_seen or observed_at
-            source = evidence_source or "active_basket_seed"
+            source = (
+                f"cycle_boundary_repair:{evidence_source or 'active_basket_seed'}"
+                if stale_cycle_hwm else
+                (evidence_source or "active_basket_seed")
+            )
 
         # Repair an impossible post-market timestamp created by a deployment
         # without ever lowering the cash HWM.
@@ -36000,7 +36470,17 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         _metals_runtime_set(conn, "broker_hwm_seen_at", seen)
         _metals_runtime_set(conn, "broker_hwm_source", source)
 
-        if historical_repair:
+        if stale_cycle_hwm:
+            _record_metals_hwm_event(
+                conn, "CYCLE_BOUNDARY_REPAIR", seen or observed_at, open_count,
+                current_gbp, current_r, hwm_gbp, hwm_r, source,
+                {
+                    "discarded_previous": stale_cycle_previous,
+                    "current_cycle_evidence": evidence,
+                    "reason": "stored HWM timestamp predates latest flat/manual cycle boundary",
+                },
+            )
+        elif historical_repair:
             _record_metals_hwm_event(
                 conn, "HISTORICAL_REPAIR", seen, open_count,
                 current_gbp, current_r, hwm_gbp, hwm_r, source,
@@ -36039,6 +36519,8 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
         "source": source,
         "broker_read_ok": True,
         "historical_repair": historical_repair,
+        "cycle_boundary_repair": stale_cycle_hwm,
+        "cycle_boundary": cycle_boundary,
         "historical_evidence": evidence,
     }
 
@@ -38323,7 +38805,11 @@ def metals_hwm_recovery_preview() -> Dict[str, Any]:
         "recovery_evidence": evidence,
         "operator_floor_gbp": METALS_HWM_RECOVERY_FLOOR_GBP,
         "operator_floor_seen_at": METALS_HWM_RECOVERY_FLOOR_SEEN_AT,
-        "note": "Active HWM can only repair upward; automatic code never invents a historical value.",
+        "note": (
+            "Within one active economic basket, HWM remains monotonic. A stored HWM may be discarded only "
+            "when a newer broker-flat/manual cycle boundary proves it belongs to the previous basket; "
+            "current-cycle repair evidence is then rebuilt from post-boundary observations."
+        ),
         "time_utc": now_utc_iso(),
     }
 
@@ -38344,6 +38830,8 @@ def metals_build_integrity() -> Dict[str, Any]:
         "export_metals_research_zip",
         "export_metals_focused_research_zip",
         "_metals_broker_highwater_state",
+        "_metals_demo_prepare_direction_flip",
+        "_metals_demo_snapshot_baskets",
         "_metals_latest_30_signals_html",
         "_metals_recently_closed_trades_html",
         "_metals_profit_harvesting_html",
