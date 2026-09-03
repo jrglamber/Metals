@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.29 Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest
-# Cumulative on user-supplied v1.6.28; all v1.6.27 direction-flip and v1.6.28 live broker-HWM functionality retained; adds broker-authoritative weekly/monthly accounting only.
+# VERIFIED BUILD: Metals v1.6.30 Visible Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest
+# Cumulative on v1.6.29; moves weekly/monthly accounting to the top-level lazy Broker/OANDA/Accounting renderer so it is always visible and independently error-contained.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.29"
-METALS_BUILD_BASELINE = "cumulative user-supplied Metals v1.6.28 / 2026-09-02"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.30"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.29 / 2026-09-02"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Visible Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -38188,8 +38188,6 @@ def _metals_std_broker_html() -> str:
         <div class="mini-card"><div class="k">HWM Source</div><div class="v pos">OANDA</div><div class="small">XAU/XAG open P&amp;L · refreshed continuously</div></div>
       </div>
 
-      {_metals_accounting_performance_html(broker)}
-
       <h3>Live Promotion Readiness</h3>
       <div class="table-scroll"><table><thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
       <tbody>{readiness_rows}</tbody></table></div>
@@ -38813,10 +38811,53 @@ def _metals_standard_latest_signals_combined_html():
       <div class="research-inner-body">""" + _metals_std_signal_state_html() + """</div></details>"""
 
 
+def _metals_accounting_performance_safe_html() -> str:
+    """
+    Independent accounting renderer for the lazy Broker/OANDA/Accounting section.
+
+    A transient accounting/OANDA/ledger problem must not hide the rest of the
+    Broker section. Conversely, a failure elsewhere in the inner broker panel
+    must not silently remove the accounting heading from the lazy wrapper.
+    """
+    try:
+        return _metals_accounting_performance_html()
+    except Exception as exc:
+        return f"""
+          <h3>Weekly / Monthly Profit Accounting</h3>
+          <div class="section-note neg">
+            <strong>Accounting panel could not load.</strong><br>
+            {esc(type(exc).__name__)}: {esc(exc)}<br>
+            The rest of Broker / OANDA / Accounting remains available.
+          </div>
+          <div class="section-note small">
+            <a href="/broker/metals-demo/accounting-performance">
+              Open accounting-performance JSON diagnostics
+            </a>
+          </div>
+        """
+
+
 def _metals_standard_broker_combined_html():
-    return _metals_std_broker_html() + """
-      <details><summary>Execution / Reconciliation</summary>
-      <div class="research-inner-body">""" + _metals_std_execution_html() + """</div></details>"""
+    accounting = _metals_accounting_performance_safe_html()
+    broker_core = _metals_std_broker_html()
+    execution = _metals_std_execution_html()
+    return f"""
+      <details open class="dashboard-group">
+        <summary>Weekly / Monthly Profit Accounting</summary>
+        <div class="research-inner-body">
+          {accounting}
+        </div>
+      </details>
+
+      {broker_core}
+
+      <details>
+        <summary>Execution / Reconciliation</summary>
+        <div class="research-inner-body">
+          {execution}
+        </div>
+      </details>
+    """
 
 
 def _metals_standard_manager_protection_html():
@@ -39251,6 +39292,8 @@ def metals_build_integrity() -> Dict[str, Any]:
         "_metals_profit_harvesting_html",
         "metals_accounting_performance",
         "_metals_accounting_performance_html",
+        "_metals_accounting_performance_safe_html",
+        "_metals_standard_broker_combined_html",
         "metals_manual_start_new_basket_cycle_impl",
         "metals_standard_dashboard",
     ]
