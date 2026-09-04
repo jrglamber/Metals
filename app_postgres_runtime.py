@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.30 Visible Weekly/Monthly Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest
-# Cumulative on v1.6.29; moves weekly/monthly accounting to the top-level lazy Broker/OANDA/Accounting renderer so it is always visible and independently error-contained.
+# VERIFIED BUILD: Metals v1.6.31 XAU LONG Live Pilot + Split Live/Demo Lanes + MFE50/Harvest
+# Cumulative on v1.6.30. Adds a dedicated fail-closed XAU LONG live pilot lane while retaining XAU SHORT + XAG LONG/SHORT on practice. All v1.6.30 accounting, v1.6.28 HWM and v1.6.27 direction-flip functionality retained.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.30"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.29 / 2026-09-02"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Visible Accounting + Live Broker HWM + Direction Flip Reset + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.31"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.30 / 2026-09-04"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU LONG Live Pilot + Demo Research Lanes + MFE50/Harvest"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1021,6 +1021,34 @@ METALS_DEMO_MODEL_VERSION = "metal_generated_short_clean_v2_demo"
 METALS_SHORT_SHADOW_V2_EXPORT_VERSION = "metal_short_shadow_v2_cleaned_export_v1"
 METALS_DEMO_LABEL = "DEMO ONLY — NO LIVE MONEY"
 
+
+# ============================================================
+# v1.6.31 — DEDICATED XAU LONG LIVE PILOT LANE
+# ============================================================
+# XAU LONG -> dedicated live OANDA lane.
+# XAU SHORT + XAG LONG/SHORT -> existing OANDA practice lane.
+# Live XAU state is isolated from practice HWM/harvest/accounting.
+# Live promotion and live writes are both fail-closed. Promotion defaults OFF until the operator explicitly enables it after checking the live preview.
+METALS_XAU_LONG_LIVE_PROMOTION_ENABLED = env_bool("METALS_XAU_LONG_LIVE_PROMOTION_ENABLED", False)
+METALS_XAU_LIVE_BROKER_ENABLED = env_bool("METALS_XAU_LIVE_BROKER_ENABLED", True)
+METALS_XAU_LIVE_EXECUTION_ARMED = env_bool("METALS_XAU_LIVE_EXECUTION_ARMED", False)
+METALS_XAU_LIVE_OANDA_ENV = os.getenv("METALS_XAU_LIVE_OANDA_ENV", "live").strip().lower()
+METALS_XAU_LIVE_OANDA_ACCOUNT_ID = os.getenv("METALS_XAU_LIVE_OANDA_ACCOUNT_ID", "").strip()
+METALS_XAU_LIVE_OANDA_API_TOKEN = os.getenv("METALS_XAU_LIVE_OANDA_API_TOKEN", "").strip()
+METALS_XAU_LIVE_OANDA_API_BASE = os.getenv("METALS_XAU_LIVE_OANDA_API_BASE", "https://api-fxtrade.oanda.com").rstrip("/")
+METALS_XAU_LIVE_ALLOWED_INSTRUMENT = "XAU_USD"
+METALS_XAU_LIVE_ALLOWED_SIDE = "long"
+METALS_XAU_LIVE_LABEL = "XAU LONG — LIVE PILOT"
+METALS_XAU_LIVE_REQUIRE_GBP_ACCOUNT = env_bool("METALS_XAU_LIVE_REQUIRE_GBP_ACCOUNT", True)
+METALS_XAU_LIVE_RISK_AMOUNT = float(os.getenv("METALS_XAU_LIVE_RISK_AMOUNT", str(METALS_DEMO_XAU_RISK_AMOUNT)))
+METALS_XAU_LIVE_SL_PCT = float(os.getenv("METALS_XAU_LIVE_SL_PCT", str(METALS_DEMO_XAU_SL_PCT)))
+METALS_XAU_LIVE_MAX_RISK_OVERAGE_PCT = float(os.getenv("METALS_XAU_LIVE_MAX_RISK_OVERAGE_PCT", str(METALS_DEMO_XAU_MAX_RISK_OVERAGE_PCT)))
+METALS_XAU_LIVE_MAX_OPEN_TRADES = max(1, int(float(os.getenv("METALS_XAU_LIVE_MAX_OPEN_TRADES", str(METALS_DEMO_MAX_OPEN_TRADES_PER_ASSET)))))
+METALS_XAU_LIVE_MANAGER_ENABLED = env_bool("METALS_XAU_LIVE_MANAGER_ENABLED", True)
+METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED = env_bool("METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED", True)
+METALS_XAU_LIVE_POLICY_VERSION = "metals_xau_long_live_pilot_v1_2026_09_04"
+METALS_XAU_LIVE_HARVEST_POLICY_VERSION = "metals_xau_live_harvest_v1_50r_spacing_20_20_25_2026_09_04"
+
 # v10.1.27: isolated OANDA-practice basket-manager simulation for both metal directions.
 METALS_DEMO_SIMULATE_LONGS = env_bool("METALS_DEMO_SIMULATE_LONGS", True)
 METALS_DEMO_SIMULATE_SHORTS = env_bool("METALS_DEMO_SIMULATE_SHORTS", True)
@@ -1432,6 +1460,14 @@ EXPORT_TABLES = {
     "metals-demo-harvest-stages": "metals_demo_harvest_stages",
     "metals-demo-harvest-events": "metals_demo_harvest_events",
     "metals-broker-only-recovery": "metals_demo_broker_only_recovery_audit",
+    "metals-xau-live-trades": "metals_xau_live_trade_links",
+    "metals-xau-live-audit": "metals_xau_live_execution_audit",
+    "metals-xau-live-queue": "metals_xau_live_action_queue",
+    "metals-xau-live-manager-reviews": "metals_xau_live_manager_reviews",
+    "metals-xau-live-hwm-events": "metals_xau_live_hwm_events",
+    "metals-xau-live-harvest-stages": "metals_xau_live_harvest_stages",
+    "metals-xau-live-harvest-events": "metals_xau_live_harvest_events",
+    "metals-xau-live-broker-transactions": "metals_xau_live_broker_transactions",
 }
 
 # v10.1.09: production/live-only bundle. Research-only tables are deliberately
@@ -1466,6 +1502,14 @@ LIVE_ANALYSIS_EXPORT_TABLES = {
     "metals-demo-harvest-stages": "metals_demo_harvest_stages",
     "metals-demo-harvest-events": "metals_demo_harvest_events",
     "metals-broker-only-recovery": "metals_demo_broker_only_recovery_audit",
+    "metals-xau-live-trades": "metals_xau_live_trade_links",
+    "metals-xau-live-audit": "metals_xau_live_execution_audit",
+    "metals-xau-live-queue": "metals_xau_live_action_queue",
+    "metals-xau-live-manager-reviews": "metals_xau_live_manager_reviews",
+    "metals-xau-live-hwm-events": "metals_xau_live_hwm_events",
+    "metals-xau-live-harvest-stages": "metals_xau_live_harvest_stages",
+    "metals-xau-live-harvest-events": "metals_xau_live_harvest_events",
+    "metals-xau-live-broker-transactions": "metals_xau_live_broker_transactions",
 }
 
 
@@ -8248,6 +8292,116 @@ def _init_db_full() -> None:
             )
         """)
 
+        # v1.6.31 XAU LONG live pilot durable state.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_trade_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER NOT NULL UNIQUE,
+                asset TEXT NOT NULL, instrument TEXT NOT NULL, side TEXT NOT NULL,
+                model_version TEXT, signal_time TEXT, entry_signal_id INTEGER,
+                requested_risk_amount REAL, estimated_risk_amount REAL,
+                requested_units REAL, filled_units REAL,
+                entry_price REAL, stop_price REAL, current_stop_price REAL,
+                broker_trade_id TEXT, broker_order_id TEXT, broker_open_time_utc TEXT,
+                status TEXT NOT NULL, last_known_price REAL, last_known_unrealized_pl REAL,
+                realized_pl REAL, financing REAL, closed_at_utc TEXT, close_reason TEXT,
+                manager_current_r REAL, manager_high_water_r REAL, manager_mfe_r REAL, manager_mae_r REAL,
+                manager_last_review_signal_id INTEGER, manager_last_review_candles INTEGER,
+                manager_last_decision TEXT, manager_last_reason TEXT,
+                fixed_48h_price REAL, fixed_48h_r REAL, fixed_48h_recorded_at_utc TEXT,
+                active_exit_policy TEXT, active_exit_policy_version TEXT,
+                active_exit_policy_started_at_utc TEXT, last_reconciled_at_utc TEXT,
+                raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_links_status ON metals_xau_live_trade_links(status, created_at_utc)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_metals_xau_live_broker_trade ON metals_xau_live_trade_links(broker_trade_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_execution_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, raw_signal_id INTEGER, link_id INTEGER,
+                action TEXT NOT NULL, status TEXT NOT NULL, message TEXT,
+                requested_risk_amount REAL, estimated_risk_amount REAL, requested_units REAL,
+                actual_units REAL, spread_pct REAL, entry_price REAL, stop_price REAL,
+                broker_trade_id TEXT, broker_order_id TEXT, response_status_code INTEGER,
+                raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_audit_signal ON metals_xau_live_execution_audit(raw_signal_id, created_at_utc)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_action_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+                raw_signal_id INTEGER, link_id INTEGER, action TEXT NOT NULL,
+                status TEXT NOT NULL, reason TEXT, attempts INTEGER DEFAULT 0,
+                last_error TEXT, raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_queue_status ON metals_xau_live_action_queue(status, created_at_utc)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_manager_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, link_id INTEGER NOT NULL,
+                raw_signal_id INTEGER, review_signal_id INTEGER, hold_candles INTEGER,
+                current_price REAL, current_r REAL, mfe_r REAL, mae_r REAL,
+                high_water_r REAL, giveback_pct REAL, decision TEXT, reason TEXT,
+                proposed_stop_price REAL, stop_update_status TEXT, close_queue_status TEXT,
+                fixed_48h_price REAL, fixed_48h_r REAL, raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_reviews_link ON metals_xau_live_manager_reviews(link_id, created_at_utc)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_runtime_state (
+                key TEXT PRIMARY KEY, value TEXT, updated_at_utc TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_hwm_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, observed_at_utc TEXT,
+                event_type TEXT NOT NULL, open_count INTEGER,
+                current_gbp REAL, current_r REAL, high_water_gbp REAL, high_water_r REAL,
+                source TEXT, raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_hwm_events_time ON metals_xau_live_hwm_events(created_at_utc)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_harvest_stages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+                policy_version TEXT NOT NULL, cycle_id TEXT NOT NULL,
+                threshold_r INTEGER NOT NULL, bank_fraction REAL NOT NULL,
+                status TEXT NOT NULL, armed_at_utc TEXT, executed_at_utc TEXT,
+                armed_hwm_r REAL, armed_hwm_gbp REAL, trigger_current_r REAL,
+                trigger_current_gbp REAL, trigger_profitable_pool_gbp REAL,
+                target_bank_gbp REAL, executed_bank_gbp REAL DEFAULT 0,
+                selected_link_ids TEXT, selected_broker_trade_ids TEXT,
+                selected_expected_gbp REAL DEFAULT 0, attempts INTEGER DEFAULT 0,
+                reason TEXT, raw_json TEXT, UNIQUE(cycle_id, threshold_r)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_harvest_cycle ON metals_xau_live_harvest_stages(cycle_id, threshold_r)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_harvest_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL, policy_version TEXT NOT NULL,
+                cycle_id TEXT NOT NULL, stage_id INTEGER, threshold_r INTEGER,
+                bank_fraction REAL, link_id INTEGER, broker_trade_id TEXT,
+                expected_upl_gbp REAL, realized_pl_gbp REAL, status TEXT,
+                reason TEXT, raw_json TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xau_live_broker_transactions (
+                transaction_id TEXT PRIMARY KEY, synced_at_utc TEXT NOT NULL,
+                transaction_time TEXT, transaction_type TEXT, instrument TEXT,
+                pl_gbp REAL DEFAULT 0, financing_gbp REAL DEFAULT 0,
+                net_realized_gbp REAL DEFAULT 0, account_balance REAL, raw_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_xau_live_tx_time ON metals_xau_live_broker_transactions(transaction_time)")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS metals_demo_xag_confirmation_guard (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10445,6 +10599,8 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
                 }
             result["metals_demo_lane"] = execute_metals_demo_candidate(int(new_signal_db_id), source=source)
             result["metals_demo_reconcile"] = metals_demo_reconcile_and_close(_scope_pair)
+            if _metals_demo_asset(_scope_pair) == "XAUUSD":
+                result["xau_long_live_manager"] = metals_xau_live_manager_tick(force=True, source=source)
             result["focused_research"] = record_metals_focused_research(int(new_signal_db_id))
             try:
                 _scope_asset = _metals_demo_asset(_scope_pair)
@@ -23027,7 +23183,7 @@ def export_research_bundles_page() -> str:
     <html><head><title>Project Exit Plan Exports</title></head>
     <body style="font-family: Arial, sans-serif; background:#08111f; color:#eaf2ff; padding:24px;">
         <h1>Project Exit Plan — Metals Exports</h1>
-        <p>This standalone project is hard-scoped to XAU/XAG research and OANDA practice execution.</p>
+        <p>This standalone project is hard-scoped to XAU/XAG. XAU LONG can run as a dedicated live pilot; XAU SHORT and XAG remain OANDA practice.</p>
         <ul>
             <li><a style="color:#7dd3fc" href="/export/live.zip">Live analysis ZIP</a> — production NAS100/US500 trading, broker and protection data.</li>
             <li><a style="color:#7dd3fc" href="/export/metals-research.zip">Metals research ZIP</a> — XAU/XAG long/short research and isolated demo evidence.</li>
@@ -23145,6 +23301,7 @@ def metals_demo_config_status() -> Dict[str, Any]:
         "orders_allowed": bool(
             METALS_DEMO_BROKER_ENABLED
             and METALS_DEMO_OANDA_ENV in {"practice","live"}
+            and ((not METALS_XAU_LONG_LIVE_PROMOTION_ENABLED) or METALS_DEMO_OANDA_ENV == "practice")
             and (METALS_DEMO_OANDA_ENV != "live" or METALS_LIVE_EXECUTION_ARMED)
             and not missing
             and not live_overlap
@@ -23185,35 +23342,104 @@ def metals_demo_config_status() -> Dict[str, Any]:
             "no_retroactive_existing_basket": METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET,
         },
         "live_execution_armed": METALS_LIVE_EXECUTION_ARMED,
-        "safety_note": "Standalone XAU/XAG ownership. Same lane supports practice or live; live writes additionally require METALS_LIVE_EXECUTION_ARMED=true.",
+        "split_execution": {
+            "xau_long": "LIVE_XAU_LONG" if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED else "LEGACY_DEMO_LANE",
+            "xau_short": "PRACTICE", "xag_long": "PRACTICE", "xag_short": "PRACTICE",
+        },
+        "safety_note": (
+            "Split-lane mode: XAU LONG routes only to dedicated live lane; XAU SHORT and XAG remain practice."
+            if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED else
+            "Legacy standalone XAU/XAG practice/live lane mode."
+        ),
     }
 
 
-def metals_demo_request(path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def metals_demo_request(
+    path: str,
+    method: str = "GET",
+    body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     cfg = metals_demo_config_status()
     if cfg["missing"]:
-        return {"ok": False, "blocked": True, "error": "Missing metals demo config: " + ",".join(cfg["missing"])}
-    if METALS_DEMO_OANDA_ENV not in {"practice","live"}:
-        return {"ok": False, "blocked": True, "error": f"Unsupported Metals OANDA environment: {METALS_DEMO_OANDA_ENV}"}
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": "Missing metals demo config: " + ",".join(cfg["missing"]),
+        }
+    if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED and METALS_DEMO_OANDA_ENV != "practice":
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": (
+                "Split-lane safety: METALS_DEMO_OANDA_ENV must remain practice "
+                "while XAU LONG live promotion is enabled."
+            ),
+        }
+    if METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": f"Unsupported Metals OANDA environment: {METALS_DEMO_OANDA_ENV}",
+        }
     if method.upper() != "GET" and not cfg["orders_allowed"]:
-        return {"ok": False, "blocked": True, "error": "Metals demo execution disabled or live-instrument overlap detected", "config": cfg}
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": (
+                "Metals demo execution disabled, not practice-safe, "
+                "or live-instrument overlap detected"
+            ),
+            "config": cfg,
+        }
+
     clean_path = "/" + safe_str(path).lstrip("/")
-    data = None if method.upper() == "GET" else json.dumps(body or {}).encode("utf-8")
+    data = (
+        None
+        if method.upper() == "GET"
+        else json.dumps(body or {}).encode("utf-8")
+    )
     req = urllib.request.Request(
-        METALS_DEMO_OANDA_API_BASE + clean_path, data=data, method=method.upper(),
-        headers={"Authorization": f"Bearer {METALS_DEMO_OANDA_API_TOKEN}", "Accept": "application/json", "Content-Type": "application/json"},
+        METALS_DEMO_OANDA_API_BASE + clean_path,
+        data=data,
+        method=method.upper(),
+        headers={
+            "Authorization": f"Bearer {METALS_DEMO_OANDA_API_TOKEN}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
     )
     try:
-        with urllib.request.urlopen(req, timeout=OANDA_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            req, timeout=OANDA_TIMEOUT_SECONDS
+        ) as resp:
             text = resp.read().decode("utf-8")
-            return {"ok": True, "status_code": resp.status, "data": json.loads(text) if text else {}, "url_path": clean_path}
-    except urllib.error.HTTPError as e:
-        text = e.read().decode("utf-8", errors="replace")
-        try: payload = json.loads(text) if text else {}
-        except Exception: payload = {"raw_body": text}
-        return {"ok": False, "status_code": e.code, "error": str(e), "data": payload, "url_path": clean_path}
-    except Exception as e:
-        return {"ok": False, "status_code": None, "error": str(e), "url_path": clean_path}
+            return {
+                "ok": True,
+                "status_code": resp.status,
+                "data": json.loads(text) if text else {},
+                "url_path": clean_path,
+            }
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text) if text else {}
+        except Exception:
+            payload = {"raw_body": text}
+        return {
+            "ok": False,
+            "status_code": exc.code,
+            "error": str(exc),
+            "data": payload,
+            "url_path": clean_path,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(exc),
+            "url_path": clean_path,
+        }
+
 
 
 
@@ -24388,6 +24614,1910 @@ def _metals_demo_prepare_direction_flip(
     }
 
 
+# ============================================================
+# v1.6.31 — XAU LONG LIVE PILOT IMPLEMENTATION
+# ============================================================
+_METALS_XAU_LIVE_TX_SYNC_LOCK = threading.Lock()
+_METALS_XAU_LIVE_TX_SYNC_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
+_METALS_XAU_LIVE_MARKET_LOCK = threading.Lock()
+_METALS_XAU_LIVE_MARKET_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
+_METALS_XAU_LIVE_MANAGER_LOCK = threading.Lock()
+
+
+def _metals_xau_live_runtime_get(conn: Any, key: str, default: str = "") -> str:
+    row = conn.execute(
+        "SELECT value FROM metals_xau_live_runtime_state WHERE key=? LIMIT 1",
+        (safe_str(key),),
+    ).fetchone()
+    return safe_str(row["value"]) if row else default
+
+
+def _metals_xau_live_runtime_set(conn: Any, key: str, value: Any) -> None:
+    conn.execute("""
+        INSERT INTO metals_xau_live_runtime_state(key,value,updated_at_utc)
+        VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,
+            updated_at_utc=excluded.updated_at_utc
+    """, (safe_str(key), safe_str(value), now_utc_iso()))
+
+
+def metals_xau_live_config_status() -> Dict[str, Any]:
+    missing: List[str] = []
+    if not METALS_XAU_LIVE_OANDA_ACCOUNT_ID:
+        missing.append("METALS_XAU_LIVE_OANDA_ACCOUNT_ID")
+    if not METALS_XAU_LIVE_OANDA_API_TOKEN:
+        missing.append("METALS_XAU_LIVE_OANDA_API_TOKEN")
+    environment_ok = METALS_XAU_LIVE_OANDA_ENV == "live"
+    orders_allowed = bool(
+        METALS_XAU_LONG_LIVE_PROMOTION_ENABLED
+        and METALS_XAU_LIVE_BROKER_ENABLED
+        and METALS_XAU_LIVE_EXECUTION_ARMED
+        and environment_ok
+        and not missing
+    )
+    return {
+        "label": METALS_XAU_LIVE_LABEL,
+        "promotion_enabled": METALS_XAU_LONG_LIVE_PROMOTION_ENABLED,
+        "broker_enabled": METALS_XAU_LIVE_BROKER_ENABLED,
+        "execution_armed": METALS_XAU_LIVE_EXECUTION_ARMED,
+        "environment": METALS_XAU_LIVE_OANDA_ENV,
+        "environment_ok": environment_ok,
+        "account_id": METALS_XAU_LIVE_OANDA_ACCOUNT_ID,
+        "token_present": bool(METALS_XAU_LIVE_OANDA_API_TOKEN),
+        "missing": missing,
+        "orders_allowed": orders_allowed,
+        "owned_instrument": METALS_XAU_LIVE_ALLOWED_INSTRUMENT,
+        "owned_side": "LONG",
+        "shared_live_nav_with_indices": True,
+        "other_live_account_instruments_ignored": True,
+        "accounting_historical_backfill": False,
+        "broker_only_recovery": "EXACT_LIVE_EXECUTION_AUDIT_ONLY",
+        "persistent_close_until_flat": True,
+        "risk_gbp_requested": METALS_XAU_LIVE_RISK_AMOUNT,
+        "sl_pct": METALS_XAU_LIVE_SL_PCT,
+        "max_risk_overage_pct": METALS_XAU_LIVE_MAX_RISK_OVERAGE_PCT,
+        "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
+        "active_exit_policy_version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
+        "harvest_policy_version": METALS_XAU_LIVE_HARVEST_POLICY_VERSION,
+    }
+
+
+def _metals_xau_live_request(path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = metals_xau_live_config_status()
+    if cfg.get("missing"):
+        return {"ok": False, "blocked": True, "error": "Missing XAU live config: " + ",".join(cfg.get("missing") or [])}
+    if METALS_XAU_LIVE_OANDA_ENV != "live":
+        return {"ok": False, "blocked": True, "error": "XAU live lane requires METALS_XAU_LIVE_OANDA_ENV=live"}
+    if method.upper() != "GET" and not cfg.get("orders_allowed"):
+        return {"ok": False, "blocked": True, "error": "XAU live broker writes are not armed", "config": cfg}
+    clean_path = "/" + safe_str(path).lstrip("/")
+    data = None if method.upper() == "GET" else json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        METALS_XAU_LIVE_OANDA_API_BASE + clean_path,
+        data=data,
+        method=method.upper(),
+        headers={
+            "Authorization": f"Bearer {METALS_XAU_LIVE_OANDA_API_TOKEN}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OANDA_TIMEOUT_SECONDS) as resp:
+            text = resp.read().decode("utf-8")
+            return {"ok": True, "status_code": resp.status, "data": json.loads(text) if text else {}, "url_path": clean_path}
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text) if text else {}
+        except Exception:
+            payload = {"raw_body": text}
+        return {"ok": False, "status_code": e.code, "error": str(e), "data": payload, "url_path": clean_path}
+    except Exception as e:
+        return {"ok": False, "status_code": None, "error": str(e), "url_path": clean_path}
+
+
+def _metals_xau_live_audit(raw_signal_id: int, action: str, status: str, message: str = "", preview: Optional[Dict[str, Any]] = None, response: Optional[Dict[str, Any]] = None, link_id: Optional[int] = None, broker_trade_id: str = "", broker_order_id: str = "") -> None:
+    try:
+        p = preview or {}
+        r = response or {}
+        fill = ((r.get("data") or {}).get("orderFillTransaction") or {})
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT INTO metals_xau_live_execution_audit(
+                    created_at_utc,raw_signal_id,link_id,action,status,message,
+                    requested_risk_amount,estimated_risk_amount,requested_units,
+                    actual_units,spread_pct,entry_price,stop_price,
+                    broker_trade_id,broker_order_id,response_status_code,raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                now_utc_iso(), int(raw_signal_id or 0), link_id, safe_str(action), safe_str(status), safe_str(message),
+                safe_float(p.get("requested_risk_gbp") or p.get("risk_amount")), safe_float(p.get("estimated_risk_gbp")), safe_float(p.get("units")),
+                safe_float(fill.get("units")), safe_float(p.get("spread_pct")), safe_float(p.get("entry_price")), safe_float(p.get("stop_price")),
+                safe_str(broker_trade_id), safe_str(broker_order_id), r.get("status_code"), json.dumps({"preview": p, "response": r}, default=str),
+            ))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def metals_xau_live_sizing_preview() -> Dict[str, Any]:
+    cfg = metals_xau_live_config_status()
+    out: Dict[str, Any] = {
+        "ok": False, "asset": "XAUUSD", "instrument": METALS_XAU_LIVE_ALLOWED_INSTRUMENT,
+        "side": "long", "label": METALS_XAU_LIVE_LABEL,
+        "requested_risk_gbp": METALS_XAU_LIVE_RISK_AMOUNT, "risk_amount": METALS_XAU_LIVE_RISK_AMOUNT,
+        "sl_pct": METALS_XAU_LIVE_SL_PCT, "warnings": [], "blocking_reasons": [],
+    }
+    if cfg.get("missing") or not cfg.get("environment_ok"):
+        out["blocking_reasons"].append("live_config_not_ready")
+        out["executable"] = False
+        return out
+    summary = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/summary")
+    acct = ((summary.get("data") or {}).get("account") or {}) if summary.get("ok") else {}
+    currency = safe_str(acct.get("currency")).upper()
+    out["oanda_account_currency"] = currency
+    if METALS_XAU_LIVE_REQUIRE_GBP_ACCOUNT and currency != "GBP":
+        out["blocking_reasons"].append(f"oanda_live_account_currency_not_gbp:{currency or 'UNKNOWN'}")
+        out["executable"] = False
+        return out
+    instrument = METALS_XAU_LIVE_ALLOWED_INSTRUMENT
+    meta_resp = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/instruments?instruments={urllib.parse.quote(instrument)}")
+    price_resp = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(instrument)}&includeHomeConversions=true")
+    metas = meta_resp.get("data", {}).get("instruments", []) if meta_resp.get("ok") else []
+    pricing = price_resp.get("data", {}) if price_resp.get("ok") else {}
+    prices = pricing.get("prices", []) or []
+    conversion = _metals_home_conversion(pricing, "USD")
+    if not metas or not prices or not conversion.get("ok"):
+        out["blocking_reasons"].append("instrument_price_or_home_conversion_unavailable")
+        out["executable"] = False
+        return out
+    meta, price = metas[0], prices[0]
+    bid = safe_float((price.get("bids") or [{}])[0].get("price")); ask = safe_float((price.get("asks") or [{}])[0].get("price"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        out["blocking_reasons"].append("invalid_bid_ask"); out["executable"] = False; return out
+    entry = float(ask); mid = (float(bid)+float(ask))/2.0; spread_pct = ((float(ask)-float(bid))/mid*100.0) if mid else None
+    stop = entry * (1.0 - METALS_XAU_LIVE_SL_PCT/100.0)
+    stop_usd = abs(entry-stop); usd_to_gbp = float(conversion["account_loss_factor"]); stop_gbp = stop_usd * usd_to_gbp
+    min_units = safe_float(meta.get("minimumTradeSize")) or 1.0; precision = int(safe_float(meta.get("tradeUnitsPrecision")) or 0); step = 10 ** (-precision)
+    raw_units = METALS_XAU_LIVE_RISK_AMOUNT / stop_gbp if stop_gbp > 0 else 0.0; floored = int(raw_units/step)*step if step > 0 else raw_units; units = max(float(min_units), float(floored))
+    estimated = units * stop_gbp; overage = ((estimated-METALS_XAU_LIVE_RISK_AMOUNT)/METALS_XAU_LIVE_RISK_AMOUNT*100.0) if METALS_XAU_LIVE_RISK_AMOUNT else 0.0
+    if spread_pct is not None and spread_pct > METALS_DEMO_MAX_SPREAD_PCT_XAU:
+        out["blocking_reasons"].append("spread_over_limit")
+    if units == float(min_units) and raw_units < float(min_units) and overage > METALS_XAU_LIVE_MAX_RISK_OVERAGE_PCT:
+        out["blocking_reasons"].append("minimum_size_risk_overage_above_live_limit")
+    out.update({
+        "ok": True, "bid": bid, "ask": ask, "entry_price": entry, "spread_pct": spread_pct,
+        "stop_price": stop, "units": units, "raw_units": raw_units, "minimum_trade_size": min_units,
+        "estimated_risk_gbp": estimated, "estimated_risk_overage_pct": overage,
+        "display_precision": int(safe_float(meta.get("displayPrecision")) or 3),
+        "executable": bool(not out["blocking_reasons"] and cfg.get("orders_allowed")),
+        "orders_currently_armed": bool(cfg.get("orders_allowed")),
+    })
+    return out
+
+
+def metals_xau_live_broker_snapshot(include_account_summary: bool = True) -> Dict[str, Any]:
+    cfg = metals_xau_live_config_status()
+    if cfg.get("missing") or not cfg.get("environment_ok"):
+        return {"ok": False, "account": {}, "owned_open_trades": [], "owned_open_count": 0, "owned_unrealized_pl": 0.0, "foreign_xau_short_trades": [], "ownership_conflict": False, "error": "xau_live_config_not_ready"}
+    acct: Dict[str, Any] = {}
+    if include_account_summary:
+        sr = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/summary")
+        if sr.get("ok"):
+            raw = sr.get("data") or {}; acct = raw.get("account") or raw
+    resp = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/openTrades")
+    if not resp.get("ok"):
+        return {"ok": False, "account": acct, "owned_open_trades": [], "owned_open_count": 0, "owned_unrealized_pl": 0.0, "foreign_xau_short_trades": [], "ownership_conflict": False, "error": resp.get("error")}
+    all_trades = (resp.get("data") or {}).get("trades", []) or []
+    xau = [t for t in all_trades if safe_str(t.get("instrument")).upper() == METALS_XAU_LIVE_ALLOWED_INSTRUMENT]
+    owned = [t for t in xau if float(safe_float(t.get("currentUnits")) or 0.0) > 0]
+    shorts = [t for t in xau if float(safe_float(t.get("currentUnits")) or 0.0) < 0]
+    return {
+        "ok": True, "account": acct, "owned_open_trades": owned, "owned_open_count": len(owned),
+        "owned_unrealized_pl": sum(float(safe_float(t.get("unrealizedPL")) or 0.0) for t in owned),
+        "owned_margin_used": sum(float(safe_float(t.get("marginUsed")) or 0.0) for t in owned),
+        "all_xau_trades": xau, "xau_open_count": len(xau), "foreign_xau_short_trades": shorts,
+        "foreign_xau_short_count": len(shorts), "ownership_conflict": bool(shorts), "account_open_count": len(all_trades),
+        "time_utc": now_utc_iso(),
+    }
+
+
+def _metals_xau_live_market_state(force: bool = False) -> Dict[str, Any]:
+    with _METALS_XAU_LIVE_MARKET_LOCK:
+        cached = _METALS_XAU_LIVE_MARKET_CACHE.get("result"); age = time.time() - float(_METALS_XAU_LIVE_MARKET_CACHE.get("at") or 0.0)
+        if not force and cached is not None and age < 30.0:
+            return dict(cached)
+    cfg = metals_xau_live_config_status()
+    if cfg.get("missing") or not cfg.get("environment_ok"):
+        result = {"ok": False, "tradeable": None, "latest_price_time": "", "reason": "config_not_ready"}
+    else:
+        resp = _metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/pricing?instruments={urllib.parse.quote(METALS_XAU_LIVE_ALLOWED_INSTRUMENT)}")
+        prices = (resp.get("data") or {}).get("prices", []) if resp.get("ok") else []; p = prices[0] if prices else {}
+        result = {"ok": bool(resp.get("ok")), "tradeable": safe_str(p.get("status")).upper() == "TRADEABLE" if p else None, "latest_price_time": safe_str(p.get("time")), "reason": "" if resp.get("ok") else safe_str(resp.get("error"))}
+    with _METALS_XAU_LIVE_MARKET_LOCK:
+        _METALS_XAU_LIVE_MARKET_CACHE.update({"at": time.time(), "result": dict(result)})
+    return result
+
+
+def _metals_xau_live_basket_r(broker: Dict[str, Any]) -> Dict[str, Any]:
+    by_id = {safe_str(t.get("id")): t for t in broker.get("owned_open_trades") or []}
+    with get_conn() as conn:
+        links = [dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
+    total = 0.0; details = []
+    for link in links:
+        bt = by_id.get(safe_str(link.get("broker_trade_id")))
+        if not bt: continue
+        upl = float(safe_float(bt.get("unrealizedPL")) or 0.0); risk = float(safe_float(link.get("estimated_risk_amount")) or safe_float(link.get("requested_risk_amount")) or METALS_XAU_LIVE_RISK_AMOUNT); rr = upl/risk if risk > 0 else 0.0
+        total += rr; details.append({"link_id": link.get("id"), "broker_trade_id": link.get("broker_trade_id"), "upl_gbp": upl, "effective_risk_gbp": risk, "broker_r": rr})
+    linked_ids = {safe_str(l.get("broker_trade_id")) for l in links if safe_str(l.get("broker_trade_id"))}
+    return {"basket_r": total, "linked_count": len(details), "unlinked_broker_count": sum(1 for t in broker.get("owned_open_trades") or [] if safe_str(t.get("id")) not in linked_ids), "details": details}
+
+
+def _metals_xau_live_highwater_state(
+    broker: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    broker = broker or metals_xau_live_broker_snapshot(
+        include_account_summary=False
+    )
+    current_gbp = float(
+        safe_float(broker.get("owned_unrealized_pl")) or 0.0
+    )
+    open_count = int(broker.get("owned_open_count") or 0)
+
+    with get_conn() as conn:
+        old_open = int(
+            safe_float(
+                _metals_xau_live_runtime_get(
+                    conn, "broker_hwm_open_count", "0"
+                )
+            ) or 0
+        )
+        old_gbp = float(
+            safe_float(
+                _metals_xau_live_runtime_get(
+                    conn, "broker_hwm_gbp", "0"
+                )
+            ) or 0.0
+        )
+        old_r = float(
+            safe_float(
+                _metals_xau_live_runtime_get(
+                    conn, "broker_hwm_r", "0"
+                )
+            ) or 0.0
+        )
+        old_seen = _metals_xau_live_runtime_get(
+            conn, "broker_hwm_seen_at", ""
+        )
+        local_open_count = int(
+            conn.execute("""
+                SELECT COUNT(*) AS c
+                FROM metals_xau_live_trade_links
+                WHERE status='OPEN'
+            """).fetchone()["c"]
+            or 0
+        )
+
+    if not broker.get("ok"):
+        return {
+            "broker_read_ok": False,
+            "reconciliation_exact": False,
+            "current_gbp": current_gbp,
+            "current_r": 0.0,
+            "high_water_gbp": old_gbp,
+            "high_water_r": old_r,
+            "high_water_seen_at": old_seen,
+            "giveback_gbp": max(0.0, old_gbp - current_gbp),
+            "giveback_r": 0.0,
+            "open_count": old_open,
+            "source": "stored_state_broker_read_failed",
+        }
+
+    rs = _metals_xau_live_basket_r(broker)
+    linked_count = int(rs.get("linked_count") or 0)
+    unlinked = int(rs.get("unlinked_broker_count") or 0)
+    exact = bool(
+        not broker.get("ownership_conflict")
+        and unlinked == 0
+        and open_count == local_open_count
+        and linked_count == open_count
+    )
+
+    if not exact:
+        current_r = float(safe_float(rs.get("basket_r")) or 0.0)
+        return {
+            "broker_read_ok": True,
+            "reconciliation_exact": False,
+            "current_gbp": current_gbp,
+            "current_r": current_r,
+            "high_water_gbp": old_gbp,
+            "high_water_r": old_r,
+            "high_water_seen_at": old_seen,
+            "giveback_gbp": max(0.0, old_gbp - current_gbp),
+            "giveback_r": max(0.0, old_r - current_r),
+            "open_count": open_count,
+            "local_open_count": local_open_count,
+            "linked_r_count": linked_count,
+            "unlinked_broker_count": unlinked,
+            "ownership_conflict": bool(broker.get("ownership_conflict")),
+            "source": "stored_state_reconciliation_blocked",
+        }
+
+    current_r = float(safe_float(rs.get("basket_r")) or 0.0)
+    market = _metals_xau_live_market_state()
+    observed = (
+        safe_str(market.get("latest_price_time"))
+        or now_utc_iso()
+    )
+
+    with get_conn() as conn:
+        if open_count == 0:
+            if old_open > 0 or old_gbp > 0 or old_r > 0:
+                conn.execute("""
+                    INSERT INTO metals_xau_live_hwm_events(
+                        created_at_utc,observed_at_utc,event_type,
+                        open_count,current_gbp,current_r,
+                        high_water_gbp,high_water_r,source,raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    now_utc_iso(), observed, "FLAT_RESET",
+                    0, 0.0, 0.0, 0.0, 0.0,
+                    "successful_live_xau_flat",
+                    json.dumps({
+                        "previous_hwm_gbp": old_gbp,
+                        "previous_hwm_r": old_r,
+                    }, default=str),
+                ))
+            for k, v in [
+                ("broker_hwm_open_count", 0),
+                ("broker_hwm_gbp", 0.0),
+                ("broker_hwm_r", 0.0),
+                ("broker_hwm_seen_at", ""),
+            ]:
+                _metals_xau_live_runtime_set(conn, k, v)
+            conn.commit()
+            return {
+                "broker_read_ok": True,
+                "reconciliation_exact": True,
+                "current_gbp": 0.0,
+                "current_r": 0.0,
+                "high_water_gbp": 0.0,
+                "high_water_r": 0.0,
+                "high_water_seen_at": "",
+                "giveback_gbp": 0.0,
+                "giveback_r": 0.0,
+                "giveback_pct": 0.0,
+                "open_count": 0,
+                "local_open_count": 0,
+                "linked_r_count": 0,
+                "unlinked_broker_count": 0,
+                "source": "successful_live_xau_flat",
+            }
+
+        new_gbp = max(0.0, old_gbp, current_gbp)
+        new_r = max(0.0, old_r, current_r)
+        new_high = (
+            new_gbp > old_gbp + 0.005
+            or new_r > old_r + 0.005
+        )
+        seen = observed if new_high or not old_seen else old_seen
+
+        for k, v in [
+            ("broker_hwm_open_count", open_count),
+            ("broker_hwm_gbp", new_gbp),
+            ("broker_hwm_r", new_r),
+            ("broker_hwm_seen_at", seen),
+        ]:
+            _metals_xau_live_runtime_set(conn, k, v)
+
+        if old_open == 0 or new_high:
+            conn.execute("""
+                INSERT INTO metals_xau_live_hwm_events(
+                    created_at_utc,observed_at_utc,event_type,
+                    open_count,current_gbp,current_r,
+                    high_water_gbp,high_water_r,source,raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (
+                now_utc_iso(), observed,
+                "CYCLE_START" if old_open == 0 else "NEW_HIGH",
+                open_count, current_gbp, current_r,
+                new_gbp, new_r, "live_xau_long", "{}",
+            ))
+        conn.commit()
+
+    return {
+        "broker_read_ok": True,
+        "reconciliation_exact": True,
+        "current_gbp": current_gbp,
+        "current_r": current_r,
+        "high_water_gbp": new_gbp,
+        "high_water_r": new_r,
+        "high_water_seen_at": seen,
+        "giveback_gbp": max(0.0, new_gbp - current_gbp),
+        "giveback_r": max(0.0, new_r - current_r),
+        "giveback_pct": (
+            max(0.0, new_gbp - current_gbp) / new_gbp * 100.0
+            if new_gbp > 0 else 0.0
+        ),
+        "open_count": open_count,
+        "local_open_count": local_open_count,
+        "linked_r_count": linked_count,
+        "unlinked_broker_count": unlinked,
+        "source": "live_xau_long_oanda",
+    }
+
+
+
+
+def _metals_xau_live_all_linked_broker_ids(conn: Any) -> set:
+    rows = conn.execute("""
+        SELECT broker_trade_id
+        FROM metals_xau_live_trade_links
+        WHERE broker_trade_id IS NOT NULL
+          AND broker_trade_id != ''
+    """).fetchall()
+    return {
+        safe_str(r["broker_trade_id"])
+        for r in rows
+        if safe_str(r["broker_trade_id"])
+    }
+
+
+def _metals_xau_live_recursive_trade_ids(value: Any) -> set:
+    out = set()
+
+    def walk(v: Any) -> None:
+        if isinstance(v, dict):
+            for k, child in v.items():
+                if safe_str(k).lower() in {"tradeid", "trade_id"}:
+                    tid = safe_str(child)
+                    if tid:
+                        out.add(tid)
+                else:
+                    walk(child)
+        elif isinstance(v, list):
+            for child in v:
+                walk(child)
+
+    walk(value)
+    return out
+
+
+def _metals_xau_live_transaction_owned(
+    raw_fragment: Any,
+    linked_ids: set,
+) -> bool:
+    ids = _metals_xau_live_recursive_trade_ids(raw_fragment)
+    return bool(ids and ids.intersection(linked_ids))
+
+
+def _metals_xau_live_recover_broker_only(
+    broker: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Exact-only live recovery.
+
+    An unlinked XAU LONG is adopted only from an exact live execution-audit
+    row carrying the same OANDA broker trade ID. No fuzzy time/price recovery.
+    """
+    broker = broker or metals_xau_live_broker_snapshot()
+    if not broker.get("ok"):
+        return {"ok": False, "reason": "broker_snapshot_failed", "results": []}
+
+    with get_conn() as conn:
+        open_links = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_xau_live_trade_links
+                WHERE status='OPEN'
+                ORDER BY id
+            """).fetchall()
+        ]
+        all_links = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_xau_live_trade_links
+                ORDER BY id
+            """).fetchall()
+        ]
+
+    open_ids = {
+        safe_str(r.get("broker_trade_id"))
+        for r in open_links
+        if safe_str(r.get("broker_trade_id"))
+    }
+    results = []
+
+    for bt in broker.get("owned_open_trades") or []:
+        bid = safe_str(bt.get("id"))
+        if not bid or bid in open_ids:
+            continue
+
+        historical = [
+            r for r in all_links
+            if safe_str(r.get("broker_trade_id")) == bid
+        ]
+        if len(historical) == 1:
+            row = historical[0]
+            if safe_str(row.get("status")).upper() != "OPEN":
+                with get_conn() as conn:
+                    conn.execute("""
+                        UPDATE metals_xau_live_trade_links
+                        SET updated_at_utc=?,
+                            status='OPEN',
+                            realized_pl=NULL,
+                            financing=NULL,
+                            closed_at_utc=NULL,
+                            close_reason=NULL,
+                            last_reconciled_at_utc=?
+                        WHERE id=?
+                    """, (now_utc_iso(), now_utc_iso(), int(row["id"])))
+                    conn.commit()
+                results.append({
+                    "broker_trade_id": bid,
+                    "status": "REOPENED_EXACT_BROKER_ID",
+                    "link_id": row.get("id"),
+                })
+                continue
+
+        with get_conn() as conn:
+            audits = [
+                dict(r) for r in conn.execute("""
+                    SELECT *
+                    FROM metals_xau_live_execution_audit
+                    WHERE broker_trade_id=?
+                      AND status IN ('OPENED_BROKER_PENDING_LINK','OPENED')
+                    ORDER BY id DESC
+                    LIMIT 3
+                """, (bid,)).fetchall()
+            ]
+
+        raw_ids = {
+            int(safe_float(a.get("raw_signal_id")) or 0)
+            for a in audits
+            if int(safe_float(a.get("raw_signal_id")) or 0) > 0
+        }
+        if len(raw_ids) != 1:
+            results.append({
+                "broker_trade_id": bid,
+                "status": "BLOCKED_UNPROVEN_BROKER_ONLY",
+                "audit_rows": len(audits),
+                "raw_signal_ids": sorted(raw_ids),
+            })
+            continue
+
+        raw_signal_id = next(iter(raw_ids))
+        audit = audits[0]
+
+        with get_conn() as conn:
+            already = conn.execute("""
+                SELECT id,status
+                FROM metals_xau_live_trade_links
+                WHERE raw_signal_id=?
+                LIMIT 1
+            """, (raw_signal_id,)).fetchone()
+            if already:
+                results.append({
+                    "broker_trade_id": bid,
+                    "status": "BLOCKED_RAW_SIGNAL_ALREADY_LINKED",
+                    "link_id": already["id"],
+                })
+                continue
+
+            sig = conn.execute("""
+                SELECT timestamp_readable
+                FROM raw_signals
+                WHERE id=?
+                LIMIT 1
+            """, (raw_signal_id,)).fetchone()
+            if not sig:
+                results.append({
+                    "broker_trade_id": bid,
+                    "status": "BLOCKED_SIGNAL_ROW_MISSING",
+                    "raw_signal_id": raw_signal_id,
+                })
+                continue
+
+            created = now_utc_iso()
+            link_id = db_insert_returning_id(conn, """
+                INSERT INTO metals_xau_live_trade_links(
+                    created_at_utc,updated_at_utc,raw_signal_id,asset,
+                    instrument,side,model_version,signal_time,entry_signal_id,
+                    requested_risk_amount,estimated_risk_amount,
+                    requested_units,filled_units,entry_price,
+                    stop_price,current_stop_price,
+                    broker_trade_id,broker_order_id,broker_open_time_utc,
+                    status,active_exit_policy,active_exit_policy_version,
+                    active_exit_policy_started_at_utc,last_reconciled_at_utc,
+                    raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                created, created, raw_signal_id, "XAUUSD",
+                METALS_XAU_LIVE_ALLOWED_INSTRUMENT, "long",
+                METALS_XAU_LIVE_POLICY_VERSION,
+                safe_str(sig["timestamp_readable"]),
+                raw_signal_id,
+                safe_float(audit.get("requested_risk_amount")),
+                safe_float(audit.get("estimated_risk_amount")),
+                safe_float(audit.get("requested_units")),
+                abs(float(safe_float(bt.get("currentUnits")) or 0.0)),
+                safe_float(audit.get("entry_price"))
+                or safe_float(bt.get("price")),
+                safe_float(audit.get("stop_price")),
+                safe_float(audit.get("stop_price")),
+                bid,
+                safe_str(audit.get("broker_order_id")),
+                safe_str(bt.get("openTime")),
+                "OPEN",
+                METALS_XAU_LONG_MFE50_POLICY,
+                METALS_XAU_LONG_MFE50_POLICY_VERSION,
+                created,
+                created,
+                json.dumps({
+                    "recovery_source": "EXACT_LIVE_EXECUTION_AUDIT",
+                    "audit_id": audit.get("id"),
+                    "broker_trade": bt,
+                }, default=str),
+            ))
+            conn.commit()
+
+        results.append({
+            "broker_trade_id": bid,
+            "status": "RECOVERED_EXACT_EXECUTION_AUDIT",
+            "link_id": link_id,
+            "raw_signal_id": raw_signal_id,
+        })
+
+    blocked = [
+        r for r in results
+        if safe_str(r.get("status")).startswith("BLOCKED")
+    ]
+    return {
+        "ok": len(blocked) == 0,
+        "results": results,
+        "blocked_count": len(blocked),
+    }
+
+
+def metals_xau_live_sync_broker_transactions(
+    force: bool = False,
+) -> Dict[str, Any]:
+    cfg = metals_xau_live_config_status()
+    if cfg.get("missing") or not cfg.get("environment_ok"):
+        return {"ok": False, "skipped": True, "reason": "config_not_ready"}
+
+    with _METALS_XAU_LIVE_TX_SYNC_LOCK:
+        if (
+            not force
+            and _METALS_XAU_LIVE_TX_SYNC_CACHE.get("result") is not None
+            and time.time()
+            - float(_METALS_XAU_LIVE_TX_SYNC_CACHE.get("at") or 0.0)
+            < 30.0
+        ):
+            return dict(_METALS_XAU_LIVE_TX_SYNC_CACHE["result"])
+
+        summary = _metals_xau_live_request(
+            f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/summary"
+        )
+        if not summary.get("ok"):
+            return {
+                "ok": False,
+                "error": "live_account_summary_failed",
+                "response": summary,
+            }
+
+        account = (
+            (summary.get("data") or {}).get("account")
+            or (summary.get("data") or {})
+        )
+        last_id = safe_str(
+            account.get("lastTransactionID")
+            or (summary.get("data") or {}).get("lastTransactionID")
+        )
+        if not last_id:
+            return {"ok": False, "error": "missing_live_last_transaction_id"}
+
+        with get_conn() as conn:
+            cursor = _metals_xau_live_runtime_get(
+                conn, "broker_transaction_cursor", ""
+            )
+            if not cursor:
+                _metals_xau_live_runtime_set(
+                    conn, "broker_transaction_cursor", last_id
+                )
+                _metals_xau_live_runtime_set(
+                    conn, "accounting_epoch_utc", now_utc_iso()
+                )
+                conn.commit()
+                result = {
+                    "ok": True,
+                    "initialized": True,
+                    "cursor": last_id,
+                    "inserted_or_updated": 0,
+                    "ignored_unowned_xau": 0,
+                    "note": (
+                        "Live XAU accounting epoch initialized with "
+                        "no historical backfill."
+                    ),
+                    "time_utc": now_utc_iso(),
+                }
+                _METALS_XAU_LIVE_TX_SYNC_CACHE.update(
+                    {"at": time.time(), "result": dict(result)}
+                )
+                return result
+
+            linked_ids = _metals_xau_live_all_linked_broker_ids(conn)
+
+        resp = _metals_xau_live_request(
+            f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/transactions/"
+            f"sinceid?id={urllib.parse.quote(cursor)}"
+        )
+        if not resp.get("ok"):
+            return {
+                "ok": False,
+                "error": "live_transactions_sinceid_failed",
+                "response": resp,
+            }
+
+        txs = (resp.get("data") or {}).get("transactions", []) or []
+        inserted = 0
+        ignored_unowned_xau = 0
+
+        with get_conn() as conn:
+            linked_ids = _metals_xau_live_all_linked_broker_ids(conn)
+
+            for tx in txs:
+                txid = safe_str(tx.get("id"))
+                if not txid:
+                    continue
+                typ = safe_str(tx.get("type")).upper()
+                inst = _metals_tx_instrument(tx)
+                records = []
+
+                if inst == METALS_XAU_LIVE_ALLOWED_INSTRUMENT:
+                    if _metals_xau_live_transaction_owned(tx, linked_ids):
+                        records.append((
+                            txid,
+                            inst,
+                            float(safe_float(tx.get("pl")) or 0.0),
+                            float(safe_float(tx.get("financing")) or 0.0),
+                            tx,
+                        ))
+                    else:
+                        ignored_unowned_xau += 1
+
+                elif typ == "DAILY_FINANCING":
+                    for pos_idx, pos in enumerate(
+                        tx.get("positionFinancings") or []
+                    ):
+                        if (
+                            safe_str((pos or {}).get("instrument")).upper()
+                            != METALS_XAU_LIVE_ALLOWED_INSTRUMENT
+                        ):
+                            continue
+                        if not _metals_xau_live_transaction_owned(
+                            pos, linked_ids
+                        ):
+                            ignored_unowned_xau += 1
+                            continue
+                        records.append((
+                            f"{txid}:{pos_idx}",
+                            METALS_XAU_LIVE_ALLOWED_INSTRUMENT,
+                            0.0,
+                            float(
+                                safe_float((pos or {}).get("financing"))
+                                or 0.0
+                            ),
+                            pos,
+                        ))
+
+                for rid, inst2, pl, fin, raw in records:
+                    conn.execute("""
+                        INSERT INTO metals_xau_live_broker_transactions(
+                            transaction_id,synced_at_utc,transaction_time,
+                            transaction_type,instrument,pl_gbp,financing_gbp,
+                            net_realized_gbp,account_balance,raw_json
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(transaction_id) DO UPDATE SET
+                            synced_at_utc=excluded.synced_at_utc,
+                            transaction_time=excluded.transaction_time,
+                            transaction_type=excluded.transaction_type,
+                            instrument=excluded.instrument,
+                            pl_gbp=excluded.pl_gbp,
+                            financing_gbp=excluded.financing_gbp,
+                            net_realized_gbp=excluded.net_realized_gbp,
+                            account_balance=excluded.account_balance,
+                            raw_json=excluded.raw_json
+                    """, (
+                        rid, now_utc_iso(), safe_str(tx.get("time")),
+                        typ, inst2, pl, fin, pl + fin,
+                        safe_float(tx.get("accountBalance")),
+                        json.dumps(raw, default=str),
+                    ))
+                    inserted += 1
+
+            _metals_xau_live_runtime_set(
+                conn, "broker_transaction_cursor", last_id
+            )
+            conn.commit()
+
+        result = {
+            "ok": True,
+            "initialized": False,
+            "inserted_or_updated": inserted,
+            "ignored_unowned_xau": ignored_unowned_xau,
+            "cursor": last_id,
+            "time_utc": now_utc_iso(),
+        }
+        _METALS_XAU_LIVE_TX_SYNC_CACHE.update(
+            {"at": time.time(), "result": dict(result)}
+        )
+        return result
+
+
+
+def metals_xau_live_reconcile_local_ghosts() -> Dict[str, Any]:
+    try:
+        tx_sync = metals_xau_live_sync_broker_transactions(force=True)
+    except Exception as exc:
+        tx_sync = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    broker = metals_xau_live_broker_snapshot()
+    if not broker.get("ok"):
+        return {
+            "ok": False,
+            "broker": broker,
+            "transaction_sync": tx_sync,
+        }
+
+    recovery = _metals_xau_live_recover_broker_only(broker)
+    if recovery.get("results"):
+        broker = metals_xau_live_broker_snapshot()
+
+    broker_ids = {
+        safe_str(t.get("id"))
+        for t in broker.get("owned_open_trades") or []
+    }
+
+    with get_conn() as conn:
+        links = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_xau_live_trade_links
+                WHERE status='OPEN'
+                ORDER BY id
+            """).fetchall()
+        ]
+
+    results = []
+    for link in links:
+        bid = safe_str(link.get("broker_trade_id"))
+        if not bid or bid in broker_ids:
+            continue
+
+        resp = _metals_xau_live_request(
+            f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/trades/"
+            f"{urllib.parse.quote(bid)}"
+        )
+        trade = (
+            (resp.get("data") or {}).get("trade")
+            if resp.get("ok") else None
+        )
+
+        if trade and safe_str(trade.get("state")).upper() == "CLOSED":
+            with get_conn() as conn:
+                conn.execute("""
+                    UPDATE metals_xau_live_trade_links
+                    SET updated_at_utc=?,
+                        status='CLOSED_BROKER',
+                        realized_pl=COALESCE(?,realized_pl),
+                        financing=COALESCE(?,financing),
+                        last_known_unrealized_pl=0,
+                        last_known_price=COALESCE(?,last_known_price),
+                        closed_at_utc=COALESCE(NULLIF(closed_at_utc,''),?),
+                        close_reason=COALESCE(
+                            NULLIF(close_reason,''),
+                            'BROKER_CONFIRMED_CLOSED'
+                        ),
+                        last_reconciled_at_utc=?
+                    WHERE id=?
+                """, (
+                    now_utc_iso(),
+                    safe_float(trade.get("realizedPL")),
+                    safe_float(trade.get("financing")),
+                    safe_float(
+                        trade.get("averageClosePrice")
+                        or trade.get("price")
+                    ),
+                    safe_str(trade.get("closeTime")) or now_utc_iso(),
+                    now_utc_iso(),
+                    int(link["id"]),
+                ))
+                conn.commit()
+            results.append({
+                "link_id": link.get("id"),
+                "broker_trade_id": bid,
+                "status": "CLOSED_BROKER",
+            })
+        else:
+            results.append({
+                "link_id": link.get("id"),
+                "broker_trade_id": bid,
+                "status": "UNRESOLVED_MISSING_FROM_OPEN_TRADES",
+            })
+
+    unresolved = [
+        r for r in results
+        if r.get("status") == "UNRESOLVED_MISSING_FROM_OPEN_TRADES"
+    ]
+    return {
+        "ok": (
+            len(unresolved) == 0
+            and bool(recovery.get("ok", True))
+        ),
+        "checked_local_open": len(links),
+        "broker_open": len(broker_ids),
+        "results": results,
+        "broker_only_recovery": recovery,
+        "transaction_sync": tx_sync,
+    }
+
+
+
+def _metals_xau_live_reconciliation_snapshot(broker: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    broker=broker or metals_xau_live_broker_snapshot()
+    if not broker.get("ok"): return {"execution_safe":False,"block_reasons":["broker_snapshot_failed"],"matched":[]}
+    with get_conn() as conn: links=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]
+    b={safe_str(t.get("id")):t for t in broker.get("owned_open_trades") or []}; l={safe_str(x.get("broker_trade_id")):x for x in links if safe_str(x.get("broker_trade_id"))}; matched=[(l[k],v) for k,v in b.items() if k in l]; local_only=[v for k,v in l.items() if k not in b]; broker_only=[v for k,v in b.items() if k not in l]; reasons=[]
+    if broker.get("ownership_conflict"): reasons.append("live_xau_short_ownership_conflict")
+    if local_only: reasons.append("live_local_only_trade_links")
+    if broker_only: reasons.append("live_broker_only_xau_long_trades")
+    return {"execution_safe":not reasons,"matched":matched,"matched_count":len(matched),"local_only_count":len(local_only),"broker_only_count":len(broker_only),"block_reasons":reasons}
+
+
+def _metals_xau_live_queue_close(link: Dict[str, Any], reason: str, raw_signal_id: int) -> int:
+    with get_conn() as conn:
+        ex=conn.execute("SELECT id FROM metals_xau_live_action_queue WHERE link_id=? AND action='CLOSE' AND status IN ('PENDING','RETRY') ORDER BY id DESC LIMIT 1",(int(link["id"]),)).fetchone()
+        if ex: return int(ex["id"])
+        qid=db_insert_returning_id(conn,"INSERT INTO metals_xau_live_action_queue(created_at_utc,updated_at_utc,raw_signal_id,link_id,action,status,reason,attempts,raw_json) VALUES(?,?,?,?,?,'PENDING',?,0,?)",(now_utc_iso(),now_utc_iso(),int(raw_signal_id or 0),int(link["id"]),"CLOSE",safe_str(reason),json.dumps({"broker_trade_id":link.get("broker_trade_id"),"lane":"LIVE_XAU_LONG"},default=str))); conn.commit(); return qid
+
+
+def _metals_xau_live_close(link: Dict[str, Any], qid: int) -> Dict[str, Any]:
+    last={}
+    for attempt in range(1,METALS_DEMO_MANAGER_CLOSE_IMMEDIATE_ATTEMPTS+1):
+        last=_metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/trades/{urllib.parse.quote(safe_str(link.get('broker_trade_id')))}/close","PUT",{"units":"ALL"})
+        if last.get("ok"):
+            fill=(last.get("data") or {}).get("orderFillTransaction") or {}; realized=safe_float(fill.get("pl"))
+            with get_conn() as conn:
+                q=conn.execute("SELECT reason FROM metals_xau_live_action_queue WHERE id=?",(qid,)).fetchone(); reason=safe_str(q["reason"] if q else "xau_live_close")
+                conn.execute("UPDATE metals_xau_live_trade_links SET updated_at_utc=?,status='CLOSED_MANAGER',realized_pl=COALESCE(?,realized_pl),last_known_unrealized_pl=0,closed_at_utc=?,close_reason=?,last_reconciled_at_utc=? WHERE id=?",(now_utc_iso(),realized,now_utc_iso(),reason,now_utc_iso(),int(link["id"]))); conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='DONE',attempts=attempts+?,last_error=NULL WHERE id=?",(now_utc_iso(),attempt,qid)); conn.commit()
+            _metals_xau_live_audit(int(link.get("raw_signal_id") or 0),"manager_close","CLOSED",reason,response=last,link_id=int(link["id"]),broker_trade_id=safe_str(link.get("broker_trade_id"))); return {"ok":True,"status":"CLOSED","realized_pl":realized}
+        if attempt<METALS_DEMO_MANAGER_CLOSE_IMMEDIATE_ATTEMPTS and METALS_DEMO_MANAGER_CLOSE_RETRY_SLEEP_SECONDS>0: time.sleep(METALS_DEMO_MANAGER_CLOSE_RETRY_SLEEP_SECONDS)
+    with get_conn() as conn: conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='RETRY',attempts=attempts+?,last_error=? WHERE id=?",(now_utc_iso(),METALS_DEMO_MANAGER_CLOSE_IMMEDIATE_ATTEMPTS,safe_str(last.get("error") or "live close failed"),qid)); conn.commit()
+    return {"ok":False,"status":"RETRY","response":last}
+
+
+
+def _metals_xau_live_pending_close_retry_tick(
+    limit: int = 25,
+) -> Dict[str, Any]:
+    cfg = metals_xau_live_config_status()
+    market = _metals_xau_live_market_state()
+
+    with get_conn() as conn:
+        stale = [
+            dict(r) for r in conn.execute("""
+                SELECT q.id
+                FROM metals_xau_live_action_queue q
+                JOIN metals_xau_live_trade_links l ON l.id=q.link_id
+                WHERE q.action='CLOSE'
+                  AND q.status IN ('PENDING','RETRY')
+                  AND l.status<>'OPEN'
+                ORDER BY q.id
+                LIMIT ?
+            """, (max(1, min(int(limit), 100)),)).fetchall()
+        ]
+        for row in stale:
+            conn.execute("""
+                UPDATE metals_xau_live_action_queue
+                SET updated_at_utc=?,
+                    status='OBSOLETE_CLOSED',
+                    last_error=NULL
+                WHERE id=?
+            """, (now_utc_iso(), int(row["id"])))
+        if stale:
+            conn.commit()
+
+        rows = [
+            dict(r) for r in conn.execute("""
+                SELECT
+                    q.id AS queue_id,
+                    q.link_id,
+                    q.reason AS queue_reason,
+                    l.*
+                FROM metals_xau_live_action_queue q
+                JOIN metals_xau_live_trade_links l ON l.id=q.link_id
+                WHERE q.action='CLOSE'
+                  AND q.status IN ('PENDING','RETRY')
+                  AND l.status='OPEN'
+                ORDER BY q.id
+                LIMIT ?
+            """, (max(1, min(int(limit), 100)),)).fetchall()
+        ]
+
+    if not rows:
+        return {
+            "ok": True,
+            "checked": 0,
+            "obsolete_closed": len(stale),
+            "status": "NO_PENDING_CLOSES",
+        }
+
+    if not cfg.get("orders_allowed"):
+        return {
+            "ok": True,
+            "checked": len(rows),
+            "obsolete_closed": len(stale),
+            "skipped": True,
+            "status": "LIVE_WRITES_NOT_ARMED",
+        }
+
+    if market.get("tradeable") is not True:
+        return {
+            "ok": True,
+            "checked": len(rows),
+            "obsolete_closed": len(stale),
+            "skipped": True,
+            "status": "MARKET_NOT_TRADEABLE",
+        }
+
+    results = []
+    for row in rows:
+        link = dict(row)
+        link["id"] = int(row["link_id"])
+        outcome = _metals_xau_live_close(
+            link, int(row["queue_id"])
+        )
+        results.append({
+            "queue_id": row["queue_id"],
+            "link_id": row["link_id"],
+            "broker_trade_id": row.get("broker_trade_id"),
+            "result": outcome,
+        })
+
+    return {
+        "ok": all((r.get("result") or {}).get("ok") for r in results),
+        "checked": len(rows),
+        "obsolete_closed": len(stale),
+        "results": results,
+        "status": "RETRIED",
+    }
+
+
+def _metals_xau_live_trade_metrics(link: Dict[str, Any]) -> Dict[str, Any]:
+    entry=safe_float(link.get("entry_price"));
+    if entry is None or entry<=0: return {"ok":False,"reason":"missing_entry_price","hold_candles":0}
+    anchor=int(safe_float(link.get("entry_signal_id")) or safe_float(link.get("raw_signal_id")) or 0)
+    with get_conn() as conn: path=_metals_demo_path(conn,"XAUUSD",anchor,limit=2000); latest=_metals_demo_latest_signal_row(conn,"XAUUSD")
+    hold=len(path); current=float(safe_float(path[-1].get("exec_close")) if path else entry); sl=float(METALS_XAU_LIVE_SL_PCT); current_r=_metals_demo_r_from_price("long",float(entry),current,sl)
+    highs=[safe_float(x.get("exec_high")) for x in path if safe_float(x.get("exec_high")) is not None]; lows=[safe_float(x.get("exec_low")) for x in path if safe_float(x.get("exec_low")) is not None]; mfe_price=max(highs) if highs else current; mae_price=min(lows) if lows else current; mfe_r=_metals_demo_r_from_price("long",float(entry),float(mfe_price),sl); mae_r=_metals_demo_r_from_price("long",float(entry),float(mae_price),sl)
+    hwm=max([float(x) for x in [safe_float(link.get("manager_high_water_r")),current_r,mfe_r] if x is not None],default=0.0); gb=((hwm-float(current_r))/hwm*100.0) if hwm>0 and current_r is not None and float(current_r)<hwm else 0.0
+    fixed_price=safe_float(link.get("fixed_48h_price")); fixed_r=safe_float(link.get("fixed_48h_r"))
+    if fixed_r is None and len(path)>=METALS_DEMO_FIXED_HOLD_CANDLES:
+        fixed_price=safe_float(path[METALS_DEMO_FIXED_HOLD_CANDLES-1].get("exec_close")); fixed_r=_metals_demo_r_from_price("long",float(entry),fixed_price,sl)
+    return {"ok":True,"asset":"XAUUSD","side":"long","entry_price":entry,"sl_pct":sl,"hold_candles":hold,"current_price":current,"current_r":current_r,"mfe_r":mfe_r,"mae_r":mae_r,"high_water_r":hwm,"giveback_pct":gb,"fixed_48h_price":fixed_price,"fixed_48h_r":fixed_r,"latest_signal_id":int(latest["id"]) if latest else None}
+
+
+def _metals_xau_live_stop_candidate(link: Dict[str, Any], m: Dict[str, Any]) -> Dict[str, Any]:
+    h=int(m.get("hold_candles") or 0); entry=safe_float(link.get("entry_price")); cur=safe_float(m.get("current_price")); mfe=max(0.0,float(safe_float(m.get("mfe_r")) or 0.0))
+    if h<METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES or entry is None or cur is None or mfe<=0: return {"eligible":False,"reason":"live_mfe50_pre48_or_no_positive_mfe"}
+    floor_r=mfe*(1.0-METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION); stop=round(float(entry)*(1.0+floor_r*METALS_XAU_LIVE_SL_PCT/100.0),3); prev=safe_float(link.get("current_stop_price")) or safe_float(link.get("stop_price")); step=float(entry)*METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT/100.0
+    if stop>=float(cur): return {"eligible":False,"reason":"live_mfe50_floor_at_or_above_current_close","stop_price":stop,"mfe_floor_r":floor_r}
+    if prev is not None and stop<=float(prev)+step: return {"eligible":False,"reason":"live_mfe50_would_not_tighten_enough","stop_price":stop,"mfe_floor_r":floor_r}
+    return {"eligible":True,"stop_price":stop,"mfe_floor_r":floor_r,"reason":f"LIVE XAU MFE50 retains 50% of {mfe:.2f}R MFE ({floor_r:.2f}R floor)"}
+
+
+def _metals_xau_live_update_stop(link: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, Any]:
+    if not cand.get("eligible"): return {"ok":True,"status":"NO_UPDATE","reason":cand.get("reason")}
+    resp=_metals_xau_live_request(f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/trades/{urllib.parse.quote(safe_str(link.get('broker_trade_id')))}/orders","PUT",{"stopLoss":{"timeInForce":"GTC","price":str(cand.get("stop_price"))}})
+    if resp.get("ok"):
+        with get_conn() as conn: conn.execute("UPDATE metals_xau_live_trade_links SET updated_at_utc=?,current_stop_price=? WHERE id=?",(now_utc_iso(),cand.get("stop_price"),int(link["id"]))); conn.commit()
+        _metals_xau_live_audit(int(link.get("raw_signal_id") or 0),"manager_stop_update","UPDATED",safe_str(cand.get("reason")),preview={"stop_price":cand.get("stop_price")},response=resp,link_id=int(link["id"]),broker_trade_id=safe_str(link.get("broker_trade_id"))); return {"ok":True,"status":"UPDATED","stop_price":cand.get("stop_price")}
+    return {"ok":False,"status":"FAILED","response":resp}
+
+
+def _metals_xau_live_harvest_cycle_id(conn: Any, hwm: Dict[str, Any]) -> str:
+    current=_metals_xau_live_runtime_get(conn,"active_harvest_cycle_id",""); open_count=int(hwm.get("open_count") or 0)
+    if open_count<=0:
+        if current:
+            conn.execute("UPDATE metals_xau_live_harvest_stages SET updated_at_utc=?,status='EXPIRED_FLAT',reason=COALESCE(NULLIF(reason,''),'live XAU basket flat') WHERE cycle_id=? AND status NOT IN ('EXECUTED','EXPIRED_FLAT')",(now_utc_iso(),current)); _metals_xau_live_runtime_set(conn,"active_harvest_cycle_id",""); _metals_xau_live_runtime_set(conn,"harvest_last_seen_hwm_r",0.0); conn.commit()
+        return ""
+    if not current:
+        current="XAU_LONG_LIVE_"+now_utc().strftime("%Y%m%dT%H%M%S%fZ"); _metals_xau_live_runtime_set(conn,"active_harvest_cycle_id",current); _metals_xau_live_runtime_set(conn,"harvest_last_seen_hwm_r",0.0); conn.commit()
+    return current
+
+
+def metals_xau_live_harvest_maintenance_tick(allow_execution: bool = True, source: str = "auto") -> Dict[str, Any]:
+    broker=metals_xau_live_broker_snapshot(include_account_summary=False); hwm=_metals_xau_live_highwater_state(broker); result={"ok":True,"source":source,"broker_hwm":hwm,"armed_levels":[],"executed_levels":[],"waiting_levels":[]}
+    with get_conn() as conn:
+        cycle=_metals_xau_live_harvest_cycle_id(conn,hwm); result["cycle_id"]=cycle
+        if not cycle: result["status"]="FLAT"; return result
+        recon=_metals_xau_live_reconciliation_snapshot(broker); result["reconciliation"]={k:v for k,v in recon.items() if k!="matched"}
+        if not recon.get("execution_safe"): result["status"]="RECONCILIATION_BLOCKED"; result["block_reasons"]=recon.get("block_reasons"); return result
+        high=float(safe_float(hwm.get("high_water_r")) or 0.0); last=float(safe_float(_metals_xau_live_runtime_get(conn,"harvest_last_seen_hwm_r","0")) or 0.0); ever=bool(_metals_xau_live_runtime_get(conn,"harvest_ever_initialized",""))
+        if not ever:
+            if high>=METALS_HARVEST_FIRST_LEVEL_R:
+                for lvl in _metals_harvest_level_sequence(high):
+                    conn.execute("INSERT INTO metals_xau_live_harvest_stages(created_at_utc,updated_at_utc,policy_version,cycle_id,threshold_r,bank_fraction,status,armed_at_utc,armed_hwm_r,armed_hwm_gbp,trigger_current_r,trigger_current_gbp,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING",(now_utc_iso(),now_utc_iso(),METALS_XAU_LIVE_HARVEST_POLICY_VERSION,cycle,int(round(lvl)),_metals_harvest_fraction_for_level(lvl),"LEGACY_PASSED_UNBANKED",now_utc_iso(),high,safe_float(hwm.get("high_water_gbp")),safe_float(hwm.get("current_r")),safe_float(hwm.get("current_gbp")),"first live-lane observation already above threshold; no retroactive close",json.dumps(hwm,default=str)))
+                last=high; _metals_xau_live_runtime_set(conn,"harvest_last_seen_hwm_r",high)
+            _metals_xau_live_runtime_set(conn,"harvest_ever_initialized","1"); conn.commit()
+        if high>last+1e-9:
+            for lvl in _metals_harvest_level_sequence(high):
+                if lvl>last+1e-9:
+                    conn.execute("INSERT INTO metals_xau_live_harvest_stages(created_at_utc,updated_at_utc,policy_version,cycle_id,threshold_r,bank_fraction,status,armed_at_utc,armed_hwm_r,armed_hwm_gbp,trigger_current_r,trigger_current_gbp,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING",(now_utc_iso(),now_utc_iso(),METALS_XAU_LIVE_HARVEST_POLICY_VERSION,cycle,int(round(lvl)),_metals_harvest_fraction_for_level(lvl),"ARMED",now_utc_iso(),high,safe_float(hwm.get("high_water_gbp")),safe_float(hwm.get("current_r")),safe_float(hwm.get("current_gbp")),f"LIVE XAU HWM crossed {lvl:.0f}R",json.dumps(hwm,default=str))); result["armed_levels"].append(lvl)
+            _metals_xau_live_runtime_set(conn,"harvest_last_seen_hwm_r",high); conn.commit()
+        stages=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_harvest_stages WHERE cycle_id=? AND status NOT IN ('EXECUTED','LEGACY_PASSED_UNBANKED','EXPIRED_FLAT') ORDER BY threshold_r,id",(cycle,)).fetchall()]
+    prior=False
+    for stage in stages:
+        if prior: result["waiting_levels"].append({"threshold_r":stage.get("threshold_r"),"status":"WAITING_FOR_PRIOR_STAGE"}); continue
+        broker_now=metals_xau_live_broker_snapshot(include_account_summary=False); recon=_metals_xau_live_reconciliation_snapshot(broker_now)
+        if not recon.get("execution_safe"): result["waiting_levels"].append({"threshold_r":stage.get("threshold_r"),"status":"RECONCILIATION_BLOCKED"}); prior=True; continue
+        candidates=[]
+        for link,bt in recon.get("matched") or []:
+            upl=float(safe_float(bt.get("unrealizedPL")) or 0.0)
+            if upl<=0: continue
+            risk=float(safe_float(link.get("estimated_risk_amount")) or safe_float(link.get("requested_risk_amount")) or METALS_XAU_LIVE_RISK_AMOUNT); rr=upl/risk if risk>0 else 0.0; hwmr=max(float(safe_float(link.get("manager_high_water_r")) or 0.0),float(safe_float(link.get("manager_mfe_r")) or 0.0),rr); gb=max(0.0,(hwmr-rr)/hwmr*100.0) if hwmr>0 else 0.0
+            candidates.append({"link":link,"broker":bt,"link_id":int(link.get("id") or 0),"broker_trade_id":safe_str(bt.get("id")),"asset":"XAUUSD","side":"long","upl_gbp":upl,"effective_risk_gbp":risk,"current_r":rr,"high_water_r":hwmr,"giveback_pct":gb,"age_hours":_metals_trade_age_hours(link,bt),"active_exit_policy":METALS_XAU_LONG_MFE50_POLICY})
+        pool=sum(float(r.get("upl_gbp") or 0.0) for r in candidates); sid=int(stage.get("id") or 0); frac=float(safe_float(stage.get("bank_fraction")) or 0.0)
+        with get_conn() as conn:
+            fresh=conn.execute("SELECT * FROM metals_xau_live_harvest_stages WHERE id=?",(sid,)).fetchone(); st=dict(fresh) if fresh else stage; target=float(safe_float(st.get("target_bank_gbp")) or 0.0); banked=float(safe_float(st.get("executed_bank_gbp")) or 0.0)
+            if target<=0 and pool>0:
+                target=pool*frac; conn.execute("UPDATE metals_xau_live_harvest_stages SET updated_at_utc=?,trigger_profitable_pool_gbp=?,target_bank_gbp=?,status='ARMED_TARGET_FROZEN' WHERE id=?",(now_utc_iso(),pool,target,sid)); conn.commit()
+        remaining=max(0.0,target-banked)
+        if target<=0 or pool+METALS_HARVEST_TARGET_TOLERANCE_GBP<remaining: result["waiting_levels"].append({"threshold_r":stage.get("threshold_r"),"status":"WAITING_POOL"}); prior=True; continue
+        if not allow_execution or not METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED or not metals_xau_live_config_status().get("orders_allowed"): result["waiting_levels"].append({"threshold_r":stage.get("threshold_r"),"status":"BROKER_WRITES_BLOCKED"}); prior=True; continue
+        selected,expected=_metals_harvest_select_rows(candidates,remaining); realized_sum=0.0; ids=[]; bids=[]; failure=None
+        for row in selected:
+            link=dict(row["link"]); reason=f"LIVE_XAU_HARVEST_{int(stage.get('threshold_r') or 0)}R:{source}"; qid=_metals_xau_live_queue_close(link,reason,int(safe_float(link.get("manager_last_review_signal_id")) or safe_float(link.get("raw_signal_id")) or 0)); cr=_metals_xau_live_close(link,qid); realized=float(safe_float(cr.get("realized_pl")) or 0.0)
+            with get_conn() as conn: conn.execute("INSERT INTO metals_xau_live_harvest_events(created_at_utc,policy_version,cycle_id,stage_id,threshold_r,bank_fraction,link_id,broker_trade_id,expected_upl_gbp,realized_pl_gbp,status,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_utc_iso(),METALS_XAU_LIVE_HARVEST_POLICY_VERSION,cycle,sid,int(stage.get("threshold_r") or 0),frac,row.get("link_id"),row.get("broker_trade_id"),row.get("upl_gbp"),realized,safe_str(cr.get("status")),reason,json.dumps(cr,default=str))); conn.commit()
+            if cr.get("ok"): realized_sum+=max(0.0,realized); ids.append(row.get("link_id")); bids.append(row.get("broker_trade_id"))
+            else: failure=cr; break
+        with get_conn() as conn:
+            fresh=conn.execute("SELECT * FROM metals_xau_live_harvest_stages WHERE id=?",(sid,)).fetchone(); st=dict(fresh) if fresh else stage; old=float(safe_float(st.get("executed_bank_gbp")) or 0.0); new=old+realized_sum; target_now=float(safe_float(st.get("target_bank_gbp")) or target); complete=target_now>0 and new+METALS_HARVEST_TARGET_TOLERANCE_GBP>=target_now; status="EXECUTED" if complete else "PARTIAL_RETRY" if failure else "PARTIAL_TARGET"; conn.execute("UPDATE metals_xau_live_harvest_stages SET updated_at_utc=?,status=?,executed_at_utc=?,executed_bank_gbp=?,selected_expected_gbp=COALESCE(selected_expected_gbp,0)+?,selected_link_ids=?,selected_broker_trade_ids=?,attempts=COALESCE(attempts,0)+1 WHERE id=?",(now_utc_iso(),status,now_utc_iso() if complete else safe_str(st.get("executed_at_utc")),new,expected,_metals_harvest_append_ids(st.get("selected_link_ids"),ids),_metals_harvest_append_ids(st.get("selected_broker_trade_ids"),bids),sid)); conn.commit()
+        out={"ok":failure is None,"status":status,"threshold_r":stage.get("threshold_r"),"target_gbp":target,"banked_this_tick_gbp":realized_sum,"banked_total_gbp":old+realized_sum}; (result["executed_levels"] if status=="EXECUTED" else result["waiting_levels"]).append(out); prior=status!="EXECUTED"
+    result["status"]="OK"; return result
+
+
+def metals_xau_live_harvest_plan_snapshot() -> Dict[str, Any]:
+    broker=metals_xau_live_broker_snapshot(include_account_summary=False); hwm=_metals_xau_live_highwater_state(broker)
+    with get_conn() as conn: cycle=_metals_xau_live_harvest_cycle_id(conn,hwm); stages=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_harvest_stages ORDER BY id DESC LIMIT 30").fetchall()]
+    high=float(safe_float(hwm.get("high_water_r")) or 0.0); next_level=max(METALS_HARVEST_FIRST_LEVEL_R,(int(high//METALS_HARVEST_STEP_R)+1)*METALS_HARVEST_STEP_R)
+    return {"ok":True,"cycle_id":cycle,"broker_hwm":hwm,"next_harvest_r":next_level,"stages":stages,"policy_version":METALS_XAU_LIVE_HARVEST_POLICY_VERSION}
+
+
+def metals_xau_live_accounting_snapshot() -> Dict[str, Any]:
+    try: metals_xau_live_sync_broker_transactions()
+    except Exception: pass
+    broker=metals_xau_live_broker_snapshot(); open_upl=float(safe_float(broker.get("owned_unrealized_pl")) or 0.0); bounds=_metals_accounting_period_boundaries(); end=bounds["now_utc"]+timedelta(microseconds=1)
+    with get_conn() as conn:
+        tx=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_broker_transactions ORDER BY transaction_time").fetchall()]; links=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_trade_links WHERE status<>'OPEN' AND closed_at_utc IS NOT NULL AND closed_at_utc!='' ORDER BY closed_at_utc").fetchall()]; harvest=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_harvest_events ORDER BY created_at_utc").fetchall()]
+    def period(label,start):
+        txp=[r for r in tx if _metals_period_contains(r.get("transaction_time"),start,end)]; closed=[r for r in links if _metals_period_contains(r.get("closed_at_utc"),start,end)]; hp=[r for r in harvest if _metals_period_contains(r.get("created_at_utc"),start,end) and safe_float(r.get("realized_pl_gbp")) is not None]
+        net=sum(float(safe_float(r.get("net_realized_gbp")) or 0.0) for r in txp); rr=0.0; wins=losses=0
+        for r in closed:
+            pnl=safe_float(r.get("realized_pl")); risk=safe_float(r.get("estimated_risk_amount")) or safe_float(r.get("requested_risk_amount"));
+            if pnl is not None: wins+=1 if pnl>0 else 0; losses+=1 if pnl<0 else 0
+            if pnl is not None and risk is not None and risk>0: rr+=float(pnl)/float(risk)
+        return {"label":label,"net_realized_gbp":net,"broker_pl_gbp":sum(float(safe_float(r.get("pl_gbp")) or 0.0) for r in txp),"financing_gbp":sum(float(safe_float(r.get("financing_gbp")) or 0.0) for r in txp),"realized_r":rr,"closed_trades":len(closed),"wins":wins,"losses":losses,"harvest_banked_gbp":sum(float(safe_float(r.get("realized_pl_gbp")) or 0.0) for r in hp),"current_open_upl_gbp":open_upl,"realized_plus_current_upl_gbp":net+open_upl}
+    return {"ok":True,"currency":"GBP","account_nav_is_shared_with_indices":True,"periods":{"week":period("This Week",bounds["week_start_utc"]),"month":period("This Month",bounds["month_start_utc"]),"all_time":period("All Time",None)},"current_open_upl_gbp":open_upl,"time_utc":now_utc_iso()}
+
+
+def execute_metals_xau_live_candidate(
+    raw_signal_id: int,
+    source: str = "signal_worker",
+    precomputed_candidate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    init_db()
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM raw_signals WHERE id=? LIMIT 1",
+            (int(raw_signal_id),),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "raw_signal_not_found"}
+
+        if _metals_demo_asset(row["pair"]) != "XAUUSD":
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "live_lane_xau_only",
+                "execution_lane": "LIVE_XAU_LONG",
+            }
+
+        existing = conn.execute("""
+            SELECT *
+            FROM metals_xau_live_trade_links
+            WHERE raw_signal_id=?
+            LIMIT 1
+        """, (int(raw_signal_id),)).fetchone()
+        if existing:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "execution_lane": "LIVE_XAU_LONG",
+                "asset": "XAUUSD",
+                "side": "long",
+                "link_id": existing["id"],
+                "status": existing["status"],
+            }
+
+        raw = _raw_signal_json(row)
+        model = (
+            precomputed_candidate
+            if precomputed_candidate is not None
+            else metals_demo_candidate_for_row(raw, row)
+        )
+        effective = metals_demo_production_candidate_for_row(
+            conn, row, model
+        )
+
+    if not effective.get("production_candidate"):
+        return {
+            "ok": True,
+            "skipped": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "reason": "not_production_candidate",
+            "candidate": model,
+            "production_candidate": effective,
+        }
+
+    side = _metals_demo_side(
+        effective.get("side") or model.get("demo_side")
+    )
+    if side != "long":
+        return {
+            "ok": True,
+            "skipped": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": side,
+            "reason": "xau_short_remains_practice",
+        }
+
+    cfg = metals_xau_live_config_status()
+    if not cfg.get("orders_allowed"):
+        _metals_xau_live_audit(
+            raw_signal_id, "entry", "BLOCKED",
+            "XAU LONG routed live but dedicated live lane is not armed/configured",
+        )
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_lane_not_armed_or_configured",
+            "config": cfg,
+        }
+
+    # Must establish a non-retroactive live accounting cursor BEFORE live order.
+    tx_init = metals_xau_live_sync_broker_transactions(force=True)
+    if not tx_init.get("ok"):
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_accounting_epoch_not_ready",
+            "transaction_sync": tx_init,
+        }
+
+    reconcile = metals_xau_live_reconcile_local_ghosts()
+    broker = metals_xau_live_broker_snapshot()
+    recon = _metals_xau_live_reconciliation_snapshot(broker)
+
+    # Recovery may have reconstructed a prior broker fill for this exact signal.
+    with get_conn() as conn:
+        recovered = conn.execute("""
+            SELECT *
+            FROM metals_xau_live_trade_links
+            WHERE raw_signal_id=?
+            LIMIT 1
+        """, (int(raw_signal_id),)).fetchone()
+    if recovered:
+        return {
+            "ok": True,
+            "duplicate": True,
+            "recovered": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "link_id": recovered["id"],
+            "status": recovered["status"],
+        }
+
+    if broker.get("ownership_conflict"):
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_xau_short_ownership_conflict",
+        }
+
+    if not recon.get("execution_safe"):
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_reconciliation_not_exact",
+            "reconciliation": {
+                k: v for k, v in recon.items()
+                if k != "matched"
+            },
+            "reconcile": reconcile,
+        }
+
+    if (
+        int(broker.get("owned_open_count") or 0)
+        >= METALS_XAU_LIVE_MAX_OPEN_TRADES
+    ):
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_xau_max_open_trades",
+        }
+
+    preview = metals_xau_live_sizing_preview()
+    if not preview.get("executable"):
+        _metals_xau_live_audit(
+            raw_signal_id, "entry", "BLOCKED",
+            ";".join(
+                preview.get("blocking_reasons")
+                or ["live_preview_not_executable"]
+            ),
+            preview=preview,
+        )
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "live_preview_not_executable",
+            "preview": preview,
+        }
+
+    units = abs(float(preview["units"]))
+    dp = int(preview.get("display_precision") or 3)
+    body = {
+        "order": {
+            "units": str(units),
+            "instrument": METALS_XAU_LIVE_ALLOWED_INSTRUMENT,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {
+                "price": f"{float(preview['stop_price']):.{dp}f}",
+                "timeInForce": "GTC",
+            },
+        }
+    }
+
+    response = _metals_xau_live_request(
+        f"/v3/accounts/{METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/orders",
+        "POST",
+        body,
+    )
+    data = response.get("data") or {}
+    fill = data.get("orderFillTransaction") or {}
+    opened = fill.get("tradeOpened") or {}
+    broker_trade_id = safe_str(opened.get("tradeID"))
+    broker_order_id = safe_str(
+        fill.get("id")
+        or (data.get("orderCreateTransaction") or {}).get("id")
+    )
+
+    if not response.get("ok") or not broker_trade_id:
+        _metals_xau_live_audit(
+            raw_signal_id, "entry", "FAILED",
+            safe_str(response.get("error") or data),
+            preview=preview,
+            response=response,
+            broker_trade_id=broker_trade_id,
+            broker_order_id=broker_order_id,
+        )
+        return {
+            "ok": False,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "response": response,
+            "preview": preview,
+        }
+
+    # Crash-gap protection: broker fill evidence is durable before link insert.
+    _metals_xau_live_audit(
+        raw_signal_id,
+        "entry",
+        "OPENED_BROKER_PENDING_LINK",
+        (
+            f"LIVE XAU LONG broker fill confirmed from {source}; "
+            "local ownership link pending."
+        ),
+        preview=preview,
+        response=response,
+        broker_trade_id=broker_trade_id,
+        broker_order_id=broker_order_id,
+    )
+
+    started = now_utc_iso()
+    fill_units = abs(
+        float(
+            safe_float(fill.get("units"))
+            or preview.get("units")
+            or 0.0
+        )
+    )
+    fill_price = (
+        safe_float(fill.get("price"))
+        or preview.get("entry_price")
+    )
+
+    try:
+        with get_conn() as conn:
+            sig = conn.execute("""
+                SELECT timestamp_readable
+                FROM raw_signals
+                WHERE id=?
+            """, (int(raw_signal_id),)).fetchone()
+
+            link_id = db_insert_returning_id(conn, """
+                INSERT INTO metals_xau_live_trade_links(
+                    created_at_utc,updated_at_utc,raw_signal_id,asset,
+                    instrument,side,model_version,signal_time,entry_signal_id,
+                    requested_risk_amount,estimated_risk_amount,
+                    requested_units,filled_units,entry_price,
+                    stop_price,current_stop_price,
+                    broker_trade_id,broker_order_id,broker_open_time_utc,
+                    status,active_exit_policy,active_exit_policy_version,
+                    active_exit_policy_started_at_utc,last_reconciled_at_utc,
+                    raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                started, started, int(raw_signal_id), "XAUUSD",
+                METALS_XAU_LIVE_ALLOWED_INSTRUMENT, "long",
+                safe_str(
+                    model.get("model_version")
+                    or METALS_XAU_LIVE_POLICY_VERSION
+                ),
+                safe_str(sig["timestamp_readable"] if sig else ""),
+                int(raw_signal_id),
+                preview.get("risk_amount"),
+                preview.get("estimated_risk_gbp"),
+                preview.get("units"),
+                fill_units,
+                fill_price,
+                preview.get("stop_price"),
+                preview.get("stop_price"),
+                broker_trade_id,
+                broker_order_id,
+                safe_str(fill.get("time")) or started,
+                "OPEN",
+                METALS_XAU_LONG_MFE50_POLICY,
+                METALS_XAU_LONG_MFE50_POLICY_VERSION,
+                started,
+                started,
+                json.dumps({
+                    "execution_lane": "LIVE_XAU_LONG",
+                    "candidate": model,
+                    "production_candidate": effective,
+                    "preview": preview,
+                    "response": response,
+                }, default=str),
+            ))
+            conn.commit()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "broker_opened": True,
+            "local_link_failed": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "broker_trade_id": broker_trade_id,
+            "reason": (
+                "broker_fill_confirmed_local_link_failed; "
+                "exact audit recovery required"
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    _metals_xau_live_audit(
+        raw_signal_id,
+        "entry",
+        "OPENED",
+        (
+            f"LIVE XAU LONG opened from {source}; "
+            f"active_exit_policy={METALS_XAU_LONG_MFE50_POLICY}"
+        ),
+        preview=preview,
+        response=response,
+        link_id=int(link_id),
+        broker_trade_id=broker_trade_id,
+        broker_order_id=broker_order_id,
+    )
+
+    return {
+        "ok": True,
+        "opened": True,
+        "live_money": True,
+        "execution_lane": "LIVE_XAU_LONG",
+        "asset": "XAUUSD",
+        "side": "long",
+        "link_id": link_id,
+        "broker_trade_id": broker_trade_id,
+        "preview": preview,
+        "candidate": model,
+        "production_candidate": effective,
+        "active_exit_policy": {
+            "policy": METALS_XAU_LONG_MFE50_POLICY,
+            "version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
+        },
+        "transaction_epoch": tx_init,
+    }
+
+
+
+def metals_xau_live_manager_tick(
+    force: bool = False,
+    source: str = "maintenance_worker",
+) -> Dict[str, Any]:
+    if not METALS_XAU_LONG_LIVE_PROMOTION_ENABLED:
+        return {
+            "ok": True,
+            "enabled": False,
+            "skipped": True,
+            "reason": "promotion_disabled",
+        }
+
+    if not _METALS_XAU_LIVE_MANAGER_LOCK.acquire(blocking=False):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "live_manager_already_running",
+        }
+
+    try:
+        cfg = metals_xau_live_config_status()
+        result = {
+            "ok": True,
+            "enabled": METALS_XAU_LIVE_MANAGER_ENABLED,
+            "config": cfg,
+            "time_utc": now_utc_iso(),
+            "source": source,
+            "results": [],
+        }
+
+        if cfg.get("missing") or not cfg.get("environment_ok"):
+            result.update({
+                "skipped": True,
+                "reason": "live_config_not_ready",
+            })
+            return result
+
+        market = _metals_xau_live_market_state(force=force)
+        result["market"] = market
+
+        reconcile = metals_xau_live_reconcile_local_ghosts()
+        result["reconciliation"] = reconcile
+
+        broker = metals_xau_live_broker_snapshot()
+        recon = _metals_xau_live_reconciliation_snapshot(broker)
+        result["reconciliation_snapshot"] = {
+            k: v for k, v in recon.items()
+            if k != "matched"
+        }
+
+        result["broker_hwm"] = _metals_xau_live_highwater_state(
+            broker
+        )
+
+        try:
+            result["harvest"] = (
+                metals_xau_live_harvest_maintenance_tick(
+                    allow_execution=(
+                        market.get("tradeable") is True
+                    ),
+                    source=source,
+                )
+            )
+        except Exception as exc:
+            result["ok"] = False
+            result["harvest"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        try:
+            result["close_retry"] = (
+                _metals_xau_live_pending_close_retry_tick()
+            )
+        except Exception as exc:
+            result["ok"] = False
+            result["close_retry"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        with get_conn() as conn:
+            latest = _metals_demo_latest_signal_row(
+                conn, "XAUUSD"
+            )
+            links = [
+                dict(r) for r in conn.execute("""
+                    SELECT *
+                    FROM metals_xau_live_trade_links
+                    WHERE status='OPEN'
+                    ORDER BY id
+                """).fetchall()
+            ]
+
+        latest_id = int(latest["id"]) if latest else 0
+        latest_dt = parse_dt(
+            safe_str(latest["received_at_utc"]) if latest else ""
+        )
+        age = (
+            (now_utc() - latest_dt).total_seconds()
+            if latest_dt is not None else None
+        )
+        fresh = bool(
+            age is not None
+            and age <= METALS_DEMO_MANAGER_FRESH_SIGNAL_SECONDS
+        )
+
+        allow_actions = bool(
+            METALS_XAU_LIVE_MANAGER_ENABLED
+            and cfg.get("orders_allowed")
+            and market.get("tradeable") is True
+            and fresh
+            and recon.get("execution_safe")
+        )
+
+        result["allow_new_manager_actions"] = allow_actions
+        result["latest_raw_signal_id"] = latest_id or None
+        result["latest_signal_age_seconds"] = age
+
+        broker_by_id = {
+            safe_str(t.get("id")): t
+            for t in broker.get("owned_open_trades") or []
+        }
+
+        for link in links:
+            bt = broker_by_id.get(
+                safe_str(link.get("broker_trade_id"))
+            )
+            if not bt:
+                result["results"].append({
+                    "link_id": link.get("id"),
+                    "status": "BROKER_TRADE_NOT_OPEN_AFTER_RECONCILE",
+                })
+                continue
+
+            metrics = _metals_xau_live_trade_metrics(link)
+            if not metrics.get("ok"):
+                result["results"].append({
+                    "link_id": link.get("id"),
+                    "status": "METRICS_FAILED",
+                    "metrics": metrics,
+                })
+                continue
+
+            decision = _metals_demo_decision(metrics, link)
+            upl = safe_float(bt.get("unrealizedPL"))
+            hold = int(metrics.get("hold_candles") or 0)
+            fixed = safe_float(metrics.get("fixed_48h_r"))
+            now_iso = now_utc_iso()
+
+            with get_conn() as conn:
+                conn.execute("""
+                    UPDATE metals_xau_live_trade_links
+                    SET updated_at_utc=?,
+                        last_known_price=?,
+                        last_known_unrealized_pl=?,
+                        manager_current_r=?,
+                        manager_high_water_r=?,
+                        manager_mfe_r=?,
+                        manager_mae_r=?,
+                        manager_last_review_signal_id=?,
+                        manager_last_review_candles=?,
+                        manager_last_decision=?,
+                        manager_last_reason=?,
+                        fixed_48h_price=COALESCE(fixed_48h_price,?),
+                        fixed_48h_r=COALESCE(fixed_48h_r,?),
+                        fixed_48h_recorded_at_utc=
+                            CASE
+                                WHEN ? IS NOT NULL
+                                THEN COALESCE(fixed_48h_recorded_at_utc,?)
+                                ELSE fixed_48h_recorded_at_utc
+                            END,
+                        last_reconciled_at_utc=?
+                    WHERE id=?
+                """, (
+                    now_iso,
+                    metrics.get("current_price"),
+                    upl,
+                    metrics.get("current_r"),
+                    metrics.get("high_water_r"),
+                    metrics.get("mfe_r"),
+                    metrics.get("mae_r"),
+                    metrics.get("latest_signal_id"),
+                    hold,
+                    decision.get("decision"),
+                    decision.get("reason"),
+                    metrics.get("fixed_48h_price"),
+                    fixed,
+                    fixed,
+                    now_iso,
+                    now_iso,
+                    int(link["id"]),
+                ))
+                conn.commit()
+
+            link.update({
+                "manager_current_r": metrics.get("current_r"),
+                "manager_high_water_r": metrics.get("high_water_r"),
+                "manager_mfe_r": metrics.get("mfe_r"),
+                "manager_last_review_candles": hold,
+            })
+
+            stop_result = {"status": "NO_UPDATE"}
+            close_status = ""
+
+            if allow_actions:
+                if safe_str(
+                    decision.get("decision")
+                ).startswith("CLOSE"):
+                    qid = _metals_xau_live_queue_close(
+                        link,
+                        safe_str(decision.get("reason")),
+                        int(metrics.get("latest_signal_id") or 0),
+                    )
+                    close_result = _metals_xau_live_close(
+                        link, qid
+                    )
+                    close_status = safe_str(
+                        close_result.get("status")
+                    )
+                elif decision.get("decision") == "EXTEND":
+                    stop_result = _metals_xau_live_update_stop(
+                        link,
+                        _metals_xau_live_stop_candidate(
+                            link, metrics
+                        ),
+                    )
+            elif not recon.get("execution_safe"):
+                stop_result = {
+                    "status": "SUPPRESSED_RECONCILIATION_NOT_EXACT"
+                }
+                close_status = "SUPPRESSED_RECONCILIATION_NOT_EXACT"
+            elif not fresh:
+                stop_result = {
+                    "status": "SUPPRESSED_STALE_SIGNAL"
+                }
+                close_status = "SUPPRESSED_STALE_SIGNAL"
+            elif not cfg.get("orders_allowed"):
+                stop_result = {
+                    "status": "SUPPRESSED_LIVE_WRITES_NOT_ARMED"
+                }
+                close_status = "SUPPRESSED_LIVE_WRITES_NOT_ARMED"
+
+            with get_conn() as conn:
+                conn.execute("""
+                    INSERT INTO metals_xau_live_manager_reviews(
+                        created_at_utc,link_id,raw_signal_id,
+                        review_signal_id,hold_candles,current_price,
+                        current_r,mfe_r,mae_r,high_water_r,
+                        giveback_pct,decision,reason,
+                        proposed_stop_price,stop_update_status,
+                        close_queue_status,fixed_48h_price,fixed_48h_r,
+                        raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    now_utc_iso(),
+                    int(link["id"]),
+                    int(link.get("raw_signal_id") or 0),
+                    metrics.get("latest_signal_id"),
+                    hold,
+                    metrics.get("current_price"),
+                    metrics.get("current_r"),
+                    metrics.get("mfe_r"),
+                    metrics.get("mae_r"),
+                    metrics.get("high_water_r"),
+                    metrics.get("giveback_pct"),
+                    decision.get("decision"),
+                    decision.get("reason"),
+                    stop_result.get("stop_price"),
+                    stop_result.get("status"),
+                    close_status,
+                    metrics.get("fixed_48h_price"),
+                    metrics.get("fixed_48h_r"),
+                    json.dumps({
+                        "metrics": metrics,
+                        "decision": decision,
+                        "stop": stop_result,
+                        "live_lane": True,
+                        "reconciliation_exact": recon.get(
+                            "execution_safe"
+                        ),
+                    }, default=str),
+                ))
+                conn.commit()
+
+            result["results"].append({
+                "link_id": link.get("id"),
+                "broker_trade_id": link.get("broker_trade_id"),
+                "hold_candles": hold,
+                "current_r": metrics.get("current_r"),
+                "mfe_r": metrics.get("mfe_r"),
+                "high_water_r": metrics.get("high_water_r"),
+                "decision": decision,
+                "stop_result": stop_result,
+                "close_queue_status": close_status,
+                "unrealized_pl": upl,
+            })
+
+        try:
+            result["transaction_sync"] = (
+                metals_xau_live_sync_broker_transactions(
+                    force=True
+                )
+            )
+        except Exception as exc:
+            result["transaction_sync"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        return result
+    finally:
+        _METALS_XAU_LIVE_MANAGER_LOCK.release()
+
+
+
+def metals_xau_live_status() -> Dict[str, Any]:
+    init_db(); cfg=metals_xau_live_config_status(); broker=metals_xau_live_broker_snapshot(); hwm=_metals_xau_live_highwater_state(broker); acct=metals_xau_live_accounting_snapshot(); harvest=metals_xau_live_harvest_plan_snapshot()
+    with get_conn() as conn: open_links=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_trade_links WHERE status='OPEN' ORDER BY id").fetchall()]; closed=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_trade_links WHERE status<>'OPEN' ORDER BY closed_at_utc DESC,id DESC LIMIT 20").fetchall()]; queue=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_action_queue ORDER BY id DESC LIMIT 20").fetchall()]; reviews=[dict(r) for r in conn.execute("SELECT * FROM metals_xau_live_manager_reviews ORDER BY id DESC LIMIT 30").fetchall()]
+    return {"ok":True,"label":METALS_XAU_LIVE_LABEL,"config":cfg,"broker":broker,"broker_hwm":hwm,"accounting":acct,"harvest":harvest,"open_trades":open_links,"recent_closed":closed,"recent_queue":queue,"recent_manager_reviews":reviews,"live_lane":{"XAUUSD_LONG":"LIVE"},"practice_lanes":{"XAUUSD_SHORT":"PRACTICE","XAGUSD_LONG":"PRACTICE","XAGUSD_SHORT":"PRACTICE"},"time_utc":now_utc_iso()}
+
+
+@app.get("/broker/xau-live/status")
+def metals_xau_live_status_route() -> Dict[str, Any]: return metals_xau_live_status()
+
+@app.get("/broker/xau-live/accounting")
+def metals_xau_live_accounting_route() -> Dict[str, Any]: return metals_xau_live_accounting_snapshot()
+
+@app.get("/broker/xau-live/harvest")
+def metals_xau_live_harvest_route() -> Dict[str, Any]: return metals_xau_live_harvest_plan_snapshot()
+
+@app.get("/broker/xau-live/preview")
+def metals_xau_live_preview_route() -> Dict[str, Any]: return metals_xau_live_sizing_preview()
+
+
 def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_worker") -> Dict[str, Any]:
     init_db()
     with get_conn() as conn:
@@ -24402,6 +26532,12 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
         _metals_demo_audit(raw_signal_id,asset,instrument,"candidate_evaluation","BLOCKED",candidate.get("demo_blockers") or "not_candidate",candidate_state=candidate.get("demo_state"))
         return {"ok":True,"skipped":True,"asset":asset,"candidate":candidate}
     side=_metals_demo_side(candidate.get("demo_side"))
+
+    # v1.6.31 split execution router. XAU LONG never falls back to practice.
+    if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED and asset == "XAUUSD" and side == "long":
+        return execute_metals_xau_live_candidate(
+            int(raw_signal_id), source=source, precomputed_candidate=candidate
+        )
 
     # v1.3.1 asymmetric correlation guard:
     # XAU unrestricted; XAG 11th+ campaign entry needs same-direction XAU <=6h.
@@ -26090,6 +28226,13 @@ def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
                     }
             result["assets"][asset] = asset_result
 
+        # v1.6.31 maintain the isolated live XAU LONG lane from the same worker.
+        try:
+            result["xau_long_live"] = metals_xau_live_manager_tick(force=force, source="maintenance_worker")
+        except Exception as exc:
+            result["ok"] = False
+            result["xau_long_live"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
         # Persistent close-until-flat retries are allowed only while tradeable.
         if market.get("tradeable") is True:
             try:
@@ -26184,42 +28327,31 @@ def metals_live_hwm_worker_status() -> Dict[str, Any]:
 
 
 def metals_live_hwm_tick() -> Dict[str, Any]:
-    """Refresh broker HWM independently of hourly TradingView/manager signals.
-
-    Read-only against OANDA. It never creates/closes/modifies a trade. A new high
-    is persisted by _metals_broker_highwater_state with the exact OANDA quote time.
-    """
+    """Refresh both independent Metals HWMs; read-only against OANDA."""
     global _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC, _METALS_LIVE_HWM_WORKER_LAST_RESULT
-    result: Dict[str, Any] = {"ok": True, "time_utc": now_utc_iso()}
+    result: Dict[str, Any] = {"ok": True, "time_utc": now_utc_iso(), "demo_practice": {}, "xau_long_live": {}}
     try:
         if not METALS_LIVE_HWM_SAMPLER_ENABLED:
-            result.update({"skipped": True, "reason": "disabled"})
-            return result
-        cfg = metals_demo_config_status()
-        if cfg.get("missing") or METALS_DEMO_OANDA_ENV not in {"practice", "live"}:
-            result.update({"skipped": True, "reason": "config_not_ready", "missing": cfg.get("missing")})
-            return result
-        broker = metals_demo_live_broker_snapshot(include_account_summary=False)
-        hwm = _metals_broker_highwater_state(broker)
-        result.update({
-            "broker_read_ok": bool(broker.get("ok")),
-            "open_count": int(broker.get("owned_open_count") or 0),
-            "current_gbp": float(safe_float(hwm.get("current_gbp")) or 0.0),
-            "high_water_gbp": float(safe_float(hwm.get("high_water_gbp")) or 0.0),
-            "high_water_r": float(safe_float(hwm.get("high_water_r")) or 0.0),
-            "high_water_seen_at": safe_str(hwm.get("high_water_seen_at")),
-            "source": safe_str(hwm.get("source")),
-        })
-        if not broker.get("ok"):
-            result["ok"] = False
-            result["error"] = safe_str(broker.get("error"))
-        return result
-    except Exception as exc:
-        result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            result.update({"skipped": True, "reason": "disabled"}); return result
+        try:
+            cfg = metals_demo_config_status()
+            if not cfg.get("missing") and METALS_DEMO_OANDA_ENV in {"practice", "live"}:
+                b = metals_demo_live_broker_snapshot(include_account_summary=False); h = _metals_broker_highwater_state(b)
+                result["demo_practice"] = {"ok": bool(b.get("ok")), "open_count": int(b.get("owned_open_count") or 0), "current_gbp": float(safe_float(h.get("current_gbp")) or 0.0), "high_water_gbp": float(safe_float(h.get("high_water_gbp")) or 0.0), "high_water_r": float(safe_float(h.get("high_water_r")) or 0.0), "high_water_seen_at": safe_str(h.get("high_water_seen_at"))}
+            else: result["demo_practice"] = {"ok": True, "skipped": True, "reason": "demo_config_not_ready"}
+        except Exception as e:
+            result["ok"] = False; result["demo_practice"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        try:
+            cfg = metals_xau_live_config_status()
+            if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED and not cfg.get("missing") and cfg.get("environment_ok"):
+                b = metals_xau_live_broker_snapshot(include_account_summary=False); h = _metals_xau_live_highwater_state(b)
+                result["xau_long_live"] = {"ok": bool(b.get("ok")), "open_count": int(b.get("owned_open_count") or 0), "current_gbp": float(safe_float(h.get("current_gbp")) or 0.0), "current_r": float(safe_float(h.get("current_r")) or 0.0), "high_water_gbp": float(safe_float(h.get("high_water_gbp")) or 0.0), "high_water_r": float(safe_float(h.get("high_water_r")) or 0.0), "high_water_seen_at": safe_str(h.get("high_water_seen_at")), "ownership_conflict": bool(b.get("ownership_conflict"))}
+            else: result["xau_long_live"] = {"ok": True, "skipped": True, "reason": "live_xau_config_not_ready"}
+        except Exception as e:
+            result["ok"] = False; result["xau_long_live"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         return result
     finally:
-        _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC = now_utc_iso()
-        _METALS_LIVE_HWM_WORKER_LAST_RESULT = dict(result)
+        _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC = now_utc_iso(); _METALS_LIVE_HWM_WORKER_LAST_RESULT = dict(result)
 
 
 def _metals_live_hwm_loop() -> None:
@@ -38837,13 +40969,46 @@ def _metals_accounting_performance_safe_html() -> str:
         """
 
 
+def _metals_xau_live_dashboard_html() -> str:
+    try:
+        st = metals_xau_live_status(); cfg = st.get("config") or {}; broker = st.get("broker") or {}; hwm = st.get("broker_hwm") or {}; acct = broker.get("account") or {}; periods = (st.get("accounting") or {}).get("periods") or {}; week = periods.get("week") or {}; month = periods.get("month") or {}; all_time = periods.get("all_time") or {}; harvest = st.get("harvest") or {}; open_rows = st.get("open_trades") or []
+        rows = "".join(f"""<tr><td>{esc(r.get('broker_trade_id'))}</td><td>{esc(r.get('signal_time'))}</td><td>{money(r.get('estimated_risk_amount'),'GBP')}</td><td>{_metals_fmt(r.get('entry_price'),3)}</td><td>{_metals_fmt(r.get('current_stop_price') or r.get('stop_price'),3)}</td><td>{_metals_fmt(r.get('manager_current_r'),2)}R</td><td>{_metals_fmt(r.get('manager_mfe_r'),2)}R</td><td>{esc(r.get('manager_last_review_candles'))}</td><td>{esc(r.get('manager_last_decision') or 'PRE-REVIEW')}</td></tr>""" for r in open_rows)
+        conflict = "" if not broker.get("ownership_conflict") else """<div class='section-note neg'><strong>LIVE XAU OWNERSHIP CONFLICT.</strong> A XAU_USD SHORT exists on the shared live account. This lane will not touch it and new XAU LONG entries are blocked.</div>"""
+        return f"""
+          <div class="section-note {'pos' if cfg.get('orders_allowed') else 'warn'}"><strong>XAU LONG — LIVE PILOT.</strong> Only XAU_USD LONG is live. XAU SHORT and XAG LONG/SHORT remain practice. NAS100/US500 trades on the shared live account are ignored.</div>
+          {conflict}
+          <div class="metric-grid">
+            <div class="mini-card"><div class="k">XAU LIVE Execution</div><div class="v {'pos' if cfg.get('orders_allowed') else 'warn'}">{'ARMED' if cfg.get('orders_allowed') else 'LOCKED'}</div><div class="small">promotion {'ON' if cfg.get('promotion_enabled') else 'OFF'} · broker {'ON' if cfg.get('broker_enabled') else 'OFF'} · arm {'ON' if cfg.get('execution_armed') else 'OFF'}</div></div>
+            <div class="mini-card"><div class="k">Shared Live NAV</div><div class="v">{money(acct.get('NAV'),'GBP')}</div><div class="small">Same OANDA NAV as Indices; not additive</div></div>
+            <div class="mini-card"><div class="k">XAU Live Open P&amp;L</div><div class="v {pnl_class(broker.get('owned_unrealized_pl'))}">{money(broker.get('owned_unrealized_pl'),'GBP')}</div><div class="small">{int(broker.get('owned_open_count') or 0)} live XAU LONG trades</div></div>
+            <div class="mini-card"><div class="k">XAU Live HWM</div><div class="v">{money(hwm.get('high_water_gbp'),'GBP')}</div><div class="small">{_metals_fmt(hwm.get('high_water_r'),2)}R · {esc(display_utc_time(hwm.get('high_water_seen_at')))}</div></div>
+            <div class="mini-card"><div class="k">XAU Live Giveback</div><div class="v">{money(hwm.get('giveback_gbp'),'GBP')}</div><div class="small">{_metals_fmt(hwm.get('giveback_r'),2)}R</div></div>
+            <div class="mini-card"><div class="k">This Week Realised</div><div class="v {pnl_class(week.get('net_realized_gbp'))}">{money(week.get('net_realized_gbp'),'GBP')}</div><div class="small">{_metals_fmt(week.get('realized_r'),2)}R</div></div>
+            <div class="mini-card"><div class="k">This Month Realised</div><div class="v {pnl_class(month.get('net_realized_gbp'))}">{money(month.get('net_realized_gbp'),'GBP')}</div><div class="small">{_metals_fmt(month.get('realized_r'),2)}R</div></div>
+            <div class="mini-card"><div class="k">All-Time XAU Live</div><div class="v {pnl_class(all_time.get('net_realized_gbp'))}">{money(all_time.get('net_realized_gbp'),'GBP')}</div><div class="small">{_metals_fmt(all_time.get('realized_r'),2)}R</div></div>
+            <div class="mini-card"><div class="k">Next Live Harvest</div><div class="v">{_metals_fmt(harvest.get('next_harvest_r'),0)}R</div><div class="small">50R ladder · live XAU only</div></div>
+          </div>
+          <div class="section-note small"><strong>Active live exit:</strong> MFE50 after the existing 48h minimum. Live HWM/harvest/accounting are XAU LONG only and cannot include demo XAG/XAU-short P&amp;L.</div>
+          <h3>Open XAU LONG Live Trades</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Signal</th><th>Effective Risk</th><th>Entry</th><th>Stop</th><th>Current R</th><th>MFE</th><th>Hold</th><th>MFE50 Decision</th></tr></thead><tbody>{rows or '<tr><td colspan="9">No live XAU LONG trades open.</td></tr>'}</tbody></table></div>
+          <div class="section-note small"><a href="/broker/xau-live/status">live status JSON</a> · <a href="/broker/xau-live/preview">live sizing preview</a> · <a href="/broker/xau-live/accounting">live accounting</a> · <a href="/broker/xau-live/harvest">live harvest</a></div>
+        """
+    except Exception as exc:
+        return f"<div class='section-note neg'><strong>XAU LONG LIVE PILOT panel failed.</strong><br>{esc(type(exc).__name__)}: {esc(exc)}</div>"
+
+
 def _metals_standard_broker_combined_html():
+    xau_live = _metals_xau_live_dashboard_html()
     accounting = _metals_accounting_performance_safe_html()
     broker_core = _metals_std_broker_html()
     execution = _metals_std_execution_html()
     return f"""
       <details open class="dashboard-group">
-        <summary>Weekly / Monthly Profit Accounting</summary>
+        <summary>XAU LONG — LIVE PILOT</summary>
+        <div class="research-inner-body">{xau_live}</div>
+      </details>
+
+      <details open class="dashboard-group">
+        <summary>Practice Lane Weekly / Monthly Profit Accounting</summary>
         <div class="research-inner-body">
           {accounting}
         </div>
@@ -39293,6 +41458,17 @@ def metals_build_integrity() -> Dict[str, Any]:
         "metals_accounting_performance",
         "_metals_accounting_performance_html",
         "_metals_accounting_performance_safe_html",
+        "metals_xau_live_config_status",
+        "execute_metals_xau_live_candidate",
+        "metals_xau_live_manager_tick",
+        "metals_xau_live_broker_snapshot",
+        "_metals_xau_live_highwater_state",
+        "metals_xau_live_harvest_maintenance_tick",
+        "metals_xau_live_accounting_snapshot",
+        "_metals_xau_live_recover_broker_only",
+        "_metals_xau_live_pending_close_retry_tick",
+        "_metals_xau_live_transaction_owned",
+        "_metals_xau_live_dashboard_html",
         "_metals_standard_broker_combined_html",
         "metals_manual_start_new_basket_cycle_impl",
         "metals_standard_dashboard",
@@ -39348,7 +41524,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 </head>
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
-<div class="sub">{esc(METALS_APP_VERSION)} · cumulative from known-good v1.6.2 · XAU + XAG · OANDA practice only</div>
+<div class="sub">{esc(METALS_APP_VERSION)} · cumulative Metals v1.6.30+ · XAU LONG live pilot · XAU SHORT/XAG practice</div>
 <div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
@@ -39461,6 +41637,14 @@ def metals_standard_status() -> Dict[str, Any]:
             "xag_blocked_candidate_counts_toward_ai_candidate": False,
             "xag_blocked_candidate_counts_toward_broker_recovery_match": False,
             "weekly_monthly_broker_accounting": True,
+            "split_live_demo_execution": True,
+            "xau_long_execution_lane": "LIVE_XAU_LONG",
+            "xau_short_execution_lane": "PRACTICE",
+            "xag_long_execution_lane": "PRACTICE",
+            "xag_short_execution_lane": "PRACTICE",
+            "live_xau_hwm_scope": "XAU_USD_LONG_ONLY",
+            "live_xau_harvest_scope": "XAU_USD_LONG_ONLY",
+            "live_account_other_instruments_ignored": True,
             "accounting_week_definition": "Monday 00:00 Europe/London",
             "accounting_month_definition": "calendar month",
             "fixed_48h_control": True,
