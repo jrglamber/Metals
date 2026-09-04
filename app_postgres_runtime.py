@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.31 XAU LONG Live Pilot + Split Live/Demo Lanes + MFE50/Harvest
+# VERIFIED BUILD: Metals v1.6.32 Live-First Standard Top Tiles + XAU LONG Live Pilot
 # Cumulative on v1.6.30. Adds a dedicated fail-closed XAU LONG live pilot lane while retaining XAU SHORT + XAG LONG/SHORT on practice. All v1.6.30 accounting, v1.6.28 HWM and v1.6.27 direction-flip functionality retained.
 import os
 import json
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.31"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.30 / 2026-09-04"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU LONG Live Pilot + Demo Research Lanes + MFE50/Harvest"
+METALS_APP_VERSION = "v1.6.32"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.31 / 2026-09-04"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Live-First Top Tiles + XAU LONG Live Pilot + Demo Research Lanes"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -39812,80 +39812,64 @@ def _metals_trade_age_hours(link: Dict[str, Any], broker_trade: Optional[Dict[st
 
 
 def _metals_standard_top_uncached() -> Dict[str, Any]:
+    """
+    Standard Metals top tiles are LIVE-FIRST.
+
+    Layout remains the cross-asset standard:
+      NAV | Broker P&L | High-Water | Giveback
+      This Week | This Month | Open Trades | 48h+ Trades
+      Signal Health | Signals | Candidate Support
+
+    At v1.6.32 the only live Metals lane is XAU LONG. Practice XAU SHORT and
+    XAG LONG/SHORT remain visible lower down in Broker / OANDA / Accounting.
+    """
     snap = metals_demo_summary()
-    cfg = snap.get("config") or {}
-    family = _metals_standard_latest_family_snapshot()
-    broker = metals_demo_live_broker_snapshot()
-    acct = broker.get("account") or {}
-
-    open_trades = snap.get("open_trades") or []
-    broker_by_id = {
-        safe_str(t.get("id")): t
-        for t in (broker.get("owned_open_trades") or [])
-    }
-    open_trade_ages = [
-        _metals_trade_age_hours(
-            r,
-            broker_by_id.get(safe_str(r.get("broker_trade_id")))
-        )
-        for r in open_trades
-    ]
-    mature = sum(
-        1 for age in open_trade_ages
-        if age >= int(METALS_DEMO_MANAGER_MIN_HOLD_CANDLES)
-    )
-    oldest = max(open_trade_ages or [0])
-
     latest = snap.get("latest") or {}
 
-    # v1.6.14: Signal Health / Signals use exact SAME-CANDLE coverage.
-    # The old "latest row per asset" count could show 2/2 when XAU had the
-    # current candle but XAG's latest row was several hours old.
-    signal_coverage: Dict[str, Any] = {
-        "status": "UNKNOWN",
-        "latest": {},
-    }
+    live_cfg = metals_xau_live_config_status()
+    live_broker = metals_xau_live_broker_snapshot()
+    live_acct = live_broker.get("account") or {}
+    live_hwm = _metals_xau_live_highwater_state(live_broker)
+    live_accounting = metals_xau_live_accounting_snapshot()
+    live_periods = live_accounting.get("periods") or {}
+    live_week = live_periods.get("week") or {}
+    live_month = live_periods.get("month") or {}
+    live_all = live_periods.get("all_time") or {}
 
-    # Top-level HWM / Giveback is broker-authoritative and updates on every
-    # dashboard refresh, not only after a local manager review.
-    broker_hwm = _metals_broker_highwater_state(broker)
-    basket_r = float(safe_float(broker_hwm.get("current_r")) or 0.0)
-    hwm_r = float(safe_float(broker_hwm.get("high_water_r")) or 0.0)
-    hwm_gbp = float(safe_float(broker_hwm.get("high_water_gbp")) or 0.0)
-    hwm_time = safe_str(broker_hwm.get("high_water_seen_at"))
-    giveback_pct = float(safe_float(broker_hwm.get("giveback_pct")) or 0.0)
-    giveback_r = float(safe_float(broker_hwm.get("giveback_r")) or 0.0)
-    giveback_gbp = float(safe_float(broker_hwm.get("giveback_gbp")) or 0.0)
-
-    broker_open_pnl = safe_float(broker.get("owned_unrealized_pl")) or 0.0
-    realized_pnl = safe_float(snap.get("actual_realized_pnl")) or 0.0
-
-    now = now_utc()
-    week_start = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     with get_conn() as conn:
-        # Exact-candle XAU/XAG delivery coverage. This is the same source of
-        # truth used by /signal-coverage and cannot mix different candles.
+        live_open_links = [
+            dict(r) for r in conn.execute("""
+                SELECT *
+                FROM metals_xau_live_trade_links
+                WHERE status='OPEN'
+                ORDER BY id
+            """).fetchall()
+        ]
         signal_coverage = build_signal_coverage(conn)
 
-        # v1.6.15: calendar realised P&L uses the same broker-authoritative
-        # OANDA transaction ledger as the Broker P&L tile. Previously these
-        # cards summed local trade-link realized_pl, which could lag or miss a
-        # broker-confirmed close and incorrectly show £0.
-        wk = conn.execute(
-            """SELECT COALESCE(SUM(net_realized_gbp),0) AS p
-               FROM metals_demo_broker_transactions
-               WHERE transaction_time>=?""",
-            (week_start.isoformat(),)
-        ).fetchone()
-        mo = conn.execute(
-            """SELECT COALESCE(SUM(net_realized_gbp),0) AS p
-               FROM metals_demo_broker_transactions
-               WHERE transaction_time>=?""",
-            (month_start.isoformat(),)
-        ).fetchone()
+    live_broker_by_id = {
+        safe_str(t.get("id")): t
+        for t in (live_broker.get("owned_open_trades") or [])
+    }
+    live_open_ages = [
+        _metals_trade_age_hours(
+            row,
+            live_broker_by_id.get(safe_str(row.get("broker_trade_id")))
+        )
+        for row in live_open_links
+    ]
+    live_mature = sum(
+        1 for age in live_open_ages
+        if age >= int(METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES)
+    )
+    live_oldest = max(live_open_ages or [0])
+
+    live_open_pnl = float(
+        safe_float(live_broker.get("owned_unrealized_pl")) or 0.0
+    )
+    live_realized = float(
+        safe_float(live_all.get("net_realized_gbp")) or 0.0
+    )
 
     latest_cov = signal_coverage.get("latest") or {}
     received_pairs = {
@@ -39898,26 +39882,30 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
         for x in (latest_cov.get("missing_pairs") or [])
         if _project_scope_pair(x) in {"XAUUSD", "XAGUSD"}
     ]
-    signal_count = int(safe_float(latest_cov.get("received_count")) or 0)
+    signal_count = int(
+        safe_float(latest_cov.get("received_count")) or 0
+    )
     signal_count = max(0, min(signal_count, 2))
     signal_health_status = safe_str(
         signal_coverage.get("status") or "UNKNOWN"
     ).upper()
 
-    # Candidate Support is current-candle AND post-guard only. A raw XAG
-    # model candidate blocked by the XAU<=6h rule is intentionally excluded.
     candidate_count = sum(
         1
-        for a in ("XAUUSD", "XAGUSD")
-        if a in received_pairs
+        for asset in ("XAUUSD", "XAGUSD")
+        if asset in received_pairs
         and bool(
-            ((latest.get(a) or {}).get("production_candidate") or {}).get(
+            ((latest.get(asset) or {}).get("production_candidate") or {}).get(
                 "production_candidate"
             )
         )
     )
-    xag_prod = ((latest.get("XAGUSD") or {}).get("production_candidate") or {})
-    xag_model = ((latest.get("XAGUSD") or {}).get("model_selected_candidate") or {})
+    xag_prod = (
+        (latest.get("XAGUSD") or {}).get("production_candidate") or {}
+    )
+    xag_model = (
+        (latest.get("XAGUSD") or {}).get("model_selected_candidate") or {}
+    )
     xag_blocked = bool(
         "XAGUSD" in received_pairs
         and xag_model.get("demo_candidate")
@@ -39927,63 +39915,119 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
     if xag_blocked:
         xag_candidate_note = (
             "XAG model candidate BLOCKED · "
-            + safe_str(xag_prod.get("reason") or "waiting for XAU confirmation")
+            + safe_str(
+                xag_prod.get("reason")
+                or "waiting for XAU confirmation"
+            )
         )
 
     return {
         "status": "ok",
         "project": "METALS",
-        "mode": "OANDA PRACTICE",
+        "mode": "SPLIT — LIVE METALS TOP / PRACTICE RESEARCH LANES",
         "reporting_currency": "GBP",
         "time_utc": now_utc_iso(),
         "account": {
-            "nav": safe_float(acct.get("NAV")),
-            "balance": safe_float(acct.get("balance")),
-            "unrealized_pl": safe_float(acct.get("unrealizedPL")),
-            "margin_available": safe_float(acct.get("marginAvailable")),
-            "currency": safe_str(acct.get("currency") or cfg.get("oanda_account_currency")),
-            "gbp_verified": bool(cfg.get("gbp_account_verified")),
+            "nav": safe_float(live_acct.get("NAV")),
+            "balance": safe_float(live_acct.get("balance")),
+            "unrealized_pl": safe_float(live_acct.get("unrealizedPL")),
+            "margin_available": safe_float(live_acct.get("marginAvailable")),
+            "currency": safe_str(live_acct.get("currency")),
+            "gbp_verified": (
+                safe_str(live_acct.get("currency")).upper() == "GBP"
+            ),
+            "shared_with_indices": True,
         },
         "accounting": {
-            "week_pnl": safe_float(wk["p"] if wk else 0) or 0.0,
-            "week_label": "OANDA realised this week",
-            "month_pnl": safe_float(mo["p"] if mo else 0) or 0.0,
-            "month_label": "OANDA realised this month",
+            "week_pnl": float(
+                safe_float(live_week.get("net_realized_gbp")) or 0.0
+            ),
+            "week_label": "LIVE Metals realised this week",
+            "month_pnl": float(
+                safe_float(live_month.get("net_realized_gbp")) or 0.0
+            ),
+            "month_label": "LIVE Metals realised this month",
+            "all_time_pnl": live_realized,
+            "source": "LIVE_METALS_ONLY",
         },
         "strategy": {
-            "open_pnl": broker_open_pnl,
-            "headline_pnl": broker_open_pnl,
-            "model_open_pnl": safe_float(snap.get("actual_open_pnl")) or 0.0,
-            "realized_pnl": realized_pnl,
-            "total_pnl": broker_open_pnl + realized_pnl,
-            "open_trades": int(broker.get("owned_open_count") or 0),
-            "local_open_trades": int(snap.get("open_trade_count") or 0),
-            "open_long": int(snap.get("open_long_count") or 0),
-            "open_short": int(snap.get("open_short_count") or 0),
-            "mature_48h_plus": mature,
-            "oldest_hold": oldest,
-            "basket_r": basket_r,
-            "high_water_r": hwm_r,
-            "high_water_gbp": hwm_gbp,
-            "high_water_time": hwm_time,
-            "giveback_r": giveback_r,
-            "giveback_gbp": giveback_gbp,
-            "giveback_pct": giveback_pct,
-            "high_water_source": safe_str(broker_hwm.get("source") or "OANDA_XAU_XAG_OPEN_PNL"),
-            "high_water_historical_repair": bool(broker_hwm.get("historical_repair")),
-            "high_water_broker_read_ok": bool(broker_hwm.get("broker_read_ok", True)),
-            "broker_r_linked_count": int(broker_hwm.get("linked_r_count") or 0),
-            "broker_r_unlinked_count": int(broker_hwm.get("unlinked_broker_count") or 0),
-            "basket_state": safe_str(
-                family.get("state") or ("FLAT" if not open_trades else "GREEN")
+            "open_pnl": live_open_pnl,
+            "headline_pnl": live_open_pnl,
+            "model_open_pnl": live_open_pnl,
+            "realized_pnl": live_realized,
+            "total_pnl": live_open_pnl + live_realized,
+            "open_trades": int(
+                live_broker.get("owned_open_count") or 0
             ),
-            "manager_enabled": bool(cfg.get("basket_manager_enabled")),
-            "orders_allowed": bool(cfg.get("orders_allowed")),
-            "broker_margin_used": safe_float(broker.get("owned_margin_used")) or 0.0,
-            "broker_account_open_count": int(broker.get("account_open_count") or 0),
+            "local_open_trades": len(live_open_links),
+            "open_long": len(live_open_links),
+            "open_short": 0,
+            "mature_48h_plus": live_mature,
+            "oldest_hold": live_oldest,
+            "basket_r": float(
+                safe_float(live_hwm.get("current_r")) or 0.0
+            ),
+            "high_water_r": float(
+                safe_float(live_hwm.get("high_water_r")) or 0.0
+            ),
+            "high_water_gbp": float(
+                safe_float(live_hwm.get("high_water_gbp")) or 0.0
+            ),
+            "high_water_time": safe_str(
+                live_hwm.get("high_water_seen_at")
+            ),
+            "giveback_r": float(
+                safe_float(live_hwm.get("giveback_r")) or 0.0
+            ),
+            "giveback_gbp": float(
+                safe_float(live_hwm.get("giveback_gbp")) or 0.0
+            ),
+            "giveback_pct": float(
+                safe_float(live_hwm.get("giveback_pct")) or 0.0
+            ),
+            "high_water_source": safe_str(
+                live_hwm.get("source") or "LIVE_METALS"
+            ),
+            "high_water_historical_repair": False,
+            "high_water_broker_read_ok": bool(
+                live_hwm.get("broker_read_ok", True)
+            ),
+            "broker_r_linked_count": int(
+                live_hwm.get("linked_r_count") or 0
+            ),
+            "broker_r_unlinked_count": int(
+                live_hwm.get("unlinked_broker_count") or 0
+            ),
+            "basket_state": (
+                "FLAT"
+                if int(live_broker.get("owned_open_count") or 0) == 0
+                else "LIVE"
+            ),
+            "manager_enabled": bool(
+                live_cfg.get("promotion_enabled")
+                and METALS_XAU_LIVE_MANAGER_ENABLED
+            ),
+            "orders_allowed": bool(live_cfg.get("orders_allowed")),
+            "broker_margin_used": float(
+                safe_float(live_broker.get("owned_margin_used")) or 0.0
+            ),
+            "broker_account_open_count": int(
+                live_broker.get("account_open_count") or 0
+            ),
             "manager_worker": metals_demo_manager_worker_status(),
             "live_hwm_worker": metals_live_hwm_worker_status(),
-            "risk_visibility": snap.get("risk_visibility") or {},
+            "risk_visibility": {
+                "live_lane": "XAUUSD_LONG",
+                "requested_risk_gbp": METALS_XAU_LIVE_RISK_AMOUNT,
+                "practice_excluded_from_top": True,
+            },
+            "top_scope": "LIVE_METALS_ONLY",
+            "live_lanes": ["XAUUSD_LONG"],
+            "practice_lanes_excluded": [
+                "XAUUSD_SHORT",
+                "XAGUSD_LONG",
+                "XAGUSD_SHORT",
+            ],
         },
         "signals": {
             "received_assets": signal_count,
@@ -39994,7 +40038,9 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "xag_candidate_note": xag_candidate_note,
             "xag_production_candidate": xag_prod,
             "coverage_status": signal_health_status,
-            "coverage_candle": safe_str(latest_cov.get("candle_time")),
+            "coverage_candle": safe_str(
+                latest_cov.get("candle_time")
+            ),
             "coverage_candle_display": safe_str(
                 latest_cov.get("candle_time_display")
                 or display_candle_time(latest_cov.get("candle_time"))
@@ -40007,10 +40053,15 @@ def _metals_standard_top_uncached() -> Dict[str, Any]:
             "latest": latest,
         },
         "research": {
-            "fixed_48h_rows": int(snap.get("fixed_48h_baseline_rows") or 0),
-            "fixed_48h_total_r": safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0,
+            "fixed_48h_rows": int(
+                snap.get("fixed_48h_baseline_rows") or 0
+            ),
+            "fixed_48h_total_r": float(
+                safe_float(snap.get("fixed_48h_baseline_total_R")) or 0.0
+            ),
         },
     }
+
 
 def metals_standard_top_snapshot(force: bool = False) -> Dict[str, Any]:
     ts = time.time()
@@ -41490,7 +41541,7 @@ def metals_standard_dashboard() -> str:
         _metals_std_placeholder("latest-signals", "Latest 30 Metals Signals", "Current XAU/XAG long, short and selected-candidate state plus signal detail."),
         _metals_std_placeholder("recent-closed", "Recently Closed Metals Trades", "Latest XAU/XAG closes with exact reason, realised GBP, approximate R and broker ID."),
         _metals_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA XAU/XAG positions with manager R, MFE/MAE, age, decisions, stops and effective risk."),
-        _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "GBP-native OANDA lane plus execution/reconciliation and sizing/accounting detail."),
+        _metals_std_placeholder("broker", "Broker / OANDA / Accounting", "LIVE XAU LONG panel plus retained practice XAU/XAG accounting, execution/reconciliation and sizing detail."),
         _metals_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus the unarmed 50/100/150/200R Metals protection framework."),
         _metals_std_placeholder("research", "Metals Research / Evidence Lab", "MFE/ATR2/Fixed120 exit challengers, broker-HWM harvest evidence, AI observer, 8H regime-age research, high-water outcomes, XAU/XAG alignment, trend efficiency and basket recovery."),
     ])
@@ -41525,7 +41576,7 @@ a{{color:var(--blue);text-decoration:none}} .links{{margin:9px 0 14px;font-size:
 <body><div class="page">
 <h1>Project Exit Plan — Metals</h1>
 <div class="sub">{esc(METALS_APP_VERSION)} · cumulative Metals v1.6.30+ · XAU LONG live pilot · XAU SHORT/XAG practice</div>
-<div class="banner"><strong>DEMO ONLY — NO LIVE MONEY.</strong> Standalone XAU/XAG project. Live indices and BCO are outside this service's management scope.</div>
+<div class="banner"><strong>METALS SPLIT EXECUTION.</strong> Top tiles show LIVE Metals only (currently XAU LONG). XAU SHORT and XAG remain practice and are shown lower in Broker / OANDA / Accounting. Indices and BCO remain outside this service's management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div>
 <div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">Metals P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
 <div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/broker/metals-demo/status">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/metals-research.zip">⬇ Metals Analysis ZIP</a><a class="export-btn research" href="/export/metals-focused-research.zip">⬇ Metals Research ZIP</a></div>
@@ -41556,13 +41607,13 @@ async function loadTop(force=false){{
   document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Account-wide UPL ${{money(a.unrealized_pl)}}`,cls(a.unrealized_pl))}}
-${{card('Broker P&L',money(s.headline_pnl),`Metals-only open P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
-${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}} · LIVE OANDA`,cls(s.high_water_gbp))}}
+${{card('Broker P&L',money(s.headline_pnl),`LIVE Metals open P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
+${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}} · LIVE Metals`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
-${{card('Open Trades',eh(s.open_trades||0),`OANDA Metals · local ${{eh(s.local_open_trades||0)}}`)}}
+${{card('Open Trades',eh(s.open_trades||0),`LIVE Metals · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
 ${{card('Signal Health',eh(health),`Current XAU/XAG candle · ${{eh(g.coverage_candle_display||'')}}`,healthClass)}}
@@ -41644,6 +41695,9 @@ def metals_standard_status() -> Dict[str, Any]:
             "xag_short_execution_lane": "PRACTICE",
             "live_xau_hwm_scope": "XAU_USD_LONG_ONLY",
             "live_xau_harvest_scope": "XAU_USD_LONG_ONLY",
+            "top_tiles_scope": "LIVE_METALS_ONLY",
+            "top_tiles_layout": "STANDARD_4_4_3_UNCHANGED",
+            "practice_accounting_location": "BROKER_OANDA_ACCOUNTING",
             "live_account_other_instruments_ignored": True,
             "accounting_week_definition": "Monday 00:00 Europe/London",
             "accounting_month_definition": "calendar month",
