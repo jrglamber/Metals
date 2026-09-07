@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.32 Live-First Standard Top Tiles + XAU LONG Live Pilot
+# VERIFIED BUILD: Metals v1.6.33 Read-Only Aggregate Portfolio Summary — cumulative on v1.6.32
 # Cumulative on v1.6.30. Adds a dedicated fail-closed XAU LONG live pilot lane while retaining XAU SHORT + XAG LONG/SHORT on practice. All v1.6.30 accounting, v1.6.28 HWM and v1.6.27 direction-flip functionality retained.
 import os
 import json
@@ -26,8 +26,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.32"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.31 / 2026-09-04"
+METALS_APP_VERSION = "v1.6.33"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.32 / 2026-09-06"
 APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Live-First Top Tiles + XAU LONG Live Pilot + Demo Research Lanes"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
@@ -58,6 +58,7 @@ def _project_scope_pair(raw_pair: Any) -> str:
 def project_scope_accepts_pair(raw_pair: Any) -> bool:
     return _project_scope_pair(raw_pair) in PROJECT_SCOPE_ALLOWED_PAIRS
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 DB_PATH = os.getenv("DB_PATH", "/data/trading_bot.sqlite")
 SQLITE_TIMEOUT_SECONDS = float(os.getenv("SQLITE_TIMEOUT_SECONDS", "45"))
 SQLITE_BUSY_TIMEOUT_MS = int(float(os.getenv("SQLITE_BUSY_TIMEOUT_MS", str(int(SQLITE_TIMEOUT_SECONDS * 1000)))) )
@@ -40085,6 +40086,78 @@ def metals_standard_top_snapshot(force: bool = False) -> Dict[str, Any]:
 @app.get("/dashboard/top")
 def metals_standard_top_route(force: bool = False) -> Dict[str, Any]:
     return metals_standard_top_snapshot(force=force)
+
+
+# ============================================================
+# Metals v1.6.33 - READ-ONLY AGGREGATE PORTFOLIO SUMMARY
+# ============================================================
+# Reuses the exact LIVE-FIRST standard top snapshot. Practice XAU SHORT and
+# XAG lanes remain excluded from all headline/portfolio values.
+def _aggregate_summary_authorized(x_aggregate_secret: Optional[str]) -> None:
+    if AGGREGATE_SOURCE_SECRET and safe_str(x_aggregate_secret) != AGGREGATE_SOURCE_SECRET:
+        raise HTTPException(status_code=403, detail="aggregate source secret rejected")
+
+
+@app.get("/api/portfolio-summary")
+def aggregate_portfolio_summary(
+    x_aggregate_secret: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _aggregate_summary_authorized(x_aggregate_secret)
+
+    top = metals_standard_top_snapshot(force=False)
+    account = top.get("account") or {}
+    accounting = top.get("accounting") or {}
+    strategy = top.get("strategy") or {}
+    signals = top.get("signals") or {}
+    risk_visibility = strategy.get("risk_visibility") or {}
+
+    return {
+        "schema_version": 1,
+        "strategy": "metals",
+        "label": "Metals",
+        # Headline tiles are the live XAU LONG lane only. Practice research
+        # lanes stay visible lower down in the Metals project, not here.
+        "mode": "live",
+        "status": "enabled",
+        "source_build": METALS_APP_VERSION,
+        "updated_at_utc": safe_str(top.get("time_utc") or now_utc_iso()),
+        "nav_gbp": safe_float(account.get("nav")),
+        "risk_per_trade_gbp": safe_float(
+            risk_visibility.get("requested_risk_gbp")
+            if risk_visibility.get("requested_risk_gbp") is not None
+            else METALS_XAU_LIVE_RISK_AMOUNT
+        ),
+        "basket": {
+            "direction": "LONG",
+            "open_trades": int(safe_float(strategy.get("open_trades")) or 0),
+            "pnl_gbp": safe_float(strategy.get("headline_pnl")),
+            "pnl_r": safe_float(strategy.get("basket_r")),
+            "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
+            "high_water_r": safe_float(strategy.get("high_water_r")),
+            "high_water_at_utc": safe_str(strategy.get("high_water_time")) or None,
+            "giveback_gbp": safe_float(strategy.get("giveback_gbp")),
+            "giveback_r": safe_float(strategy.get("giveback_r")),
+        },
+        "accounting": {
+            "realised_today_gbp": None,
+            "realised_week_gbp": safe_float(accounting.get("week_pnl")),
+            "realised_month_gbp": safe_float(accounting.get("month_pnl")),
+            "realised_all_time_gbp": safe_float(accounting.get("all_time_pnl")),
+        },
+        "health": {
+            "broker_ok": bool(
+                account.get("nav") is not None
+                and strategy.get("high_water_broker_read_ok", True)
+            ),
+            "database_ok": True,
+            "worker_ok": None,
+            "last_signal_at_utc": safe_str(signals.get("latest_received_at_utc")) or None,
+            "note": (
+                "LIVE headline scope is XAUUSD LONG only; "
+                "XAUUSD SHORT and XAGUSD LONG/SHORT practice lanes are excluded."
+            ),
+        },
+    }
 
 
 def _metals_std_section_wrap(body: str) -> str:
