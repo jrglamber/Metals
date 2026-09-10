@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.35 Intrahour HWM Harvest Trigger + Exact HWM Timestamp — cumulative on v1.6.34
-# Cumulative on v1.6.34. Moves the existing 50R/100R/150R+ harvest evaluation onto the 15-second broker-HWM sampler for intrahour execution, forces fresh OANDA timestamps for cash-or-R new highs, and serializes concurrent harvest paths. All v1.6.34 MARKET_HALTED recovery, queue cleanup, AI veto research, live-pilot, accounting, direction-flip, manager and research functionality retained.
+# VERIFIED BUILD: Metals v1.6.36 Portfolio Hub Last-Trade-Opened Visibility — cumulative on v1.6.35
+# Cumulative on v1.6.35. Adds read-only latest actual XAU LONG broker-open time to the Portfolio Hub summary. Intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, AI veto research, live-pilot, accounting, direction-flip, manager and research functionality are unchanged.
 import os
 import json
 import csv
@@ -26,8 +26,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.35"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.34 / 2026-09-10"
+METALS_APP_VERSION = "v1.6.36"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.35 / 2026-09-10"
 APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Intrahour HWM Harvest + Reopen Retry + AI Veto + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
@@ -40846,6 +40846,27 @@ def _aggregate_summary_authorized(x_aggregate_secret: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="aggregate source secret rejected")
 
 
+def _aggregate_last_trade_opened_at_utc() -> Optional[str]:
+    """Latest actual broker-confirmed XAU LONG live-pilot opening time.
+
+    The Portfolio Hub Metals headline is the live XAU LONG lane only, so practice
+    XAU SHORT/XAG rows are deliberately excluded. This is read-only metadata.
+    """
+    try:
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT broker_open_time_utc
+                FROM metals_xau_live_trade_links
+                WHERE COALESCE(broker_trade_id,'') <> ''
+                  AND COALESCE(broker_open_time_utc,'') <> ''
+                ORDER BY broker_open_time_utc DESC, id DESC
+                LIMIT 1
+            """).fetchone()
+        return safe_str(row["broker_open_time_utc"]) if row and safe_str(row["broker_open_time_utc"]) else None
+    except Exception:
+        return None
+
+
 @app.get("/api/portfolio-summary")
 def aggregate_portfolio_summary(
     x_aggregate_secret: Optional[str] = Header(default=None),
@@ -40858,6 +40879,7 @@ def aggregate_portfolio_summary(
     strategy = top.get("strategy") or {}
     signals = top.get("signals") or {}
     risk_visibility = strategy.get("risk_visibility") or {}
+    last_trade_opened_at_utc = _aggregate_last_trade_opened_at_utc()
 
     return {
         "schema_version": 1,
@@ -40878,6 +40900,7 @@ def aggregate_portfolio_summary(
         "basket": {
             "direction": "LONG",
             "open_trades": int(safe_float(strategy.get("open_trades")) or 0),
+            "last_trade_opened_at_utc": last_trade_opened_at_utc,
             "pnl_gbp": safe_float(strategy.get("headline_pnl")),
             "pnl_r": safe_float(strategy.get("basket_r")),
             "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
