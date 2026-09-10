@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.33 Read-Only Aggregate Portfolio Summary — cumulative on v1.6.32
-# Cumulative on v1.6.30. Adds a dedicated fail-closed XAU LONG live pilot lane while retaining XAU SHORT + XAG LONG/SHORT on practice. All v1.6.30 accounting, v1.6.28 HWM and v1.6.27 direction-flip functionality retained.
+# VERIFIED BUILD: Metals v1.6.34 Market-Reopen Deferred Entries + Queue Cleanup + AI Veto Counterfactual — cumulative on v1.6.33
+# Cumulative on v1.6.33. Adds revalidated MARKET_HALTED deferred-entry recovery for practice/live XAU lanes, closes stale durable CLOSE retries once broker reconciliation proves the trade is already closed, and adds a research-only AI AVOID veto counterfactual. All prior live-pilot, accounting, HWM, harvest, direction-flip, manager and research functionality retained.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.33"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.32 / 2026-09-06"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Live-First Top Tiles + XAU LONG Live Pilot + Demo Research Lanes"
+METALS_APP_VERSION = "v1.6.34"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.33 / 2026-09-10"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Revalidated Market-Reopen Entries + AI Veto Research + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1238,6 +1238,24 @@ METALS_LIVE_HWM_SAMPLER_ENABLED = env_bool("METALS_LIVE_HWM_SAMPLER_ENABLED", Tr
 METALS_LIVE_HWM_INTERVAL_SECONDS = max(
     5.0, min(float(os.getenv("METALS_LIVE_HWM_INTERVAL_SECONDS", "15")), 60.0)
 )
+
+# v1.6.34 — market-halt deferred entry recovery.
+# A deterministic candidate rejected only because OANDA reports MARKET_HALTED /
+# market closed is not discarded. It is retained in the lane-specific durable
+# queue and retried by the existing maintenance worker after the market reopens.
+# Before any delayed order is sent, the *latest* same-asset production state must
+# still support the original direction (and XAG must still pass its XAU guard).
+# This is execution plumbing only; it does not manufacture or relax candidates.
+METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED = env_bool(
+    "METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED", True
+)
+METALS_MARKET_REOPEN_ENTRY_MAX_AGE_SECONDS = max(
+    300, min(int(float(os.getenv("METALS_MARKET_REOPEN_ENTRY_MAX_AGE_SECONDS", "7200"))), 21600)
+)
+METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT = max(
+    1, min(int(float(os.getenv("METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT", "25"))), 100)
+)
+METALS_AI_VETO_COUNTERFACTUAL_VERSION = "metals_ai_avoid_veto_counterfactual_v1_2026_09_10"
 
 app = FastAPI(title=APP_NAME)
 
@@ -25818,6 +25836,141 @@ def metals_xau_live_accounting_snapshot() -> Dict[str, Any]:
     return {"ok":True,"currency":"GBP","account_nav_is_shared_with_indices":True,"periods":{"week":period("This Week",bounds["week_start_utc"]),"month":period("This Month",bounds["month_start_utc"]),"all_time":period("All Time",None)},"current_open_upl_gbp":open_upl,"time_utc":now_utc_iso()}
 
 
+def _metals_deferred_entry_age_seconds(created_at_utc: Any) -> Optional[float]:
+    dt = parse_dt(created_at_utc)
+    if not dt:
+        return None
+    return max(0.0, (now_utc() - dt).total_seconds())
+
+
+def _metals_latest_same_direction_support(asset: str, expected_side: str) -> Dict[str, Any]:
+    """Revalidate a delayed MARKET_HALTED entry against the latest model state.
+
+    The original signal is never enough on its own for a delayed execution. The
+    newest same-asset signal must still be a production candidate in the same
+    direction. XAG also has to pass the current XAU confirmation guard.
+    Research/AI fields are deliberately ignored.
+    """
+    a = _metals_demo_asset(asset)
+    side = _metals_demo_side(expected_side)
+    with get_conn() as conn:
+        latest = _metals_demo_latest_signal_row(conn, a)
+        if not latest:
+            return {"ok": False, "supported": False, "reason": "latest_signal_missing", "asset": a, "expected_side": side}
+        selected = metals_demo_candidate_for_row(_raw_signal_json(latest), latest)
+        # XAG production state is fail-closed until its guard row exists, so
+        # refresh/persist the latest guard decision before reading the unified
+        # post-guard production candidate state.
+        guard = {"allow": True, "decision": "NOT_XAG"}
+        if a == "XAGUSD":
+            guard_candidate = dict(selected)
+            guard_candidate["demo_side"] = side if selected.get("demo_side") is None else selected.get("demo_side")
+            guard = metals_xag_xau_confirmation_guard(conn, latest, guard_candidate)
+        effective = metals_demo_production_candidate_for_row(conn, latest, selected)
+        current_side = _metals_demo_side(effective.get("side") or selected.get("demo_side"))
+        if not effective.get("production_candidate"):
+            reason = "latest_xag_confirmation_guard_blocks" if a == "XAGUSD" and not guard.get("allow", True) else "latest_signal_not_production_candidate"
+            return {
+                "ok": True, "supported": False, "reason": reason,
+                "asset": a, "expected_side": side, "latest_raw_signal_id": int(latest["id"]),
+                "latest_side": current_side, "production_candidate": effective,
+                "confirmation_guard": guard,
+            }
+        if current_side != side:
+            return {
+                "ok": True, "supported": False, "reason": "latest_candidate_direction_changed",
+                "asset": a, "expected_side": side, "latest_raw_signal_id": int(latest["id"]),
+                "latest_side": current_side, "production_candidate": effective,
+                "confirmation_guard": guard,
+            }
+    return {
+        "ok": True, "supported": True, "reason": "latest_model_still_supports_direction",
+        "asset": a, "expected_side": side, "latest_raw_signal_id": int(latest["id"]),
+        "latest_signal_time": safe_str(latest["timestamp_readable"]),
+        "latest_side": current_side, "confirmation_guard": guard,
+    }
+
+
+def _metals_demo_queue_market_reopen_open(
+    raw_signal_id: int, asset: str, instrument: str, side: str, source: str,
+    preview: Optional[Dict[str, Any]], response: Optional[Dict[str, Any]],
+) -> int:
+    """Idempotently retain one practice entry rejected only because market is halted."""
+    now = now_utc_iso()
+    payload = {
+        "lane": "PRACTICE_METALS", "source": source, "side": _metals_demo_side(side),
+        "preview": preview or {}, "market_closed_response": response or {},
+        "retry_policy": "latest_same_direction_revalidation_required",
+    }
+    with get_conn() as conn:
+        existing = conn.execute("""
+            SELECT id FROM metals_demo_action_queue
+            WHERE raw_signal_id=? AND action='OPEN' AND status='WAITING_MARKET_REOPEN'
+            ORDER BY id DESC LIMIT 1
+        """, (int(raw_signal_id),)).fetchone()
+        if existing:
+            qid = int(existing["id"])
+            conn.execute("""
+                UPDATE metals_demo_action_queue
+                SET updated_at_utc=?, asset=?, instrument=?, reason=?,
+                    attempts=COALESCE(attempts,0)+1, raw_json=?
+                WHERE id=?
+            """, (now, _metals_demo_asset(asset), normalise_oanda_instrument(instrument),
+                  "MARKET_HALTED — deferred entry awaiting reopen + revalidation",
+                  json.dumps(payload, default=str), qid))
+        else:
+            qid = db_insert_returning_id(conn, """
+                INSERT INTO metals_demo_action_queue(
+                    created_at_utc,updated_at_utc,raw_signal_id,link_id,asset,instrument,
+                    action,status,reason,attempts,raw_json
+                ) VALUES(?,?,?,?,?,?,'OPEN','WAITING_MARKET_REOPEN',?,1,?)
+            """, (now, now, int(raw_signal_id), None, _metals_demo_asset(asset),
+                  normalise_oanda_instrument(instrument),
+                  "MARKET_HALTED — deferred entry awaiting reopen + revalidation",
+                  json.dumps(payload, default=str)))
+        conn.commit()
+    return int(qid)
+
+
+def _metals_xau_live_queue_market_reopen_open(
+    raw_signal_id: int, source: str, preview: Optional[Dict[str, Any]],
+    response: Optional[Dict[str, Any]],
+) -> int:
+    """Idempotently retain one LIVE XAU LONG entry rejected only by market halt."""
+    now = now_utc_iso()
+    payload = {
+        "lane": "LIVE_XAU_LONG", "source": source, "side": "long",
+        "preview": preview or {}, "market_closed_response": response or {},
+        "retry_policy": "latest_same_direction_revalidation_required",
+    }
+    with get_conn() as conn:
+        existing = conn.execute("""
+            SELECT id FROM metals_xau_live_action_queue
+            WHERE raw_signal_id=? AND action='OPEN' AND status='WAITING_MARKET_REOPEN'
+            ORDER BY id DESC LIMIT 1
+        """, (int(raw_signal_id),)).fetchone()
+        if existing:
+            qid = int(existing["id"])
+            conn.execute("""
+                UPDATE metals_xau_live_action_queue
+                SET updated_at_utc=?, reason=?, attempts=COALESCE(attempts,0)+1,
+                    last_error='MARKET_HALTED', raw_json=?
+                WHERE id=?
+            """, (now, "MARKET_HALTED — deferred live XAU entry awaiting reopen + revalidation",
+                  json.dumps(payload, default=str), qid))
+        else:
+            qid = db_insert_returning_id(conn, """
+                INSERT INTO metals_xau_live_action_queue(
+                    created_at_utc,updated_at_utc,raw_signal_id,link_id,action,status,
+                    reason,attempts,last_error,raw_json
+                ) VALUES(?,?,?,?,?,'WAITING_MARKET_REOPEN',?,1,'MARKET_HALTED',?)
+            """, (now, now, int(raw_signal_id), None, "OPEN",
+                  "MARKET_HALTED — deferred live XAU entry awaiting reopen + revalidation",
+                  json.dumps(payload, default=str)))
+        conn.commit()
+    return int(qid)
+
+
 def execute_metals_xau_live_candidate(
     raw_signal_id: int,
     source: str = "signal_worker",
@@ -26034,6 +26187,25 @@ def execute_metals_xau_live_candidate(
     )
 
     if not response.get("ok") or not broker_trade_id:
+        if (
+            METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED
+            and is_oanda_market_closed_response(response)
+        ):
+            qid = _metals_xau_live_queue_market_reopen_open(
+                int(raw_signal_id), source, preview, response
+            )
+            _metals_xau_live_audit(
+                raw_signal_id, "entry", "WAITING_MARKET_REOPEN",
+                "OANDA market halted; LIVE XAU LONG entry deferred. Latest XAU state must still support LONG before any retry.",
+                preview=preview, response=response, broker_order_id=broker_order_id,
+            )
+            return {
+                "ok": True, "deferred": True, "queued_market_reopen": True,
+                "queue_id": qid, "execution_lane": "LIVE_XAU_LONG",
+                "asset": "XAUUSD", "side": "long",
+                "reason": "market_halted_waiting_reopen_revalidation",
+                "response": response, "preview": preview,
+            }
         _metals_xau_live_audit(
             raw_signal_id, "entry", "FAILED",
             safe_str(response.get("error") or data),
@@ -26237,6 +26409,18 @@ def metals_xau_live_manager_tick(
         result["broker_hwm"] = _metals_xau_live_highwater_state(
             broker
         )
+
+        # v1.6.34: recover only MARKET_HALTED live entry attempts, and only
+        # after the latest XAU model state still confirms LONG.
+        try:
+            result["market_reopen_entry_retry"] = (
+                _metals_xau_live_pending_open_market_reopen_tick()
+            )
+        except Exception as exc:
+            result["ok"] = False
+            result["market_reopen_entry_retry"] = {
+                "ok": False, "error": f"{type(exc).__name__}: {exc}",
+            }
 
         try:
             result["harvest"] = (
@@ -26603,7 +26787,23 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
     response=metals_demo_request(f"/v3/accounts/{METALS_DEMO_OANDA_ACCOUNT_ID}/orders","POST",body); data=response.get("data",{}); fill=data.get("orderFillTransaction") or {}; opened=fill.get("tradeOpened") or {}
     broker_trade_id=safe_str(opened.get("tradeID")); broker_order_id=safe_str(fill.get("id") or (data.get("orderCreateTransaction") or {}).get("id"))
     if not response.get("ok") or not broker_trade_id:
-        _metals_demo_audit(raw_signal_id,asset,instrument,"entry","FAILED",safe_str(response.get("error") or data),preview,response,candidate_state="CANDIDATE"); return {"ok":False,"asset":asset,"side":side,"response":response,"preview":preview}
+        if METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED and is_oanda_market_closed_response(response):
+            qid = _metals_demo_queue_market_reopen_open(
+                int(raw_signal_id), asset, instrument, side, source, preview, response
+            )
+            _metals_demo_audit(
+                raw_signal_id, asset, instrument, "entry", "WAITING_MARKET_REOPEN",
+                "OANDA market halted; practice entry deferred. Latest same-asset model state must still support the same direction before retry.",
+                preview, response, candidate_state="CANDIDATE"
+            )
+            return {
+                "ok": True, "deferred": True, "queued_market_reopen": True,
+                "queue_id": qid, "asset": asset, "side": side,
+                "reason": "market_halted_waiting_reopen_revalidation",
+                "response": response, "preview": preview,
+            }
+        _metals_demo_audit(raw_signal_id,asset,instrument,"entry","FAILED",safe_str(response.get("error") or data),preview,response,candidate_state="CANDIDATE")
+        return {"ok":False,"asset":asset,"side":side,"response":response,"preview":preview}
     with get_conn() as conn:
         er=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=?",(raw_signal_id,)).fetchone(); fill_units=abs(safe_float(fill.get("units")) or preview.get("units") or 0); fill_price=safe_float(fill.get("price")) or preview.get("entry_price")
         policy_info=_metals_demo_new_trade_exit_policy(asset,side); policy_started=now_utc_iso()
@@ -26619,6 +26819,154 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
         shadow_start={"ok":False,"error":f"{type(_shadow_exc).__name__}: {_shadow_exc}","research_only":True}
     _metals_demo_audit(raw_signal_id,asset,instrument,"entry","OPENED",f"practice {side} trade opened from {source}; active_exit_policy={policy_info['policy']}",preview,response,link_id,"CANDIDATE")
     return {"ok":True,"opened":True,"asset":asset,"side":side,"link_id":link_id,"broker_trade_id":broker_trade_id,"preview":preview,"candidate":candidate,"direction_transition":direction_transition,"active_exit_policy":policy_info,"exit_challenger_shadow":shadow_start}
+
+
+def _metals_demo_pending_open_market_reopen_tick(limit: int = METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT) -> Dict[str, Any]:
+    """Retry practice OPENs rejected only by MARKET_HALTED, after fresh revalidation."""
+    if not METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED:
+        return {"ok": True, "enabled": False, "checked": 0, "status": "DISABLED"}
+    lim = max(1, min(int(limit or METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT), 100))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT * FROM metals_demo_action_queue
+            WHERE action='OPEN' AND status='WAITING_MARKET_REOPEN'
+            ORDER BY id ASC LIMIT ?
+        """, (lim,)).fetchall()]
+    market = _metals_demo_market_state()
+    results = []
+    for q in rows:
+        qid = int(q.get("id") or 0)
+        rid = int(safe_float(q.get("raw_signal_id")) or 0)
+        asset = _metals_demo_asset(q.get("asset") or q.get("instrument"))
+        try:
+            rawq = json.loads(safe_str(q.get("raw_json")) or "{}")
+        except Exception:
+            rawq = {}
+        side = _metals_demo_side(rawq.get("side") or "long")
+        age = _metals_deferred_entry_age_seconds(q.get("created_at_utc"))
+        if age is None or age > METALS_MARKET_REOPEN_ENTRY_MAX_AGE_SECONDS:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='CANCELLED_STALE_AFTER_REOPEN',reason=? WHERE id=?",
+                             (now_utc_iso(), f"Deferred entry expired after {age if age is not None else 'unknown'}s", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": "retry_age_expired"})
+            continue
+        with get_conn() as conn:
+            existing = conn.execute("SELECT id,status FROM metals_demo_trade_links WHERE raw_signal_id=? LIMIT 1", (rid,)).fetchone() if rid > 0 else None
+        if existing:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='RESOLVED_LINK_EXISTS',link_id=?,reason=? WHERE id=?",
+                             (now_utc_iso(), int(existing["id"]), "Deferred entry resolved because broker/local link already exists", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": True, "resolved": True, "link_id": int(existing["id"])})
+            continue
+        if asset == "XAUUSD" and side == "long" and METALS_XAU_LONG_LIVE_PROMOTION_ENABLED:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='CANCELLED_LANE_CHANGED',reason=? WHERE id=?",
+                             (now_utc_iso(), "Practice deferred XAU LONG cancelled because XAU LONG is now routed to dedicated live lane", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": "execution_lane_changed_to_live"})
+            continue
+        support = _metals_latest_same_direction_support(asset, side)
+        if not support.get("supported"):
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='CANCELLED_REVALIDATION_FAILED',reason=? WHERE id=?",
+                             (now_utc_iso(), safe_str(support.get("reason") or "latest model no longer supports deferred direction"), qid)); conn.commit()
+            _metals_demo_audit(rid, asset, _metals_demo_instrument(asset), "deferred_entry_revalidation", "CANCELLED",
+                               safe_str(support.get("reason")), response=support, candidate_state="REVALIDATION")
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": support.get("reason"), "support": support})
+            continue
+        if market.get("tradeable") is not True:
+            results.append({"queue_id": qid, "ok": True, "waiting": True, "reason": "market_still_not_tradeable", "support": support})
+            continue
+        outcome = execute_metals_demo_candidate(rid, source="market_reopen_retry")
+        if outcome.get("opened") or outcome.get("duplicate"):
+            link_id = int(safe_float(outcome.get("link_id")) or 0) or None
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='DONE_AFTER_REOPEN',link_id=COALESCE(?,link_id),reason=? WHERE id=?",
+                             (now_utc_iso(), link_id, "Deferred practice entry executed/resolved after reopen and revalidation", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": True, "executed": bool(outcome.get("opened")), "result": outcome})
+        elif outcome.get("queued_market_reopen") or outcome.get("deferred"):
+            results.append({"queue_id": qid, "ok": True, "waiting": True, "reason": "market_halted_again", "result": outcome})
+        else:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_demo_action_queue SET updated_at_utc=?,status='CANCELLED_REVALIDATION_FAILED',reason=? WHERE id=?",
+                             (now_utc_iso(), safe_str(outcome.get("reason") or outcome.get("response") or "retry no longer executable")[:1500], qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": "retry_no_longer_executable", "result": outcome})
+    return {
+        "ok": True, "enabled": True, "checked": len(rows),
+        "waiting": sum(1 for r in results if r.get("waiting")),
+        "executed_or_resolved": sum(1 for r in results if r.get("executed") or r.get("resolved")),
+        "cancelled": sum(1 for r in results if r.get("cancelled")),
+        "market_tradeable": market.get("tradeable"), "results": results, "time_utc": now_utc_iso(),
+    }
+
+
+def _metals_xau_live_pending_open_market_reopen_tick(limit: int = METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT) -> Dict[str, Any]:
+    """Retry LIVE XAU LONG MARKET_HALTED entries only if latest XAU still says LONG."""
+    if not METALS_MARKET_REOPEN_ENTRY_RETRY_ENABLED:
+        return {"ok": True, "enabled": False, "checked": 0, "status": "DISABLED"}
+    lim = max(1, min(int(limit or METALS_MARKET_REOPEN_ENTRY_RETRY_LIMIT), 100))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT * FROM metals_xau_live_action_queue
+            WHERE action='OPEN' AND status='WAITING_MARKET_REOPEN'
+            ORDER BY id ASC LIMIT ?
+        """, (lim,)).fetchall()]
+    cfg = metals_xau_live_config_status()
+    market = _metals_xau_live_market_state()
+    results = []
+    for q in rows:
+        qid = int(q.get("id") or 0)
+        rid = int(safe_float(q.get("raw_signal_id")) or 0)
+        age = _metals_deferred_entry_age_seconds(q.get("created_at_utc"))
+        if age is None or age > METALS_MARKET_REOPEN_ENTRY_MAX_AGE_SECONDS:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='CANCELLED_STALE_AFTER_REOPEN',reason=?,last_error=NULL WHERE id=?",
+                             (now_utc_iso(), f"Deferred live XAU entry expired after {age if age is not None else 'unknown'}s", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": "retry_age_expired"})
+            continue
+        with get_conn() as conn:
+            existing = conn.execute("SELECT id,status FROM metals_xau_live_trade_links WHERE raw_signal_id=? LIMIT 1", (rid,)).fetchone() if rid > 0 else None
+        if existing:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='RESOLVED_LINK_EXISTS',link_id=?,reason=?,last_error=NULL WHERE id=?",
+                             (now_utc_iso(), int(existing["id"]), "Deferred live entry resolved because link already exists", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": True, "resolved": True, "link_id": int(existing["id"])})
+            continue
+        support = _metals_latest_same_direction_support("XAUUSD", "long")
+        if not support.get("supported"):
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='CANCELLED_REVALIDATION_FAILED',reason=?,last_error=NULL WHERE id=?",
+                             (now_utc_iso(), safe_str(support.get("reason") or "latest XAU no longer supports LONG"), qid)); conn.commit()
+            _metals_xau_live_audit(rid, "deferred_entry_revalidation", "CANCELLED", safe_str(support.get("reason")), response=support)
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": support.get("reason"), "support": support})
+            continue
+        if not cfg.get("orders_allowed"):
+            results.append({"queue_id": qid, "ok": True, "waiting": True, "reason": "live_writes_not_armed", "support": support})
+            continue
+        if market.get("tradeable") is not True:
+            results.append({"queue_id": qid, "ok": True, "waiting": True, "reason": "market_still_not_tradeable", "support": support})
+            continue
+        outcome = execute_metals_xau_live_candidate(rid, source="market_reopen_retry")
+        if outcome.get("opened") or outcome.get("duplicate"):
+            link_id = int(safe_float(outcome.get("link_id")) or 0) or None
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='DONE_AFTER_REOPEN',link_id=COALESCE(?,link_id),reason=?,last_error=NULL WHERE id=?",
+                             (now_utc_iso(), link_id, "Deferred live XAU entry executed/resolved after reopen and revalidation", qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": True, "executed": bool(outcome.get("opened")), "result": outcome})
+        elif outcome.get("queued_market_reopen") or outcome.get("deferred"):
+            results.append({"queue_id": qid, "ok": True, "waiting": True, "reason": "market_halted_again", "result": outcome})
+        else:
+            with get_conn() as conn:
+                conn.execute("UPDATE metals_xau_live_action_queue SET updated_at_utc=?,status='CANCELLED_REVALIDATION_FAILED',reason=?,last_error=NULL WHERE id=?",
+                             (now_utc_iso(), safe_str(outcome.get("reason") or outcome.get("response") or "retry no longer executable")[:1500], qid)); conn.commit()
+            results.append({"queue_id": qid, "ok": False, "cancelled": True, "reason": "retry_no_longer_executable", "result": outcome})
+    return {
+        "ok": True, "enabled": True, "checked": len(rows),
+        "waiting": sum(1 for r in results if r.get("waiting")),
+        "executed_or_resolved": sum(1 for r in results if r.get("executed") or r.get("resolved")),
+        "cancelled": sum(1 for r in results if r.get("cancelled")),
+        "market_tradeable": market.get("tradeable"), "orders_allowed": cfg.get("orders_allowed"),
+        "results": results, "time_utc": now_utc_iso(),
+    }
 
 
 def _metals_demo_pair_variants(asset: str) -> Tuple[str, str]:
@@ -28070,21 +28418,45 @@ def _metals_hwm_recovery_evidence(conn: Any) -> Dict[str, Any]:
 
 
 def _metals_pending_close_retry_tick(limit: int = 25) -> Dict[str, Any]:
-    """Retry only already-durable close requests; does not create new decisions."""
+    """Retry durable CLOSE requests and auto-resolve rows whose trade is already closed.
+
+    v1.6.34 housekeeping: broker reconciliation is authoritative. If the linked
+    trade is no longer OPEN locally after broker reconciliation, a lingering
+    PENDING/RETRY CLOSE row is marked OBSOLETE_CLOSED instead of remaining as a
+    false operational warning forever. No new close decision is created here.
+    """
+    lim = max(1, min(int(limit), 100))
     with get_conn() as conn:
-        rows = [
-            dict(r) for r in conn.execute("""
-                SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,
-                       l.asset,l.instrument,l.status AS link_status
-                FROM metals_demo_action_queue q
-                JOIN metals_demo_trade_links l ON l.id=q.link_id
-                WHERE q.action='CLOSE'
-                  AND q.status IN ('PENDING','RETRY')
-                  AND l.status='OPEN'
-                ORDER BY q.id
-                LIMIT ?
-            """, (max(1, min(int(limit), 100)),)).fetchall()
-        ]
+        stale = [dict(r) for r in conn.execute("""
+            SELECT q.id,q.link_id,l.status AS link_status,l.broker_trade_id
+            FROM metals_demo_action_queue q
+            JOIN metals_demo_trade_links l ON l.id=q.link_id
+            WHERE q.action='CLOSE'
+              AND q.status IN ('PENDING','RETRY')
+              AND l.status<>'OPEN'
+            ORDER BY q.id
+            LIMIT ?
+        """, (lim,)).fetchall()]
+        for row in stale:
+            conn.execute("""
+                UPDATE metals_demo_action_queue
+                SET updated_at_utc=?,status='OBSOLETE_CLOSED',
+                    reason=COALESCE(NULLIF(reason,''),'Broker reconciliation already proved trade closed')
+                WHERE id=?
+            """, (now_utc_iso(), int(row["id"])))
+        if stale:
+            conn.commit()
+        rows = [dict(r) for r in conn.execute("""
+            SELECT q.*,l.broker_trade_id,l.raw_signal_id,l.side,
+                   l.asset,l.instrument,l.status AS link_status
+            FROM metals_demo_action_queue q
+            JOIN metals_demo_trade_links l ON l.id=q.link_id
+            WHERE q.action='CLOSE'
+              AND q.status IN ('PENDING','RETRY')
+              AND l.status='OPEN'
+            ORDER BY q.id
+            LIMIT ?
+        """, (lim,)).fetchall()]
     results = []
     for q in rows:
         link = dict(q)
@@ -28094,7 +28466,10 @@ def _metals_pending_close_retry_tick(limit: int = 25) -> Dict[str, Any]:
             "link_id": q.get("link_id"),
             "result": _metals_demo_close(link, int(q["id"])),
         })
-    return {"ok": True, "checked": len(rows), "results": results}
+    return {
+        "ok": True, "checked": len(rows), "obsolete_closed": len(stale),
+        "obsolete_queue_ids": [int(r["id"]) for r in stale], "results": results,
+    }
 
 
 def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
@@ -28152,6 +28527,16 @@ def metals_demo_manager_maintenance_tick(force: bool = False) -> Dict[str, Any]:
         except Exception as exc:
             result["ok"] = False
             result["broker_only_recovery"] = {
+                "ok": False, "error": f"{type(exc).__name__}: {exc}"
+            }
+
+        # v1.6.34: MARKET_HALTED entries are durable but must be revalidated
+        # against the latest production state before any delayed broker order.
+        try:
+            result["market_reopen_entry_retry"] = _metals_demo_pending_open_market_reopen_tick()
+        except Exception as exc:
+            result["ok"] = False
+            result["market_reopen_entry_retry"] = {
                 "ok": False, "error": f"{type(exc).__name__}: {exc}"
             }
 
@@ -36777,6 +37162,261 @@ def build_ai_regime_observer_html():
     """
 
 
+AI_VETO_COUNTERFACTUAL_HORIZONS = (12, 24, 48, 72, 96)
+
+
+def _ai_veto_actual_link_map(conn: Any) -> Dict[int, Dict[str, Any]]:
+    """Map raw signal id -> actual executed Metals link without changing any state."""
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        for row in conn.execute("SELECT * FROM metals_demo_trade_links ORDER BY id").fetchall():
+            d = dict(row)
+            rid = int(safe_float(d.get("raw_signal_id")) or 0)
+            if rid > 0:
+                d["execution_lane"] = "PRACTICE"
+                out[rid] = d
+    except Exception:
+        pass
+    try:
+        for row in conn.execute("SELECT * FROM metals_xau_live_trade_links ORDER BY id").fetchall():
+            d = dict(row)
+            rid = int(safe_float(d.get("raw_signal_id")) or 0)
+            if rid > 0:
+                d["execution_lane"] = "LIVE_XAU_LONG"
+                # Dedicated live link is authoritative if a raw id ever appears in both lanes.
+                out[rid] = d
+    except Exception:
+        pass
+    return out
+
+
+def _ai_veto_group_summary(rows: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
+    executed = [r for r in rows if safe_float(r.get("actual_trade_r")) is not None]
+    kept_exec = [r for r in executed if not bool(r.get("ai_avoid_veto"))]
+    avoided_exec = [r for r in executed if bool(r.get("ai_avoid_veto"))]
+    summary: Dict[str, Any] = {
+        "group": label,
+        "ai_candidate_observations": len(rows),
+        "ai_avoid_count": sum(1 for r in rows if bool(r.get("ai_avoid_veto"))),
+        "executed_linked_count": len(executed),
+        "executed_ai_avoid_count": len(avoided_exec),
+        "actual_trade_contribution_gbp_all": sum(float(r.get("actual_trade_pnl_gbp") or 0.0) for r in executed),
+        "actual_trade_contribution_gbp_without_ai_avoid": sum(float(r.get("actual_trade_pnl_gbp") or 0.0) for r in kept_exec),
+        "actual_trade_r_all": sum(float(r.get("actual_trade_r") or 0.0) for r in executed),
+        "actual_trade_r_without_ai_avoid": sum(float(r.get("actual_trade_r") or 0.0) for r in kept_exec),
+    }
+    summary["actual_gbp_delta_if_ai_avoid_veto"] = (
+        summary["actual_trade_contribution_gbp_without_ai_avoid"]
+        - summary["actual_trade_contribution_gbp_all"]
+    )
+    summary["actual_r_delta_if_ai_avoid_veto"] = (
+        summary["actual_trade_r_without_ai_avoid"] - summary["actual_trade_r_all"]
+    )
+    for h in AI_VETO_COUNTERFACTUAL_HORIZONS:
+        mature = [r for r in rows if safe_float(r.get(f"outcome_{h}h_r")) is not None]
+        kept = [r for r in mature if not bool(r.get("ai_avoid_veto"))]
+        all_r = sum(float(r.get(f"outcome_{h}h_r") or 0.0) for r in mature)
+        kept_r = sum(float(r.get(f"outcome_{h}h_r") or 0.0) for r in kept)
+        summary[f"mature_{h}h_count"] = len(mature)
+        summary[f"all_{h}h_r"] = all_r
+        summary[f"without_ai_avoid_{h}h_r"] = kept_r
+        summary[f"delta_{h}h_r_if_ai_avoid_veto"] = kept_r - all_r
+    return summary
+
+
+def build_ai_regime_veto_counterfactual(limit: int = 5000) -> Dict[str, Any]:
+    """Research-only first-order test of treating AI entry_view=AVOID as a veto.
+
+    Two evidence views are returned:
+    1) actual linked trade contribution (realised for closed links, current broker
+       UPL for open links) divided by the trade's locked estimated risk; and
+    2) fixed forward directional R at 12/24/48/72/96 signal-hours.
+
+    This deliberately does NOT resimulate second-order basket effects such as a
+    different HWM, harvest selection or manager decisions after removing a trade.
+    It therefore cannot affect execution and must not be read as a production P&L
+    backtest. Event-driven AI means only completed AI candidate observations are
+    in scope, not every deterministic candidate.
+    """
+    ensure_ai_regime_observer_table()
+    lim = max(1, min(int(limit or 5000), 50000))
+    with get_conn() as conn:
+        ai_rows = [dict(r) for r in conn.execute("""
+            SELECT * FROM ai_regime_observer
+            WHERE status='COMPLETE'
+              AND COALESCE(live_candidate,0)=1
+              AND COALESCE(entry_view,'')<>''
+            ORDER BY raw_signal_id DESC
+            LIMIT ?
+        """, (lim,)).fetchall()]
+        raw_rows = [dict(r) for r in conn.execute("""
+            SELECT id,pair,timestamp_readable,exec_close,exec_high,exec_low
+            FROM raw_signals
+            WHERE UPPER(pair) IN ('XAUUSD','XAU','XAGUSD','XAG')
+            ORDER BY id ASC
+        """).fetchall()]
+        links = _ai_veto_actual_link_map(conn)
+
+    by_asset: Dict[str, List[Dict[str, Any]]] = {"XAUUSD": [], "XAGUSD": []}
+    pos_by_id: Dict[int, Tuple[str, int]] = {}
+    for row in raw_rows:
+        asset = _metals_demo_asset(row.get("pair"))
+        if asset not in by_asset:
+            continue
+        pos_by_id[int(row["id"])] = (asset, len(by_asset[asset]))
+        by_asset[asset].append(row)
+
+    detail: List[Dict[str, Any]] = []
+    for ai in ai_rows:
+        rid = int(safe_float(ai.get("raw_signal_id")) or 0)
+        loc = pos_by_id.get(rid)
+        if not loc:
+            continue
+        asset, idx = loc
+        series = by_asset[asset]
+        raw = series[idx]
+        entry = safe_float(raw.get("exec_close"))
+        side = _metals_demo_side(ai.get("candidate_side"))
+        sl_pct = float(METALS_DEMO_XAU_SL_PCT if asset == "XAUUSD" else METALS_DEMO_XAG_SL_PCT)
+        veto = safe_str(ai.get("entry_view")).upper() == "AVOID"
+        d: Dict[str, Any] = {
+            "counterfactual_version": METALS_AI_VETO_COUNTERFACTUAL_VERSION,
+            "raw_signal_id": rid,
+            "asset": asset,
+            "signal_time": safe_str(ai.get("signal_time") or raw.get("timestamp_readable")),
+            "candidate_side": side.upper(),
+            "ai_entry_view": safe_str(ai.get("entry_view")).upper(),
+            "ai_regime": safe_str(ai.get("regime")).upper(),
+            "ai_confidence": int(safe_float(ai.get("confidence")) or 0),
+            "ai_live_rule_assessment": safe_str(ai.get("live_rule_assessment")),
+            "ai_avoid_veto": 1 if veto else 0,
+            "counterfactual_keep": 0 if veto else 1,
+            "entry_close": entry,
+            "sl_pct": sl_pct,
+        }
+        for h in AI_VETO_COUNTERFACTUAL_HORIZONS:
+            d[f"outcome_{h}h_r"] = None
+            d[f"has_{h}h"] = 0
+            if entry is None or entry <= 0 or idx + h >= len(series):
+                continue
+            target = safe_float(series[idx + h].get("exec_close"))
+            if target is None or target <= 0:
+                continue
+            ret_pct = ((target / entry) - 1.0) * 100.0 if side == "long" else ((entry - target) / entry) * 100.0
+            d[f"outcome_{h}h_r"] = ret_pct / sl_pct if sl_pct else None
+            d[f"has_{h}h"] = 1
+
+        link = links.get(rid)
+        if link:
+            status = safe_str(link.get("status")).upper()
+            core_pnl = safe_float(link.get("last_known_unrealized_pl")) if status == "OPEN" else safe_float(link.get("realized_pl"))
+            risk = safe_float(link.get("estimated_risk_amount"))
+            known_financing = safe_float(link.get("financing")) if link.get("execution_lane") == "LIVE_XAU_LONG" else None
+            d.update({
+                "executed": 1,
+                "execution_lane": link.get("execution_lane"),
+                "link_id": link.get("id"),
+                "broker_trade_id": safe_str(link.get("broker_trade_id")),
+                "trade_status": status,
+                "actual_trade_pnl_gbp": core_pnl,
+                "known_financing_gbp": known_financing,
+                "estimated_risk_gbp": risk,
+                "actual_trade_r": (float(core_pnl) / float(risk)) if core_pnl is not None and risk not in (None, 0) else None,
+            })
+        else:
+            d.update({
+                "executed": 0, "execution_lane": "", "link_id": None,
+                "broker_trade_id": "", "trade_status": "NOT_LINKED",
+                "actual_trade_pnl_gbp": None, "known_financing_gbp": None,
+                "estimated_risk_gbp": None, "actual_trade_r": None,
+            })
+        detail.append(d)
+
+    groups: List[Dict[str, Any]] = []
+    groups.append(_ai_veto_group_summary(detail, "ALL"))
+    for asset in ("XAUUSD", "XAGUSD"):
+        for side in ("LONG", "SHORT"):
+            subset = [r for r in detail if r.get("asset") == asset and r.get("candidate_side") == side]
+            if subset:
+                groups.append(_ai_veto_group_summary(subset, f"{asset}_{side}"))
+
+    return {
+        "status": "ok",
+        "research_only": True,
+        "execution_authority": False,
+        "version": METALS_AI_VETO_COUNTERFACTUAL_VERSION,
+        "event_driven_sample_only": True,
+        "first_order_only": True,
+        "detail_count": len(detail),
+        "summary": groups,
+        "rows": detail,
+        "note": (
+            "Counterfactual only. Removing AI AVOID trades is evaluated as a first-order contribution test; "
+            "basket HWM/harvest/manager paths are not resimulated. Practice per-link financing is not available "
+            "in the trade-link table and is excluded from actual_trade_pnl_gbp."
+        ),
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/ai-regime-veto-counterfactual")
+def ai_regime_veto_counterfactual_endpoint(limit: int = 5000) -> Dict[str, Any]:
+    snap = build_ai_regime_veto_counterfactual(limit=limit)
+    return {k: v for k, v in snap.items() if k != "rows"}
+
+
+@app.get("/export/ai-regime-veto-counterfactual.csv")
+def export_ai_regime_veto_counterfactual_csv(limit: int = 5000) -> Response:
+    snap = build_ai_regime_veto_counterfactual(limit=limit)
+    rows = snap.get("rows") or []
+    out = io.StringIO()
+    if rows:
+        fields: List[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
+        writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(rows)
+    else:
+        out.write("note\nNo completed AI candidate observations yet\n")
+    return Response(
+        content=out.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="ai-regime-veto-counterfactual.csv"'},
+    )
+
+
+def build_ai_regime_veto_counterfactual_html() -> str:
+    try:
+        snap = build_ai_regime_veto_counterfactual(limit=5000)
+        summaries = snap.get("summary") or []
+        total = summaries[0] if summaries else {}
+    except Exception as exc:
+        return f'<div class="section-note warn">AI veto counterfactual unavailable: {esc(exc)}</div>'
+    delta_r = safe_float(total.get("actual_r_delta_if_ai_avoid_veto"))
+    delta_gbp = safe_float(total.get("actual_gbp_delta_if_ai_avoid_veto"))
+    d48 = safe_float(total.get("delta_48h_r_if_ai_avoid_veto"))
+    rows_html = ""
+    for row in summaries:
+        rows_html += f"""<tr><td>{esc(row.get('group'))}</td><td>{esc(row.get('ai_candidate_observations'))}</td>
+        <td>{esc(row.get('ai_avoid_count'))}</td><td>{esc(row.get('executed_linked_count'))}</td>
+        <td>{_fmt_metric(row.get('actual_trade_r_all'),'R',2)}</td><td>{_fmt_metric(row.get('actual_trade_r_without_ai_avoid'),'R',2)}</td>
+        <td>{_fmt_metric(row.get('actual_r_delta_if_ai_avoid_veto'),'R',2)}</td><td>{_fmt_metric(row.get('all_48h_r'),'R',2)}</td>
+        <td>{_fmt_metric(row.get('without_ai_avoid_48h_r'),'R',2)}</td><td>{_fmt_metric(row.get('delta_48h_r_if_ai_avoid_veto'),'R',2)}</td></tr>"""
+    return f"""
+      <div class="section-note small"><strong>Research only — AI still has zero execution authority.</strong>
+      Tests the first-order result of excluding completed AI observations labelled <code>AVOID</code>. It does not
+      resimulate changed basket HWM, harvest or manager decisions, so it is evidence rather than a production backtest.</div>
+      <div class="cards three">
+        <div class="card"><div class="label">AI-observed candidates</div><div class="value flat">{esc(total.get('ai_candidate_observations') or 0)}</div><div class="small">AVOID {esc(total.get('ai_avoid_count') or 0)} · executed/linked {esc(total.get('executed_linked_count') or 0)}</div></div>
+        <div class="card"><div class="label">Actual linked Δ if AVOID skipped</div><div class="value {'pos' if (delta_r or 0)>0 else 'neg' if (delta_r or 0)<0 else 'flat'}">{_fmt_metric(delta_r,'R',2)}</div><div class="small">GBP contribution Δ {_fmt_metric(delta_gbp,'',2)}</div></div>
+        <div class="card"><div class="label">Fixed 48h Δ if AVOID skipped</div><div class="value {'pos' if (d48 or 0)>0 else 'neg' if (d48 or 0)<0 else 'flat'}">{_fmt_metric(d48,'R',2)}</div><div class="small">Event-driven sample only.</div></div>
+      </div>
+      <div class="table-scroll"><table><thead><tr><th>Group</th><th>AI Candidates</th><th>AVOID</th><th>Executed</th><th>Actual R</th><th>R ex-AVOID</th><th>Δ R</th><th>48h R</th><th>48h ex-AVOID</th><th>Δ 48h</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+      <div class="section-note small">JSON: <a href="/ai-regime-veto-counterfactual">counterfactual summary</a> · CSV: <a href="/export/ai-regime-veto-counterfactual.csv">detail rows</a>.</div>
+    """
+
+
 def _metals_aiobs_candidate(conn, row):
     raw=_raw_signal_json(row)
     selected=metals_demo_candidate_for_row(raw,row)
@@ -38532,6 +39172,7 @@ def build_metals_focused_research_html():
       _mf_table("Broker-HWM Harvest Stages",_mf_rows("metals_demo_harvest_stages",100),["threshold_r","bank_fraction","status","armed_hwm_r","armed_hwm_gbp","target_bank_gbp","executed_bank_gbp","selected_broker_trade_ids","reason"]) + \
       _mf_table("Broker-HWM Harvest Close Audit",_mf_rows("metals_demo_harvest_events",150),["created_at_utc","threshold_r","bank_fraction","asset","side","broker_trade_id","expected_upl_gbp","realized_pl_gbp","status","reason"]) + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
+      '<details class="research-inner"><summary>AI AVOID Veto Counterfactual — Research Only</summary><div class="research-inner-body">' + build_ai_regime_veto_counterfactual_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAU / XAG Alignment / Divergence",_mf_rows("metals_focused_alignment",100),["signal_time","state","xau_8h","xag_8h","xau_24h","xag_24h","xau_candidate","xag_candidate"]) + \
       _mf_table("Trend Efficiency / Chop Research",_mf_rows("metals_focused_efficiency",150),["asset","signal_time","lookback_candles","efficiency","state","net_move_pct","path_travelled_pct"]) + \
@@ -38592,7 +39233,18 @@ def export_metals_focused_research_zip(limit:int=25000):
                     if _k not in _fields:_fields.append(_k)
             _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
         z.writestr("ai-regime-observer.csv",_aio.getvalue())
-        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"],"exit_policy":metals_exit_policy_status(),"harvest_policy":{"version":METALS_HARVEST_POLICY_VERSION,"execution_enabled":METALS_HARVEST_EXECUTION_ENABLED,"first_level_r":METALS_HARVEST_FIRST_LEVEL_R,"step_r":METALS_HARVEST_STEP_R,"fractions":{"50R":METALS_HARVEST_50_FRACTION,"100R":METALS_HARVEST_100_FRACTION,"150R_plus":METALS_HARVEST_150_PLUS_FRACTION},"no_retroactive_existing_basket":METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET}},indent=2))
+        _veto = build_ai_regime_veto_counterfactual(limit=limit)
+        _veto_out = io.StringIO()
+        _veto_rows = _veto.get("rows") or []
+        if _veto_rows:
+            _veto_fields=[]
+            for _r in _veto_rows:
+                for _k in _r:
+                    if _k not in _veto_fields:_veto_fields.append(_k)
+            _veto_writer=csv.DictWriter(_veto_out,fieldnames=_veto_fields,extrasaction="ignore");_veto_writer.writeheader();_veto_writer.writerows(_veto_rows)
+        z.writestr("ai-veto-counterfactual.csv",_veto_out.getvalue())
+        z.writestr("ai-veto-counterfactual-summary.json",json.dumps({k:v for k,v in _veto.items() if k!="rows"},default=str,indent=2))
+        z.writestr("manifest.json",json.dumps({"project":"METALS","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv","ai-veto-counterfactual.csv","ai-veto-counterfactual-summary.json"],"exit_policy":metals_exit_policy_status(),"harvest_policy":{"version":METALS_HARVEST_POLICY_VERSION,"execution_enabled":METALS_HARVEST_EXECUTION_ENABLED,"first_level_r":METALS_HARVEST_FIRST_LEVEL_R,"step_r":METALS_HARVEST_STEP_R,"fractions":{"50R":METALS_HARVEST_50_FRACTION,"100R":METALS_HARVEST_100_FRACTION,"150R_plus":METALS_HARVEST_150_PLUS_FRACTION},"no_retroactive_existing_basket":METALS_HARVEST_NO_RETROACTIVE_EXISTING_BASKET}},indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="metals-focused-research.zip"'})
 
 
@@ -41591,6 +42243,10 @@ def metals_build_integrity() -> Dict[str, Any]:
         "metals_xau_live_accounting_snapshot",
         "_metals_xau_live_recover_broker_only",
         "_metals_xau_live_pending_close_retry_tick",
+        "_metals_xau_live_pending_open_market_reopen_tick",
+        "_metals_pending_close_retry_tick",
+        "_metals_demo_pending_open_market_reopen_tick",
+        "build_ai_regime_veto_counterfactual",
         "_metals_xau_live_transaction_owned",
         "_metals_xau_live_dashboard_html",
         "_metals_standard_broker_combined_html",
