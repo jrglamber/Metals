@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.34 Market-Reopen Deferred Entries + Queue Cleanup + AI Veto Counterfactual — cumulative on v1.6.33
-# Cumulative on v1.6.33. Adds revalidated MARKET_HALTED deferred-entry recovery for practice/live XAU lanes, closes stale durable CLOSE retries once broker reconciliation proves the trade is already closed, and adds a research-only AI AVOID veto counterfactual. All prior live-pilot, accounting, HWM, harvest, direction-flip, manager and research functionality retained.
+# VERIFIED BUILD: Metals v1.6.35 Intrahour HWM Harvest Trigger + Exact HWM Timestamp — cumulative on v1.6.34
+# Cumulative on v1.6.34. Moves the existing 50R/100R/150R+ harvest evaluation onto the 15-second broker-HWM sampler for intrahour execution, forces fresh OANDA timestamps for cash-or-R new highs, and serializes concurrent harvest paths. All v1.6.34 MARKET_HALTED recovery, queue cleanup, AI veto research, live-pilot, accounting, direction-flip, manager and research functionality retained.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.34"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.33 / 2026-09-10"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Revalidated Market-Reopen Entries + AI Veto Research + Live Pilot"
+METALS_APP_VERSION = "v1.6.35"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.34 / 2026-09-10"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Intrahour HWM Harvest + Reopen Retry + AI Veto + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1229,14 +1229,19 @@ METALS_HWM_RECOVERY_FLOOR_SEEN_AT = os.getenv(
     "METALS_HWM_RECOVERY_FLOOR_SEEN_AT", ""
 ).strip()
 
-# v1.6.28 — live broker HWM sampler.
+# v1.6.28/v1.6.35 — intrahour broker HWM + harvest trigger.
 # The hourly TradingView/manager cadence must not define the basket high-water time.
-# While a Metals basket is open, a lightweight read-only OANDA sampler refreshes
-# broker UPL/HWM independently of signal arrival and stores the exact OANDA quote
-# timestamp whenever a new cash high is observed. No orders/stops/exits are sent.
+# While a Metals basket is open, the OANDA sampler refreshes broker UPL/R independently
+# of signal arrival and stores a fresh OANDA pricing timestamp whenever cash OR R makes
+# a new high. v1.6.35 also invokes the existing harvest ladder from this same sampler,
+# so a 50R/100R/150R+ crossing can bank on the intrahour path instead of waiting for
+# the 60-second manager or next hourly signal. Existing manager calls remain fallback.
 METALS_LIVE_HWM_SAMPLER_ENABLED = env_bool("METALS_LIVE_HWM_SAMPLER_ENABLED", True)
 METALS_LIVE_HWM_INTERVAL_SECONDS = max(
     5.0, min(float(os.getenv("METALS_LIVE_HWM_INTERVAL_SECONDS", "15")), 60.0)
+)
+METALS_LIVE_HWM_HARVEST_TRIGGER_ENABLED = env_bool(
+    "METALS_LIVE_HWM_HARVEST_TRIGGER_ENABLED", True
 )
 
 # v1.6.34 — market-halt deferred entry recovery.
@@ -24641,6 +24646,7 @@ _METALS_XAU_LIVE_TX_SYNC_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
 _METALS_XAU_LIVE_MARKET_LOCK = threading.Lock()
 _METALS_XAU_LIVE_MARKET_CACHE: Dict[str, Any] = {"at": 0.0, "result": None}
 _METALS_XAU_LIVE_MANAGER_LOCK = threading.Lock()
+_METALS_XAU_LIVE_HARVEST_LOCK = threading.Lock()
 
 
 def _metals_xau_live_runtime_get(conn: Any, key: str, default: str = "") -> str:
@@ -24965,7 +24971,14 @@ def _metals_xau_live_highwater_state(
         }
 
     current_r = float(safe_float(rs.get("basket_r")) or 0.0)
-    market = _metals_xau_live_market_state()
+    # v1.6.35: force a fresh OANDA pricing read for every new cash OR R high.
+    # The live pilot HWM timestamp therefore represents the intrahour market
+    # observation that detected the high, rather than a cached 30-second quote.
+    current_is_new_high = (
+        current_gbp > old_gbp + 0.005
+        or current_r > old_r + 0.005
+    )
+    market = _metals_xau_live_market_state(force=current_is_new_high)
     observed = (
         safe_str(market.get("latest_price_time"))
         or now_utc_iso()
@@ -25761,8 +25774,8 @@ def _metals_xau_live_harvest_cycle_id(conn: Any, hwm: Dict[str, Any]) -> str:
     return current
 
 
-def metals_xau_live_harvest_maintenance_tick(allow_execution: bool = True, source: str = "auto") -> Dict[str, Any]:
-    broker=metals_xau_live_broker_snapshot(include_account_summary=False); hwm=_metals_xau_live_highwater_state(broker); result={"ok":True,"source":source,"broker_hwm":hwm,"armed_levels":[],"executed_levels":[],"waiting_levels":[]}
+def _metals_xau_live_harvest_maintenance_tick_unlocked(allow_execution: bool = True, source: str = "auto", broker_snapshot: Optional[Dict[str, Any]] = None, hwm_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    broker=broker_snapshot or metals_xau_live_broker_snapshot(include_account_summary=False); hwm=hwm_snapshot or _metals_xau_live_highwater_state(broker); result={"ok":True,"source":source,"broker_hwm":hwm,"armed_levels":[],"executed_levels":[],"waiting_levels":[]}
     with get_conn() as conn:
         cycle=_metals_xau_live_harvest_cycle_id(conn,hwm); result["cycle_id"]=cycle
         if not cycle: result["status"]="FLAT"; return result
@@ -25810,6 +25823,36 @@ def metals_xau_live_harvest_maintenance_tick(allow_execution: bool = True, sourc
             fresh=conn.execute("SELECT * FROM metals_xau_live_harvest_stages WHERE id=?",(sid,)).fetchone(); st=dict(fresh) if fresh else stage; old=float(safe_float(st.get("executed_bank_gbp")) or 0.0); new=old+realized_sum; target_now=float(safe_float(st.get("target_bank_gbp")) or target); complete=target_now>0 and new+METALS_HARVEST_TARGET_TOLERANCE_GBP>=target_now; status="EXECUTED" if complete else "PARTIAL_RETRY" if failure else "PARTIAL_TARGET"; conn.execute("UPDATE metals_xau_live_harvest_stages SET updated_at_utc=?,status=?,executed_at_utc=?,executed_bank_gbp=?,selected_expected_gbp=COALESCE(selected_expected_gbp,0)+?,selected_link_ids=?,selected_broker_trade_ids=?,attempts=COALESCE(attempts,0)+1 WHERE id=?",(now_utc_iso(),status,now_utc_iso() if complete else safe_str(st.get("executed_at_utc")),new,expected,_metals_harvest_append_ids(st.get("selected_link_ids"),ids),_metals_harvest_append_ids(st.get("selected_broker_trade_ids"),bids),sid)); conn.commit()
         out={"ok":failure is None,"status":status,"threshold_r":stage.get("threshold_r"),"target_gbp":target,"banked_this_tick_gbp":realized_sum,"banked_total_gbp":old+realized_sum}; (result["executed_levels"] if status=="EXECUTED" else result["waiting_levels"]).append(out); prior=status!="EXECUTED"
     result["status"]="OK"; return result
+
+
+def metals_xau_live_harvest_maintenance_tick(
+    allow_execution: bool = True,
+    source: str = "auto",
+    broker_snapshot: Optional[Dict[str, Any]] = None,
+    hwm_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Serialized live-XAU harvest evaluation/execution.
+
+    Both the 15-second HWM sampler and the existing manager/signal paths can call
+    this safely. The lock prevents two concurrent paths from banking the same
+    checkpoint twice. Existing callers remain fully compatible.
+    """
+    if not _METALS_XAU_LIVE_HARVEST_LOCK.acquire(blocking=False):
+        return {
+            "ok": True,
+            "skipped": True,
+            "status": "HARVEST_ALREADY_RUNNING",
+            "source": source,
+        }
+    try:
+        return _metals_xau_live_harvest_maintenance_tick_unlocked(
+            allow_execution=allow_execution,
+            source=source,
+            broker_snapshot=broker_snapshot,
+            hwm_snapshot=hwm_snapshot,
+        )
+    finally:
+        _METALS_XAU_LIVE_HARVEST_LOCK.release()
 
 
 def metals_xau_live_harvest_plan_snapshot() -> Dict[str, Any]:
@@ -28051,6 +28094,7 @@ _METALS_LIVE_HWM_WORKER_STOP = threading.Event()
 _METALS_LIVE_HWM_WORKER_THREAD: Optional[threading.Thread] = None
 _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC = ""
 _METALS_LIVE_HWM_WORKER_LAST_RESULT: Dict[str, Any] = {}
+_METALS_PRACTICE_HARVEST_LOCK = threading.Lock()
 
 
 def ensure_metals_hwm_history_table() -> None:
@@ -28708,7 +28752,8 @@ def metals_live_hwm_worker_status() -> Dict[str, Any]:
         "interval_seconds": METALS_LIVE_HWM_INTERVAL_SECONDS,
         "last_heartbeat_utc": _METALS_LIVE_HWM_WORKER_LAST_HEARTBEAT_UTC,
         "last_result": _METALS_LIVE_HWM_WORKER_LAST_RESULT,
-        "authority": "READ_ONLY_OANDA_HWM_ONLY",
+        "authority": "OANDA_HWM_PLUS_INTRAHOUR_HARVEST_TRIGGER",
+        "harvest_trigger_enabled": bool(METALS_LIVE_HWM_HARVEST_TRIGGER_ENABLED),
     }
 
 
@@ -28723,7 +28768,15 @@ def metals_live_hwm_tick() -> Dict[str, Any]:
             cfg = metals_demo_config_status()
             if not cfg.get("missing") and METALS_DEMO_OANDA_ENV in {"practice", "live"}:
                 b = metals_demo_live_broker_snapshot(include_account_summary=False); h = _metals_broker_highwater_state(b)
-                result["demo_practice"] = {"ok": bool(b.get("ok")), "open_count": int(b.get("owned_open_count") or 0), "current_gbp": float(safe_float(h.get("current_gbp")) or 0.0), "high_water_gbp": float(safe_float(h.get("high_water_gbp")) or 0.0), "high_water_r": float(safe_float(h.get("high_water_r")) or 0.0), "high_water_seen_at": safe_str(h.get("high_water_seen_at"))}
+                result["demo_practice"] = {"ok": bool(b.get("ok")), "open_count": int(b.get("owned_open_count") or 0), "current_gbp": float(safe_float(h.get("current_gbp")) or 0.0), "current_r": float(safe_float(h.get("current_r")) or 0.0), "high_water_gbp": float(safe_float(h.get("high_water_gbp")) or 0.0), "high_water_r": float(safe_float(h.get("high_water_r")) or 0.0), "high_water_seen_at": safe_str(h.get("high_water_seen_at"))}
+                if METALS_LIVE_HWM_HARVEST_TRIGGER_ENABLED and b.get("ok"):
+                    market = _metals_demo_market_state(force=False)
+                    result["demo_practice"]["harvest"] = _metals_harvest_maintenance_tick(
+                        allow_execution=(market.get("tradeable") is True),
+                        source="live_hwm_sampler",
+                        broker_snapshot=b,
+                        hwm_snapshot=h,
+                    )
             else: result["demo_practice"] = {"ok": True, "skipped": True, "reason": "demo_config_not_ready"}
         except Exception as e:
             result["ok"] = False; result["demo_practice"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -28732,6 +28785,14 @@ def metals_live_hwm_tick() -> Dict[str, Any]:
             if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED and not cfg.get("missing") and cfg.get("environment_ok"):
                 b = metals_xau_live_broker_snapshot(include_account_summary=False); h = _metals_xau_live_highwater_state(b)
                 result["xau_long_live"] = {"ok": bool(b.get("ok")), "open_count": int(b.get("owned_open_count") or 0), "current_gbp": float(safe_float(h.get("current_gbp")) or 0.0), "current_r": float(safe_float(h.get("current_r")) or 0.0), "high_water_gbp": float(safe_float(h.get("high_water_gbp")) or 0.0), "high_water_r": float(safe_float(h.get("high_water_r")) or 0.0), "high_water_seen_at": safe_str(h.get("high_water_seen_at")), "ownership_conflict": bool(b.get("ownership_conflict"))}
+                if METALS_LIVE_HWM_HARVEST_TRIGGER_ENABLED and b.get("ok"):
+                    market = _metals_xau_live_market_state(force=False)
+                    result["xau_long_live"]["harvest"] = metals_xau_live_harvest_maintenance_tick(
+                        allow_execution=(market.get("tradeable") is True),
+                        source="live_hwm_sampler",
+                        broker_snapshot=b,
+                        hwm_snapshot=h,
+                    )
             else: result["xau_long_live"] = {"ok": True, "skipped": True, "reason": "live_xau_config_not_ready"}
         except Exception as e:
             result["ok"] = False; result["xau_long_live"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -39487,11 +39548,15 @@ def _metals_broker_highwater_state(broker: Dict[str, Any]) -> Dict[str, Any]:
 
         r_state = _metals_broker_basket_r(broker)
         current_r = float(safe_float(r_state.get("basket_r")) or 0.0)
-        # v1.6.28 live HWM: a true new cash high gets a fresh OANDA pricing
-        # timestamp instead of inheriting the latest hourly signal time/cache.
-        current_is_new_cash_high = current_gbp > old_hwm_gbp + 0.005
+        # v1.6.35: harvest thresholds are R-based, so force a fresh OANDA pricing
+        # timestamp whenever EITHER broker cash or broker R makes a new high. This
+        # prevents an intrahour R checkpoint inheriting a cached/top-of-hour time.
+        current_is_new_high = (
+            current_gbp > old_hwm_gbp + 0.005
+            or current_r > old_hwm_r + 0.005
+        )
         observed_at = _metals_hwm_observation_time(
-            conn, force_market_quote=current_is_new_cash_high
+            conn, force_market_quote=current_is_new_high
         )
 
         # Only a successful broker read proving flat may reset the cycle.
@@ -40183,14 +40248,16 @@ def _metals_harvest_execute_stage(
     }
 
 
-def _metals_harvest_maintenance_tick(
+def _metals_harvest_maintenance_tick_unlocked(
     allow_execution: bool = True,
     source: str = "auto",
+    broker_snapshot: Optional[Dict[str, Any]] = None,
+    hwm_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Broker-authoritative family banking; independent of individual exit policy."""
     init_db()
-    broker = metals_demo_live_broker_snapshot()
-    hwm = _metals_broker_highwater_state(broker)
+    broker = broker_snapshot or metals_demo_live_broker_snapshot()
+    hwm = hwm_snapshot or _metals_broker_highwater_state(broker)
     result: Dict[str, Any] = {
         "ok": True,
         "enabled": bool(METALS_HARVEST_EXECUTION_ENABLED),
@@ -40316,6 +40383,35 @@ def _metals_harvest_maintenance_tick(
 
     result["status"] = "OK"
     return result
+
+
+def _metals_harvest_maintenance_tick(
+    allow_execution: bool = True,
+    source: str = "auto",
+    broker_snapshot: Optional[Dict[str, Any]] = None,
+    hwm_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Serialized practice-family harvest evaluation/execution.
+
+    The intrahour HWM sampler and the existing manager path may race during a
+    checkpoint. Serialize them so one stage cannot be banked twice.
+    """
+    if not _METALS_PRACTICE_HARVEST_LOCK.acquire(blocking=False):
+        return {
+            "ok": True,
+            "skipped": True,
+            "status": "HARVEST_ALREADY_RUNNING",
+            "source": source,
+        }
+    try:
+        return _metals_harvest_maintenance_tick_unlocked(
+            allow_execution=allow_execution,
+            source=source,
+            broker_snapshot=broker_snapshot,
+            hwm_snapshot=hwm_snapshot,
+        )
+    finally:
+        _METALS_PRACTICE_HARVEST_LOCK.release()
 
 
 def metals_harvest_plan_snapshot() -> Dict[str, Any]:
