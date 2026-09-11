@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.36 Portfolio Hub Last-Trade-Opened Visibility — cumulative on v1.6.35
-# Cumulative on v1.6.35. Adds read-only latest actual XAU LONG broker-open time to the Portfolio Hub summary. Intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, AI veto research, live-pilot, accounting, direction-flip, manager and research functionality are unchanged.
+# VERIFIED BUILD: Metals v1.6.37 Directional Intelligence Research v1 + Last-Trade Visibility + Intrahour HWM Harvest — cumulative on v1.6.36
+# Cumulative on the supplied v1.6.36 last-trade build. Adds prospective direction-normalised LONG/SHORT evidence, candidate episodes, snapback metrics and directional AI labels while retaining last-trade visibility, intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, live-pilot, accounting, direction-flip, manager and broker execution behaviour unchanged.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.36"
-METALS_BUILD_BASELINE = "cumulative Metals v1.6.35 / 2026-09-10"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Intrahour HWM Harvest + Reopen Retry + AI Veto + Live Pilot"
+METALS_APP_VERSION = "v1.6.37"
+METALS_BUILD_BASELINE = "cumulative supplied Metals v1.6.36 / 2026-09-11"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Directional Research + Intrahour HWM Harvest + Reopen Retry + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -10626,6 +10626,7 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
             if _metals_demo_asset(_scope_pair) == "XAUUSD":
                 result["xau_long_live_manager"] = metals_xau_live_manager_tick(force=True, source=source)
             result["focused_research"] = record_metals_focused_research(int(new_signal_db_id))
+            result["directional_intelligence_research"] = record_metals_directional_intelligence(int(new_signal_db_id))
             try:
                 _scope_asset = _metals_demo_asset(_scope_pair)
                 if _scope_asset == "XAGUSD":
@@ -30941,6 +30942,23 @@ def export_metals_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT) -> Resp
             _write_zip_json(zf, "metals-short-shadow-v2-export-error.json", {"error": str(e), "time_utc": now_utc_iso()}); files.append("metals-short-shadow-v2-export-error.json")
 
         try:
+            directional_rows = metals_directional_intelligence_rows(limit=limit)
+            _write_zip_csv(
+                zf,
+                "metals-directional-intelligence.csv",
+                directional_rows,
+                ["raw_signal_id", "asset", "direction", "candidate", "candidate_episode_id"],
+            )
+            files.append("metals-directional-intelligence.csv")
+        except Exception as e:
+            _write_zip_json(
+                zf,
+                "metals-directional-intelligence-error.json",
+                {"error": str(e), "time_utc": now_utc_iso()},
+            )
+            files.append("metals-directional-intelligence-error.json")
+
+        try:
             with get_conn() as conn:
                 raw_rows = _filtered_raw_signals(conn, ["XAUUSD", "XAU", "XAGUSD", "XAG"], limit)
             _write_zip_csv(zf, "raw-signals-metals.csv", raw_rows, ["id", "pair", "timestamp_readable"]); files.append("raw-signals-metals.csv")
@@ -36819,8 +36837,8 @@ AI_SHADOW_ENABLED = os.getenv("AI_SHADOW_ENABLED", "false").strip().lower() == "
 AI_SHADOW_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 AI_SHADOW_OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
 AI_SHADOW_MODEL = os.getenv("AI_SHADOW_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
-AI_SHADOW_PROMPT_VERSION = "ai_regime_observer_family_v1_2026_08_21"
-AI_SHADOW_OBSERVER_VERSION = "ai_regime_observer_v1_event_driven_2026_08_21"
+AI_SHADOW_PROMPT_VERSION = "ai_regime_observer_directional_v2_2026_09_10"
+AI_SHADOW_OBSERVER_VERSION = "ai_regime_observer_directional_v2_event_driven_2026_09_10"
 AI_SHADOW_EVENT_DRIVEN_ONLY = os.getenv("AI_SHADOW_EVENT_DRIVEN_ONLY", "true").strip().lower() == "true"
 AI_SHADOW_TIMEOUT_SECONDS = max(10.0, min(float(os.getenv("AI_SHADOW_TIMEOUT_SECONDS", "45")), 120.0))
 AI_SHADOW_MAX_OUTPUT_TOKENS = max(250, min(int(float(os.getenv("AI_SHADOW_MAX_OUTPUT_TOKENS", "700"))), 2000))
@@ -36830,7 +36848,30 @@ AI_SHADOW_GIVEBACK_BANDS_PCT = (25.0, 50.0, 75.0)
 # still being learned prospectively. These are CALL TRIGGERS ONLY.
 AI_SHADOW_HIGH_WATER_LEVELS_R = (25.0, 50.0, 75.0, 100.0, 200.0, 300.0)
 
-AI_REGIME_SYSTEM_PROMPT = 'You are the Project Exit Plan AI Regime Observer.\nYou are research-only and have ZERO authority over live or demo trading.\n\nYou receive one immutable point-in-time snapshot captured before the deterministic\ntrading worker acts on that signal. Use ONLY that snapshot. Do not use web\nknowledge, remembered market history, later candles, hidden information, or\nassumptions about what happened next.\n\nThis project trades XAUUSD and XAGUSD using deterministic long/short rules.\nGold and Silver form one internal Metals family; Gold is the anchor market and\nSilver may require same-direction Gold confirmation when Silver exposure becomes\nlarge. Existing positions use a 48h minimum normal hold with hourly mature-runner\nreview thereafter. Your role is to classify current regime and independently\ndescribe whether a fresh deterministic slice looks supported and whether existing\nexposure appears HOLD / PROTECT / REDUCE. You do not make or alter trading decisions.\n\nregime TREND / CHOP / TRANSITION / EXHAUSTION describes the current state only.\nBe conservative about certainty. Candidate state is evidence, not an instruction.'
+AI_REGIME_SYSTEM_PROMPT = '''You are the Project Exit Plan AI Regime Observer.
+You are research-only and have ZERO authority over live or demo trading.
+
+You receive one immutable point-in-time snapshot captured before the deterministic
+trading worker acts on that signal. Use ONLY that snapshot. Do not use web
+knowledge, remembered market history, later candles, hidden information, or
+assumptions about what happened next.
+
+This project trades XAUUSD and XAGUSD using deterministic long/short rules.
+Gold and Silver form one internal Metals family; Gold is the anchor market and
+Silver may require same-direction Gold confirmation when Silver exposure becomes
+large. Existing positions use the current deterministic manager. Your research role
+is to classify regime and independently assess BOTH a fresh LONG and a fresh SHORT.
+Do not simply invert one side to obtain the other. Candidate state is evidence, not
+an instruction.
+
+entry_view remains the view of the currently selected deterministic candidate for
+backward compatibility. long_view and short_view are independent ENTER/HOLD/AVOID
+judgements. directional_bias is UP/DOWN/NEUTRAL/MIXED. directional_regime is
+TREND_UP/TREND_DOWN/TRANSITION/CHOP/EXHAUSTION_UP/EXHAUSTION_DOWN.
+management_view describes existing exposure only.
+
+Be conservative about certainty. AI has no authority to open, close, size, stop,
+harvest or block any trade.'''
 
 AI_REGIME_OUTPUT_SCHEMA = {
     "type": "object",
@@ -36838,6 +36879,10 @@ AI_REGIME_OUTPUT_SCHEMA = {
         "entry_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
         "management_view": {"type": "string", "enum": ["HOLD", "PROTECT", "REDUCE"]},
         "regime": {"type": "string", "enum": ["TREND", "CHOP", "TRANSITION", "EXHAUSTION"]},
+        "directional_bias": {"type": "string", "enum": ["UP", "DOWN", "NEUTRAL", "MIXED"]},
+        "directional_regime": {"type": "string", "enum": ["TREND_UP", "TREND_DOWN", "TRANSITION", "CHOP", "EXHAUSTION_UP", "EXHAUSTION_DOWN"]},
+        "long_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
+        "short_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
         "live_rule_assessment": {
             "type": "string",
@@ -36853,7 +36898,8 @@ AI_REGIME_OUTPUT_SCHEMA = {
         "short_reason": {"type": "string"},
     },
     "required": [
-        "entry_view","management_view","regime","confidence",
+        "entry_view","management_view","regime","directional_bias",
+        "directional_regime","long_view","short_view","confidence",
         "live_rule_assessment","reason_codes","short_reason"
     ],
     "additionalProperties": False,
@@ -36890,6 +36936,10 @@ def ensure_ai_regime_observer_table() -> None:
                 entry_view TEXT,
                 management_view TEXT,
                 regime TEXT,
+                directional_bias TEXT,
+                directional_regime TEXT,
+                long_view TEXT,
+                short_view TEXT,
                 confidence INTEGER,
                 live_rule_assessment TEXT,
                 reason_codes TEXT,
@@ -36902,6 +36952,8 @@ def ensure_ai_regime_observer_table() -> None:
                 error TEXT
             )
         """)
+        for _col,_typ in [("directional_bias","TEXT"),("directional_regime","TEXT"),("long_view","TEXT"),("short_view","TEXT")]:
+            add_column_if_missing(conn,"ai_regime_observer",_col,_typ)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_status ON ai_regime_observer(status, created_at_utc)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_asset ON ai_regime_observer(asset, raw_signal_id)")
         conn.commit()
@@ -37000,7 +37052,7 @@ def _aiobs_openai_call(model_input, raw_signal_id):
                 data = json.loads(resp.read().decode("utf-8"))
             txt = _aiobs_extract_text(data)
             decision = json.loads(txt) if txt else {}
-            required = {"entry_view","management_view","regime","confidence","live_rule_assessment","reason_codes","short_reason"}
+            required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
             if not isinstance(decision, dict) or not required.issubset(decision):
                 raise ValueError("structured regime decision missing required fields")
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -37052,12 +37104,13 @@ def process_ai_regime_observer(raw_signal_id):
         d = api["decision"]
         conn.execute("""UPDATE ai_regime_observer SET
                         status='COMPLETE',updated_at_utc=?,completed_at_utc=?,
-                        entry_view=?,management_view=?,regime=?,confidence=?,
+                        entry_view=?,management_view=?,regime=?,directional_bias=?,directional_regime=?,long_view=?,short_view=?,confidence=?,
                         live_rule_assessment=?,reason_codes=?,short_reason=?,
                         response_id=?,input_tokens=?,output_tokens=?,model=?,error=''
                         WHERE raw_signal_id=?""",
                      (now,now,safe_str(d.get("entry_view")),safe_str(d.get("management_view")),
-                      safe_str(d.get("regime")),int(safe_float(d.get("confidence")) or 0),
+                      safe_str(d.get("regime")),safe_str(d.get("directional_bias")),safe_str(d.get("directional_regime")),
+                      safe_str(d.get("long_view")),safe_str(d.get("short_view")),int(safe_float(d.get("confidence")) or 0),
                       safe_str(d.get("live_rule_assessment")),json.dumps(d.get("reason_codes") or []),
                       safe_str(d.get("short_reason"))[:1500],safe_str(api.get("response_id")),
                       int(api.get("input_tokens") or 0),int(api.get("output_tokens") or 0),
@@ -37564,6 +37617,27 @@ def _metals_aiobs_state(conn, raw_signal_id):
     },raw,selected
 
 
+
+def _metals_directional_candidate_context(raw: Dict[str, Any], row: Any) -> Dict[str, Any]:
+    long_c = cleaned_metal_long_demo_candidate(raw, row)
+    short_c = cleaned_metal_short_demo_candidate(raw, row)
+    return {
+        "asset": _metals_demo_asset(row["pair"]),
+        "long_candidate": bool(int(safe_float(long_c.get("demo_candidate")) or 0)),
+        "long_state": safe_str(long_c.get("demo_state")),
+        "long_blockers": safe_str(long_c.get("demo_blockers")),
+        "short_candidate": bool(int(safe_float(short_c.get("demo_candidate")) or 0)),
+        "short_state": safe_str(short_c.get("demo_state")),
+        "short_blockers": safe_str(short_c.get("demo_blockers")),
+        "short_watch": bool(int(safe_float(short_c.get("short_watch")) or 0)),
+        "candidate_sources": {
+            "long": "existing_long_forward_candidate_cleaned_demo",
+            "short": "generated_short_v1_cleaned_v2",
+        },
+        "execution_authority": False,
+    }
+
+
 def capture_ai_regime_snapshot(raw_signal_id):
     if not AI_SHADOW_CAPTURE_ENABLED:
         return {"captured":False,"reason":"AI_SHADOW_CAPTURE_ENABLED=false"}
@@ -37576,13 +37650,20 @@ def capture_ai_regime_snapshot(raw_signal_id):
         if not row:
             return {"captured":False,"reason":"raw_signal_missing"}
         current,raw,selected=_metals_aiobs_state(conn,raw_signal_id)
+        directional_ctx=_metals_directional_candidate_context(raw,row)
         previous_row=conn.execute("""SELECT snapshot_json FROM ai_regime_observer
                                     WHERE asset=? ORDER BY raw_signal_id DESC LIMIT 1""",
                                  (current["asset"],)).fetchone()
         previous={}
+        previous_directional={}
         if previous_row:
-            try: previous=(json.loads(previous_row["snapshot_json"]) or {}).get("event_state") or {}
-            except Exception: previous={}
+            try:
+                _prev_snap=json.loads(previous_row["snapshot_json"]) or {}
+                previous=_prev_snap.get("event_state") or {}
+                _prev_mi=_prev_snap.get("model_input") or {}
+                previous_directional=_prev_mi.get("directional_candidate_context") or {}
+            except Exception:
+                previous={}; previous_directional={}
         reasons=[]
         if not previous:
             reasons.append("FIRST_OBSERVATION")
@@ -37592,6 +37673,12 @@ def capture_ai_regime_snapshot(raw_signal_id):
                     reasons.append("CANDIDATE_FLIP_TO_"+safe_str(current["side"]).upper())
                 else:
                     reasons.append("CANDIDATE_FLIP_TO_FALSE")
+            for _side in ("long","short"):
+                _k=f"{_side}_candidate"
+                if bool(directional_ctx.get(_k)) != bool(previous_directional.get(_k)):
+                    reasons.append(f"{_side.upper()}_RESEARCH_CANDIDATE_ON" if directional_ctx.get(_k) else f"{_side.upper()}_RESEARCH_CANDIDATE_OFF")
+                elif safe_str(directional_ctx.get(f"{_side}_state")) != safe_str(previous_directional.get(f"{_side}_state")):
+                    reasons.append(f"{_side.upper()}_RESEARCH_STATE_CHANGE")
             if bool(current["peer_supported"]) != bool(previous.get("peer_supported")):
                 reasons.append("METALS_PEER_SUPPORT_ON" if current["peer_supported"] else "METALS_PEER_SUPPORT_OFF")
             if int(previous.get("mature_48h_plus") or 0)<=0<int(current["mature_48h_plus"]):
@@ -37627,10 +37714,11 @@ def capture_ai_regime_snapshot(raw_signal_id):
             "current_asset":current["asset"],
             "current_signal":_aiobs_scalar_features(raw),
             "deterministic_selected_state":selected,
+            "directional_candidate_context":directional_ctx,
             "counterpart_latest_known":counterpart,
             "event_state":current,
             "recent_history":recent,
-            "research_note":"XAU/XAG family. Snapshot captured before deterministic processing; AI has zero execution authority. Basket R/HWM/giveback use broker-derived OANDA XAU/XAG state.",
+            "research_note":"XAU/XAG family. Snapshot captured before deterministic processing; independent long/short views are research-only and have zero execution authority. Basket R/HWM/giveback use broker-derived OANDA XAU/XAG state.",
         }
         snapshot={"captured_at_utc":now_utc_iso(),"event_state":current,"model_input":model_input}
         status="CAPTURED" if api_eligible else "CAPTURED_NO_CALL"
@@ -38939,6 +39027,9 @@ async def broker_oanda_test_update_managed_stops(request: Request) -> Dict[str, 
 METALS_FOCUSED_THRESHOLDS = [40,60,75,100,150,200,300,400,500,600]
 METALS_FOCUSED_HORIZONS = [6,12,24,48]
 METALS_FOCUSED_EFFICIENCY_LOOKBACKS = [8,12,24]
+METALS_DIRECTIONAL_INTELLIGENCE_VERSION = "metals_directional_intelligence_v1_2026_09_10"
+METALS_DIRECTIONAL_INTELLIGENCE_HORIZONS = [6,12,24,48,72,96]
+METALS_DIRECTIONAL_INTELLIGENCE_PROSPECTIVE_ONLY = True
 
 def ensure_metals_focused_research_tables():
     with get_conn() as conn:
@@ -38964,6 +39055,73 @@ def ensure_metals_focused_research_tables():
             outcome_6_r REAL,outcome_12_r REAL,outcome_24_r REAL,outcome_48_r REAL,
             completed_48 INTEGER DEFAULT 0, updated_at_utc TEXT,
             UNIQUE(cycle_id,threshold_r))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS metals_directional_intelligence_research (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+            raw_signal_id INTEGER NOT NULL, asset TEXT NOT NULL, signal_time TEXT, direction TEXT NOT NULL,
+            candidate INTEGER DEFAULT 0, candidate_source TEXT, candidate_state TEXT, candidate_episode_id TEXT,
+            episode_start_raw_signal_id INTEGER, entry_close REAL, sl_pct REAL, context_trend TEXT,
+            efficiency_8h REAL, efficiency_state_8h TEXT, alignment_state TEXT, peer_support_state TEXT,
+            basket_cycle_id TEXT, basket_open_count INTEGER, basket_r REAL, basket_high_water_r REAL, basket_giveback_pct REAL,
+            ai_decision_id INTEGER, ai_status TEXT, ai_regime TEXT, ai_directional_bias TEXT, ai_directional_regime TEXT,
+            ai_long_view TEXT, ai_short_view TEXT, point_in_time_json TEXT,
+            outcome_6_signal_time TEXT,
+            outcome_6_close REAL,
+            outcome_6_r REAL,
+            outcome_6_mfe_r REAL,
+            outcome_6_mae_r REAL,
+            outcome_6_post_peak_worst_r REAL,
+            outcome_6_snapback_r REAL,
+            outcome_6_hard_stop_hit INTEGER,
+            completed_6 INTEGER DEFAULT 0,
+            outcome_12_signal_time TEXT,
+            outcome_12_close REAL,
+            outcome_12_r REAL,
+            outcome_12_mfe_r REAL,
+            outcome_12_mae_r REAL,
+            outcome_12_post_peak_worst_r REAL,
+            outcome_12_snapback_r REAL,
+            outcome_12_hard_stop_hit INTEGER,
+            completed_12 INTEGER DEFAULT 0,
+            outcome_24_signal_time TEXT,
+            outcome_24_close REAL,
+            outcome_24_r REAL,
+            outcome_24_mfe_r REAL,
+            outcome_24_mae_r REAL,
+            outcome_24_post_peak_worst_r REAL,
+            outcome_24_snapback_r REAL,
+            outcome_24_hard_stop_hit INTEGER,
+            completed_24 INTEGER DEFAULT 0,
+            outcome_48_signal_time TEXT,
+            outcome_48_close REAL,
+            outcome_48_r REAL,
+            outcome_48_mfe_r REAL,
+            outcome_48_mae_r REAL,
+            outcome_48_post_peak_worst_r REAL,
+            outcome_48_snapback_r REAL,
+            outcome_48_hard_stop_hit INTEGER,
+            completed_48 INTEGER DEFAULT 0,
+            outcome_72_signal_time TEXT,
+            outcome_72_close REAL,
+            outcome_72_r REAL,
+            outcome_72_mfe_r REAL,
+            outcome_72_mae_r REAL,
+            outcome_72_post_peak_worst_r REAL,
+            outcome_72_snapback_r REAL,
+            outcome_72_hard_stop_hit INTEGER,
+            completed_72 INTEGER DEFAULT 0,
+            outcome_96_signal_time TEXT,
+            outcome_96_close REAL,
+            outcome_96_r REAL,
+            outcome_96_mfe_r REAL,
+            outcome_96_mae_r REAL,
+            outcome_96_post_peak_worst_r REAL,
+            outcome_96_snapback_r REAL,
+            outcome_96_hard_stop_hit INTEGER,
+            completed_96 INTEGER DEFAULT 0,
+            research_version TEXT NOT NULL, UNIQUE(raw_signal_id,direction))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_directional_candidate ON metals_directional_intelligence_research(direction,candidate,asset,signal_time)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_directional_episode ON metals_directional_intelligence_research(candidate_episode_id,direction,asset)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_metals_directional_pending ON metals_directional_intelligence_research(completed_96,asset,direction,raw_signal_id)")
         conn.commit()
 
 def _mf_asset_return(conn, asset, raw_id, lookback):
@@ -39140,6 +39298,163 @@ def _mf_elapsed(conn, raw_id):
                         WHERE id>? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''""",(int(raw_id),)).fetchone()
     return int(row["c"] if row else 0)
 
+
+def _metals_directional_ai_fields(conn: Any, raw_signal_id: int) -> Dict[str, Any]:
+    try:
+        row=conn.execute("""SELECT id,status,regime,directional_bias,directional_regime,long_view,short_view
+                            FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1""",(int(raw_signal_id),)).fetchone()
+        if not row:return {}
+        d=dict(row)
+        return {"ai_decision_id":d.get("id"),"ai_status":d.get("status"),"ai_regime":d.get("regime"),
+                "ai_directional_bias":d.get("directional_bias"),"ai_directional_regime":d.get("directional_regime"),
+                "ai_long_view":d.get("long_view"),"ai_short_view":d.get("short_view")}
+    except Exception:return {}
+
+
+def _metals_directional_pre_action_snapshot(conn: Any, raw_signal_id: int) -> Dict[str, Any]:
+    try:
+        row=conn.execute("SELECT snapshot_json FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+        if not row:return {}
+        s=json.loads(safe_str(row["snapshot_json"] or "{}")); mi=s.get("model_input") if isinstance(s,dict) else {}
+        return mi if isinstance(mi,dict) else {}
+    except Exception:return {}
+
+
+def _metals_directional_episode(conn: Any, asset: str, direction: str, raw_signal_id: int, candidate: bool) -> Tuple[str, Optional[int]]:
+    if not candidate:return "",None
+    prev=conn.execute("""SELECT candidate,candidate_episode_id,episode_start_raw_signal_id FROM metals_directional_intelligence_research
+                         WHERE asset=? AND direction=? AND raw_signal_id<? ORDER BY raw_signal_id DESC LIMIT 1""",
+                      (asset,direction,int(raw_signal_id))).fetchone()
+    if prev and int(safe_float(prev["candidate"]) or 0)==1 and safe_str(prev["candidate_episode_id"]):
+        return safe_str(prev["candidate_episode_id"]),int(safe_float(prev["episode_start_raw_signal_id"]) or raw_signal_id)
+    return f"METALS_{asset}_{direction}_{int(raw_signal_id)}",int(raw_signal_id)
+
+
+def _metals_directional_future_rows(conn: Any, asset: str, raw_signal_id: int, limit: int) -> List[Dict[str, Any]]:
+    rows=conn.execute("""SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals
+                         WHERE UPPER(pair)=? AND id>? AND exec_close IS NOT NULL
+                           AND UPPER(COALESCE(model_version,''))!='RESEARCH_MULTI_CTX_1H'
+                         ORDER BY id ASC LIMIT ?""",(asset,int(raw_signal_id),int(limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _metals_directional_path_metrics(entry: float, sl_pct: float, direction: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    risk=float(entry)*float(sl_pct)/100.0
+    if risk<=0 or not rows:return {}
+    fav=[];adv=[];side=safe_str(direction).upper()
+    for r in rows:
+        c=safe_float(r.get("exec_close")); hi=safe_float(r.get("exec_high")); lo=safe_float(r.get("exec_low"))
+        hi=hi if hi is not None else c; lo=lo if lo is not None else c
+        if hi is None or lo is None: fav.append(0.0);adv.append(0.0);continue
+        if side=="LONG":fav.append((hi-entry)/risk);adv.append((lo-entry)/risk)
+        else:fav.append((entry-lo)/risk);adv.append((entry-hi)/risk)
+    mfe=max([0.0]+fav);mae=min([0.0]+adv);peak=fav.index(max(fav)) if max(fav)>0 else 0
+    post=min([0.0]+adv[peak:]);return {"mfe_r":mfe,"mae_r":mae,"post_peak_worst_r":post,"snapback_r":max(0.0,mfe-post),"hard_stop_hit":1 if mae<=-1.0 else 0}
+
+
+def update_metals_directional_intelligence_outcomes(conn: Any, limit: int=500) -> Dict[str, Any]:
+    rows=[dict(r) for r in conn.execute("SELECT * FROM metals_directional_intelligence_research WHERE COALESCE(completed_96,0)=0 ORDER BY id ASC LIMIT ?",(max(1,min(int(limit),2000)),)).fetchall()]
+    updated=0
+    for row in rows:
+        rid=int(safe_float(row.get("raw_signal_id")) or 0);entry=safe_float(row.get("entry_close"));sl=safe_float(row.get("sl_pct"));asset=safe_str(row.get("asset")).upper();direction=safe_str(row.get("direction")).upper()
+        if rid<=0 or entry is None or entry<=0 or sl is None or sl<=0 or direction not in {"LONG","SHORT"}:continue
+        sets=[];vals=[];ai=_metals_directional_ai_fields(conn,rid)
+        for col in ["ai_decision_id","ai_status","ai_regime","ai_directional_bias","ai_directional_regime","ai_long_view","ai_short_view"]:
+            if ai.get(col) is not None and ai.get(col)!=row.get(col):sets.append(f"{col}=?");vals.append(ai.get(col))
+        future=_metals_directional_future_rows(conn,asset,rid,max(METALS_DIRECTIONAL_INTELLIGENCE_HORIZONS)+2)
+        for h in METALS_DIRECTIONAL_INTELLIGENCE_HORIZONS:
+            if int(safe_float(row.get(f"completed_{h}")) or 0)==1 or len(future)<h:continue
+            path=future[:h];end=path[h-1];close=safe_float(end.get("exec_close"))
+            if close is None:continue
+            risk=float(entry)*float(sl)/100.0;out=((close-entry)/risk) if direction=="LONG" else ((entry-close)/risk)
+            p=_metals_directional_path_metrics(float(entry),float(sl),direction,path)
+            sets.extend([f"outcome_{h}_signal_time=?",f"outcome_{h}_close=?",f"outcome_{h}_r=?",f"outcome_{h}_mfe_r=?",f"outcome_{h}_mae_r=?",f"outcome_{h}_post_peak_worst_r=?",f"outcome_{h}_snapback_r=?",f"outcome_{h}_hard_stop_hit=?",f"completed_{h}=?"])
+            vals.extend([safe_str(end.get("timestamp_readable")),close,out,p.get("mfe_r"),p.get("mae_r"),p.get("post_peak_worst_r"),p.get("snapback_r"),p.get("hard_stop_hit"),1])
+        if sets:
+            sets.append("updated_at_utc=?");vals.extend([now_utc_iso(),int(row["id"])]);conn.execute(f"UPDATE metals_directional_intelligence_research SET {', '.join(sets)} WHERE id=?",tuple(vals));updated+=1
+    return {"ok":True,"checked":len(rows),"updated":updated,"research_only":True,"execution_authority":False}
+
+
+def record_metals_directional_intelligence(raw_signal_id: int) -> Dict[str, Any]:
+    rid=int(raw_signal_id or 0)
+    if rid<=0:return {"ok":False,"reason":"invalid_raw_signal_id","research_only":True}
+    ensure_metals_focused_research_tables()
+    with get_conn() as conn:
+        update_metals_directional_intelligence_outcomes(conn,500)
+        row=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(rid,)).fetchone()
+        if not row:conn.commit();return {"ok":False,"reason":"raw_signal_not_found","research_only":True}
+        asset=_metals_demo_asset(row["pair"])
+        if asset not in {"XAUUSD","XAGUSD"}:conn.commit();return {"ok":True,"skipped":True,"reason":"non_metal_asset","research_only":True}
+        raw=_raw_signal_json(row);entry=safe_float(row["exec_close"])
+        if entry is None or entry<=0:conn.commit();return {"ok":True,"skipped":True,"reason":"missing_entry_close","research_only":True}
+        ctx=_metals_directional_candidate_context(raw,row);long_c=cleaned_metal_long_demo_candidate(raw,row);short_c=cleaned_metal_short_demo_candidate(raw,row)
+        effrow=conn.execute("""SELECT efficiency,state FROM metals_focused_efficiency WHERE asset=? AND lookback_candles=8 AND raw_signal_id<=? ORDER BY raw_signal_id DESC LIMIT 1""",(asset,rid)).fetchone()
+        alrow=conn.execute("SELECT * FROM metals_focused_alignment WHERE raw_signal_id<=? ORDER BY raw_signal_id DESC LIMIT 1",(rid,)).fetchone();alignment=safe_str(alrow["state"] if alrow else "")
+        other="XAGUSD" if asset=="XAUUSD" else "XAUUSD";orow=conn.execute("SELECT * FROM raw_signals WHERE UPPER(pair)=? AND id<=? ORDER BY id DESC LIMIT 1",(other,rid)).fetchone();other_ctx={}
+        if orow:
+            oraw=_raw_signal_json(orow);other_ctx=_metals_directional_candidate_context(oraw,orow)
+        pre=_metals_directional_pre_action_snapshot(conn,rid);event=pre.get("event_state") if isinstance(pre.get("event_state"),dict) else {}
+        # In Metals snapshot event_state is stored one level above model_input; recover from full snapshot when possible.
+        try:
+            srow=conn.execute("SELECT snapshot_json FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1",(rid,)).fetchone();full=json.loads(safe_str(srow["snapshot_json"] or "{}")) if srow else {};event=full.get("event_state") or event
+        except Exception:pass
+        ai=_metals_directional_ai_fields(conn,rid)
+        dirs=[("LONG",bool(int(safe_float(long_c.get("demo_candidate")) or 0)),"existing_long_forward_candidate_cleaned_demo",safe_str(long_c.get("demo_state"))),
+              ("SHORT",bool(int(safe_float(short_c.get("demo_candidate")) or 0)),"generated_short_v1_cleaned_v2",safe_str(short_c.get("demo_state")))]
+        inserted=0
+        for direction,cand,source,state in dirs:
+            if conn.execute("SELECT id FROM metals_directional_intelligence_research WHERE raw_signal_id=? AND direction=? LIMIT 1",(rid,direction)).fetchone():continue
+            ep,epstart=_metals_directional_episode(conn,asset,direction,rid,cand);peer_c=bool(other_ctx.get(direction.lower()+"_candidate"));peer_state=("PEER_SAME_DIRECTION_CONFIRMED" if cand and peer_c else "PEER_NOT_CONFIRMED")
+            point={"prospective_only":True,"future_data_included":False,"directional_candidate_context":ctx,"peer_candidate_context":other_ctx,"ai_pre_action_model_input":pre}
+            ctxtrend=safe_str(raw.get("ctx_trend_state") or raw.get("context_trend") or raw.get("context_trend_state"))
+            vals=[now_utc_iso(),now_utc_iso(),rid,asset,safe_str(row["timestamp_readable"]),direction,1 if cand else 0,source,state,ep,epstart,float(entry),float(_metals_demo_sl_pct(asset)),ctxtrend,
+                  safe_float(effrow["efficiency"] if effrow else None),safe_str(effrow["state"] if effrow else ""),alignment,peer_state,
+                  safe_str(event.get("cycle_id")),int(safe_float(event.get("open_count")) or 0),safe_float(event.get("basket_r")),safe_float(event.get("high_water_r")),safe_float(event.get("giveback_pct")),
+                  ai.get("ai_decision_id"),ai.get("ai_status"),ai.get("ai_regime"),ai.get("ai_directional_bias"),ai.get("ai_directional_regime"),ai.get("ai_long_view"),ai.get("ai_short_view"),json.dumps(point,default=str),METALS_DIRECTIONAL_INTELLIGENCE_VERSION]
+            conn.execute("""INSERT INTO metals_directional_intelligence_research (created_at_utc,updated_at_utc,raw_signal_id,asset,signal_time,direction,candidate,candidate_source,candidate_state,candidate_episode_id,episode_start_raw_signal_id,entry_close,sl_pct,context_trend,efficiency_8h,efficiency_state_8h,alignment_state,peer_support_state,basket_cycle_id,basket_open_count,basket_r,basket_high_water_r,basket_giveback_pct,ai_decision_id,ai_status,ai_regime,ai_directional_bias,ai_directional_regime,ai_long_view,ai_short_view,point_in_time_json,research_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",tuple(vals));inserted+=1
+        conn.commit()
+    return {"ok":True,"raw_signal_id":rid,"asset":asset,"rows_inserted":inserted,"research_only":True,"execution_authority":False,"prospective_only":True,"version":METALS_DIRECTIONAL_INTELLIGENCE_VERSION}
+
+
+def metals_directional_intelligence_rows(limit:int=25000)->List[Dict[str,Any]]:
+    ensure_metals_focused_research_tables();lim=max(1,min(int(limit),100000))
+    with get_conn() as conn:
+        update_metals_directional_intelligence_outcomes(conn,min(lim,2000));conn.commit();return [dict(r) for r in conn.execute("SELECT * FROM metals_directional_intelligence_research ORDER BY id DESC LIMIT ?",(lim,)).fetchall()]
+
+
+def metals_directional_intelligence_summary(limit:int=5000)->Dict[str,Any]:
+    rows=metals_directional_intelligence_rows(limit);cand=[r for r in rows if int(safe_float(r.get("candidate")) or 0)==1];groups=[]
+    for direction in ("LONG","SHORT"):
+        rr=[r for r in cand if safe_str(r.get("direction")).upper()==direction];comp=[r for r in rr if int(safe_float(r.get("completed_48")) or 0)==1 and safe_float(r.get("outcome_48_r")) is not None];eps=len({safe_str(r.get("candidate_episode_id")) for r in rr if safe_str(r.get("candidate_episode_id"))})
+        def avg(k):
+            vs=[safe_float(x.get(k)) for x in comp];vs=[float(x) for x in vs if x is not None];return sum(vs)/len(vs) if vs else None
+        groups.append({"direction":direction,"candidate_rows":len(rr),"independent_candidate_episodes":eps,"completed_48":len(comp),"avg_48_r":avg("outcome_48_r"),"avg_48_mfe_r":avg("outcome_48_mfe_r"),"avg_48_mae_r":avg("outcome_48_mae_r"),"avg_48_snapback_r":avg("outcome_48_snapback_r")})
+    return {"ok":True,"research_only":True,"execution_authority":False,"prospective_only":True,"version":METALS_DIRECTIONAL_INTELLIGENCE_VERSION,"groups":groups,"recent_candidates":cand[:60],"time_utc":now_utc_iso()}
+
+
+def build_metals_directional_intelligence_html()->str:
+    try:s=metals_directional_intelligence_summary()
+    except Exception as exc:return f'<div class="lazy-error">Directional intelligence unavailable: {esc(exc)}</div>'
+    cards=''.join(f"""<div class="card"><div class="label">{esc(g['direction'])} candidate episodes</div><div class="value flat">{esc(g['independent_candidate_episodes'])}</div><div class="small">Rows {esc(g['candidate_rows'])} · 48h complete {esc(g['completed_48'])} · avg 48h {('n/a' if g['avg_48_r'] is None else f"{g['avg_48_r']:+.2f}R")}</div></div>""" for g in s['groups'])
+    recent=''.join(f"""<tr><td>{esc(r.get('signal_time'))}</td><td>{esc(r.get('asset'))}</td><td>{esc(r.get('direction'))}</td><td>{esc(r.get('candidate_state'))}</td><td>{esc(r.get('candidate_episode_id'))}</td><td>{esc(r.get('ai_directional_regime') or r.get('ai_regime'))}</td><td>{esc(r.get('ai_directional_bias'))}</td><td>{esc(r.get('efficiency_state_8h'))}</td><td>{esc(r.get('alignment_state'))}</td><td>{esc(r.get('peer_support_state'))}</td><td>{'' if safe_float(r.get('outcome_48_r')) is None else f"{safe_float(r.get('outcome_48_r')):+.2f}R"}</td><td>{'' if safe_float(r.get('outcome_48_snapback_r')) is None else f"{safe_float(r.get('outcome_48_snapback_r')):.2f}R"}</td></tr>""" for r in s['recent_candidates'][:40]) or '<tr><td colspan="12">Prospective collection starts after v1.6.37 deployment.</td></tr>'
+    return f"""<details class="research-inner"><summary>Directional Intelligence — Long / Short Prospective Research</summary><div class="research-inner-body"><div class="section-note small"><strong>RESEARCH ONLY.</strong> Uses the existing deterministic long candidate and existing cleaned short candidate without changing either. Contiguous candidate runs form independent episodes. Snapback measures R surrendered from peak favourable excursion to the worst later excursion.</div><div class="cards four">{cards}<div class="card"><div class="label">Execution authority</div><div class="value flat">NONE</div><div class="small">Prospective only · no backfill.</div></div></div><div class="table-scroll"><table><thead><tr><th>Signal</th><th>Asset</th><th>Side</th><th>State</th><th>Episode</th><th>AI Regime</th><th>AI Bias</th><th>Efficiency</th><th>Alignment</th><th>Peer</th><th>48h R</th><th>48h Snapback</th></tr></thead><tbody>{recent}</tbody></table></div><div class="section-note small">JSON: <a href="/metals-directional-intelligence">/metals-directional-intelligence</a> · CSV: <a href="/export/metals-directional-intelligence.csv">/export/metals-directional-intelligence.csv</a></div></div></details>"""
+
+
+@app.get("/metals-directional-intelligence")
+def metals_directional_intelligence_api(limit:int=5000):return metals_directional_intelligence_summary(limit)
+
+@app.get("/export/metals-directional-intelligence.csv")
+def export_metals_directional_intelligence_csv(limit:int=25000):
+    rows=metals_directional_intelligence_rows(limit);out=io.StringIO();fields=[]
+    for r in rows:
+        for k in r:
+            if k not in fields:fields.append(k)
+    if fields:
+        w=csv.DictWriter(out,fieldnames=fields,extrasaction="ignore");w.writeheader();w.writerows(rows)
+    else:out.write("note\\nProspective collection has not started yet\\n")
+    return Response(content=out.getvalue(),media_type="text/csv",headers={"Content-Disposition":'attachment; filename="metals-directional-intelligence.csv"'})
+
+
 def record_metals_focused_research(raw_signal_id):
     try:
         ensure_metals_focused_research_tables(); raw_signal_id=int(raw_signal_id or 0)
@@ -39228,10 +39543,11 @@ def _mf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_metals_focused_research_html():
-    return '<div class="section-note small"><strong>Focused Metals research.</strong> Exit challenger shadows, broker-HWM harvest audit, AI regime labels and focused evidence streams. Shadow outputs have zero execution authority; harvest rows are the durable audit of the active family banking layer.</div>' + \
+    return '<div class="section-note small"><strong>Focused Metals research.</strong> Exit challenger shadows, broker-HWM harvest audit, directional AI labels and focused evidence streams. Directional Intelligence records comparable prospective LONG/SHORT episodes with zero execution authority.</div>' + \
       '<details class="research-inner"><summary>MFE / ATR2 / Fixed120 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_metals_exit_challenger_shadow_html() + '</div></details>' + \
       _mf_table("Broker-HWM Harvest Stages",_mf_rows("metals_demo_harvest_stages",100),["threshold_r","bank_fraction","status","armed_hwm_r","armed_hwm_gbp","target_bank_gbp","executed_bank_gbp","selected_broker_trade_ids","reason"]) + \
       _mf_table("Broker-HWM Harvest Close Audit",_mf_rows("metals_demo_harvest_events",150),["created_at_utc","threshold_r","bank_fraction","asset","side","broker_trade_id","expected_upl_gbp","realized_pl_gbp","status","reason"]) + \
+      build_metals_directional_intelligence_html() + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI AVOID Veto Counterfactual — Research Only</summary><div class="research-inner-body">' + build_ai_regime_veto_counterfactual_html() + '</div></details>' + \
       _mf_table("Live High-Water / Banking Outcomes",_mf_rows("metals_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
@@ -39272,7 +39588,7 @@ def export_metals_xag_confirmation_guard_csv(limit: int = 50000):
 @app.get("/export/metals-focused-research.zip")
 def export_metals_focused_research_zip(limit:int=25000):
     ensure_metals_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","harvest-stages.csv":"metals_demo_harvest_stages","harvest-events.csv":"metals_demo_harvest_events","broker-only-recovery.csv":"metals_demo_broker_only_recovery_audit","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard"}
+    tables={"exit-challenger-shadow.csv":"metals_exit_challenger_shadow","harvest-stages.csv":"metals_demo_harvest_stages","harvest-events.csv":"metals_demo_harvest_events","broker-only-recovery.csv":"metals_demo_broker_only_recovery_audit","highwater-banking-research.csv":"metals_focused_highwater","alignment-research.csv":"metals_focused_alignment","trend-efficiency-research.csv":"metals_focused_efficiency","basket-recovery-research.csv":"metals_focused_recovery","xag-xau-confirmation-guard.csv":"metals_demo_xag_confirmation_guard","directional-intelligence.csv":"metals_directional_intelligence_research"}
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_mf_rows(tbl,limit);out=io.StringIO()
