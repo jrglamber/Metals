@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.37 Directional Intelligence Research v1 + Last-Trade Visibility + Intrahour HWM Harvest — cumulative on v1.6.36
-# Cumulative on the supplied v1.6.36 last-trade build. Adds prospective direction-normalised LONG/SHORT evidence, candidate episodes, snapback metrics and directional AI labels while retaining last-trade visibility, intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, live-pilot, accounting, direction-flip, manager and broker execution behaviour unchanged.
+# VERIFIED BUILD: Metals v1.6.38 Durable AI Retry + Prospective AI Veto Shadow + Directional Intelligence Research v1 + Intrahour HWM Harvest — cumulative on v1.6.37
+# Cumulative on supplied Metals v1.6.37. Adds durable AI 429/5xx/network retry with backoff and a prospective research-only AI-veto decision/portfolio ledger. Preserves deterministic execution authority, last-trade visibility, directional research, intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, live-pilot, accounting, direction-flip, manager and broker execution behaviour.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.37"
-METALS_BUILD_BASELINE = "cumulative supplied Metals v1.6.36 / 2026-09-11"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — Directional Research + Intrahour HWM Harvest + Reopen Retry + Live Pilot"
+METALS_APP_VERSION = "v1.6.38"
+METALS_BUILD_BASELINE = "cumulative supplied Metals v1.6.37 / 2026-09-19"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — AI Retry + Prospective Veto Shadow + Directional Research + Intrahour HWM Harvest + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -10863,6 +10863,23 @@ def signal_processing_background_loop() -> None:
         try:
             raw_signal_id = _signal_processing_queue.get(timeout=WEBHOOK_SIGNAL_WORKER_SLEEP_SECONDS)
         except queue.Empty:
+            try:
+                with get_conn() as _rc:
+                    _due = _rc.execute("""SELECT raw_signal_id FROM ai_regime_observer
+                                         WHERE status='RETRY_WAIT' AND COALESCE(next_retry_at_utc,'')<>''
+                                           AND next_retry_at_utc<=? ORDER BY next_retry_at_utc ASC LIMIT 10""", (now_utc_iso(),)).fetchall()
+                    # Recover pre-v1.6.38 429 failures from their frozen point-in-time snapshots.
+                    _legacy = _rc.execute("""SELECT raw_signal_id FROM ai_regime_observer
+                                            WHERE status='ERROR' AND COALESCE(error,'') LIKE '%429%'
+                                              AND COALESCE(retry_count,0)<? ORDER BY raw_signal_id ASC LIMIT 10""", (AI_SHADOW_RETRY_MAX_ATTEMPTS,)).fetchall()
+                for _rr in list(_due) + list(_legacy):
+                    try:
+                        _ai_regime_queue.put_nowait(int(_rr["raw_signal_id"]))
+                    except queue.Full:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
             continue
         try:
             _signal_processing_worker_last_raw_signal_id = int(raw_signal_id)
@@ -36843,6 +36860,10 @@ AI_SHADOW_EVENT_DRIVEN_ONLY = os.getenv("AI_SHADOW_EVENT_DRIVEN_ONLY", "true").s
 AI_SHADOW_TIMEOUT_SECONDS = max(10.0, min(float(os.getenv("AI_SHADOW_TIMEOUT_SECONDS", "45")), 120.0))
 AI_SHADOW_MAX_OUTPUT_TOKENS = max(250, min(int(float(os.getenv("AI_SHADOW_MAX_OUTPUT_TOKENS", "700"))), 2000))
 AI_SHADOW_QUEUE_MAXSIZE = max(50, min(int(float(os.getenv("AI_SHADOW_QUEUE_MAXSIZE", "1000"))), 10000))
+AI_SHADOW_RETRY_MAX_ATTEMPTS = max(1, min(int(float(os.getenv("AI_SHADOW_RETRY_MAX_ATTEMPTS", "8"))), 20))
+AI_SHADOW_RETRY_BASE_SECONDS = max(5, min(int(float(os.getenv("AI_SHADOW_RETRY_BASE_SECONDS", "15"))), 300))
+AI_SHADOW_RETRY_MAX_SECONDS = max(AI_SHADOW_RETRY_BASE_SECONDS, min(int(float(os.getenv("AI_SHADOW_RETRY_MAX_SECONDS", "900"))), 3600))
+AI_VETO_PROSPECTIVE_VERSION = "metals_ai_veto_prospective_shadow_v1_2026_09_19"
 AI_SHADOW_GIVEBACK_BANDS_PCT = (25.0, 50.0, 75.0)
 # Includes earlier levels than Indices because BCO/Metals basket throughput is
 # still being learned prospectively. These are CALL TRIGGERS ONLY.
@@ -36952,7 +36973,9 @@ def ensure_ai_regime_observer_table() -> None:
                 error TEXT
             )
         """)
-        for _col,_typ in [("directional_bias","TEXT"),("directional_regime","TEXT"),("long_view","TEXT"),("short_view","TEXT")]:
+        for _col,_typ in [("directional_bias","TEXT"),("directional_regime","TEXT"),("long_view","TEXT"),("short_view","TEXT"),
+                          ("retry_count","INTEGER DEFAULT 0"),("next_retry_at_utc","TEXT"),("last_http_status","INTEGER"),
+                          ("last_retry_after_seconds","REAL")]:
             add_column_if_missing(conn,"ai_regime_observer",_col,_typ)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_status ON ai_regime_observer(status, created_at_utc)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_asset ON ai_regime_observer(asset, raw_signal_id)")
@@ -37020,6 +37043,17 @@ def _aiobs_extract_text(data):
     return "\n".join(bits).strip()
 
 
+def _aiobs_retry_after_seconds(exc) -> Optional[float]:
+    try:
+        headers = getattr(exc, "headers", None)
+        raw = headers.get("Retry-After") if headers is not None else None
+        if raw is None:
+            return None
+        return max(0.0, float(raw))
+    except Exception:
+        return None
+
+
 def _aiobs_openai_call(model_input, raw_signal_id):
     body = {
         "model": AI_SHADOW_MODEL,
@@ -37027,47 +37061,36 @@ def _aiobs_openai_call(model_input, raw_signal_id):
         "input": json.dumps(model_input, separators=(",",":"), default=str),
         "store": False,
         "max_output_tokens": AI_SHADOW_MAX_OUTPUT_TOKENS,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "project_exit_plan_regime_observer",
-                "strict": True,
-                "schema": AI_REGIME_OUTPUT_SCHEMA,
-            }
-        },
+        "text": {"format": {"type": "json_schema", "name": "project_exit_plan_regime_observer",
+                            "strict": True, "schema": AI_REGIME_OUTPUT_SCHEMA}},
     }
     req = urllib.request.Request(
-        AI_SHADOW_OPENAI_API_BASE + "/responses",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": "Bearer " + AI_SHADOW_OPENAI_API_KEY,
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    last_error = ""
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=AI_SHADOW_TIMEOUT_SECONDS) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            txt = _aiobs_extract_text(data)
-            decision = json.loads(txt) if txt else {}
-            required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
-            if not isinstance(decision, dict) or not required.issubset(decision):
-                raise ValueError("structured regime decision missing required fields")
-            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-            return {
-                "ok": True,
-                "decision": decision,
-                "response_id": safe_str(data.get("id")),
+        AI_SHADOW_OPENAI_API_BASE + "/responses", data=json.dumps(body).encode("utf-8"),
+        headers={"Authorization": "Bearer " + AI_SHADOW_OPENAI_API_KEY, "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=AI_SHADOW_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        txt = _aiobs_extract_text(data)
+        decision = json.loads(txt) if txt else {}
+        required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
+        if not isinstance(decision, dict) or not required.issubset(decision):
+            raise ValueError("structured regime decision missing required fields")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return {"ok": True, "decision": decision, "response_id": safe_str(data.get("id")),
                 "input_tokens": int(safe_float(usage.get("input_tokens")) or 0),
-                "output_tokens": int(safe_float(usage.get("output_tokens")) or 0),
-            }
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-    return {"ok": False, "error": last_error or "OpenAI request failed"}
+                "output_tokens": int(safe_float(usage.get("output_tokens")) or 0)}
+    except urllib.error.HTTPError as exc:
+        status = int(getattr(exc, "code", 0) or 0)
+        retry_after = _aiobs_retry_after_seconds(exc)
+        return {"ok": False, "error": f"HTTPError: HTTP Error {status}: {getattr(exc, 'reason', '')}",
+                "http_status": status, "retryable": bool(status == 429 or 500 <= status <= 599),
+                "retry_after_seconds": retry_after}
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "http_status": 0,
+                "retryable": True, "retry_after_seconds": None}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "http_status": 0,
+                "retryable": False, "retry_after_seconds": None}
 
 
 def process_ai_regime_observer(raw_signal_id):
@@ -37096,9 +37119,22 @@ def process_ai_regime_observer(raw_signal_id):
     now = now_utc_iso()
     with get_conn() as conn:
         if not api.get("ok"):
-            conn.execute("""UPDATE ai_regime_observer SET status='ERROR',updated_at_utc=?,
-                            completed_at_utc=?,error=? WHERE raw_signal_id=?""",
-                         (now,now,safe_str(api.get("error"))[:4000],int(raw_signal_id)))
+            current = conn.execute("SELECT retry_count FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1", (int(raw_signal_id),)).fetchone()
+            retry_count = int(safe_float(current["retry_count"] if current else 0) or 0)
+            retryable = bool(api.get("retryable")) and retry_count < AI_SHADOW_RETRY_MAX_ATTEMPTS
+            if retryable:
+                retry_count += 1
+                retry_after = safe_float(api.get("retry_after_seconds"))
+                delay = float(retry_after) if retry_after is not None else float(min(AI_SHADOW_RETRY_MAX_SECONDS, AI_SHADOW_RETRY_BASE_SECONDS * (2 ** max(0, retry_count - 1))))
+                next_retry = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+                conn.execute("""UPDATE ai_regime_observer SET status='RETRY_WAIT',updated_at_utc=?,completed_at_utc=NULL,error=?,
+                                retry_count=?,next_retry_at_utc=?,last_http_status=?,last_retry_after_seconds=? WHERE raw_signal_id=?""",
+                             (now,safe_str(api.get("error"))[:4000],retry_count,next_retry,int(safe_float(api.get("http_status")) or 0),retry_after,int(raw_signal_id)))
+                api.update({"retry_scheduled":True,"retry_count":retry_count,"next_retry_at_utc":next_retry})
+            else:
+                conn.execute("""UPDATE ai_regime_observer SET status='ERROR',updated_at_utc=?,completed_at_utc=?,error=?,
+                                last_http_status=?,next_retry_at_utc=NULL WHERE raw_signal_id=?""",
+                             (now,now,safe_str(api.get("error"))[:4000],int(safe_float(api.get("http_status")) or 0),int(raw_signal_id)))
             conn.commit()
             return api
         d = api["decision"]
@@ -37115,7 +37151,12 @@ def process_ai_regime_observer(raw_signal_id):
                       safe_str(d.get("short_reason"))[:1500],safe_str(api.get("response_id")),
                       int(api.get("input_tokens") or 0),int(api.get("output_tokens") or 0),
                       AI_SHADOW_MODEL,int(raw_signal_id)))
+        conn.execute("UPDATE ai_regime_observer SET next_retry_at_utc=NULL,last_http_status=NULL WHERE raw_signal_id=?", (int(raw_signal_id),))
         conn.commit()
+    try:
+        sync_ai_veto_prospective_shadow(int(raw_signal_id))
+    except Exception as _veto_exc:
+        log_system_event("ai_veto_prospective_sync_error", f"raw_signal_id={raw_signal_id}: {_veto_exc}")
     return {"ok":True,"decision":d,"research_only":True}
 
 
@@ -37336,6 +37377,108 @@ def _ai_veto_group_summary(rows: List[Dict[str, Any]], label: str) -> Dict[str, 
         summary[f"without_ai_avoid_{h}h_r"] = kept_r
         summary[f"delta_{h}h_r_if_ai_avoid_veto"] = kept_r - all_r
     return summary
+
+
+def ensure_ai_veto_prospective_shadow_table() -> None:
+    """Durable research-only prospective AI-veto decision ledger.
+
+    This lane is deliberately isolated from broker/open_trades execution. It freezes the
+    AI decision at completion time and then tracks the corresponding core trade, if kept.
+    Vetoed candidates never become shadow positions. This is prospective evidence; it has
+    zero authority over deterministic execution.
+    """
+    with get_conn() as conn:
+        id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS ai_veto_prospective_shadow (
+            id {id_type}, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+            version TEXT NOT NULL, raw_signal_id BIGINT NOT NULL UNIQUE, asset TEXT, signal_time TEXT,
+            candidate_side TEXT, ai_entry_view TEXT, ai_confidence INTEGER, decision TEXT NOT NULL,
+            status TEXT NOT NULL, core_link_id BIGINT, broker_trade_id TEXT, execution_lane TEXT,
+            estimated_risk_gbp REAL, entry_price REAL, current_or_exit_price REAL,
+            shadow_pnl_gbp REAL, shadow_r REAL, opened_at_utc TEXT, closed_at_utc TEXT, note TEXT)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_veto_shadow_status ON ai_veto_prospective_shadow(status, created_at_utc)")
+        conn.commit()
+
+
+def sync_ai_veto_prospective_shadow(raw_signal_id: int) -> Dict[str, Any]:
+    ensure_ai_veto_prospective_shadow_table()
+    with get_conn() as conn:
+        ai = conn.execute("SELECT * FROM ai_regime_observer WHERE raw_signal_id=? AND status='COMPLETE' LIMIT 1", (int(raw_signal_id),)).fetchone()
+        if not ai or not int(safe_float(ai["live_candidate"]) or 0):
+            return {"ok":True,"skipped":True,"reason":"not_complete_candidate"}
+        ai = dict(ai); view=safe_str(ai.get("entry_view")).upper(); decision="VETO" if view=="AVOID" else "KEEP"
+        existing=conn.execute("SELECT id FROM ai_veto_prospective_shadow WHERE raw_signal_id=? LIMIT 1", (int(raw_signal_id),)).fetchone()
+        if not existing:
+            now=now_utc_iso()
+            conn.execute("""INSERT INTO ai_veto_prospective_shadow(created_at_utc,updated_at_utc,version,raw_signal_id,asset,signal_time,candidate_side,ai_entry_view,ai_confidence,decision,status,note)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         (now,now,AI_VETO_PROSPECTIVE_VERSION,int(raw_signal_id),safe_str(ai.get("asset")),safe_str(ai.get("signal_time")),safe_str(ai.get("candidate_side")).upper(),view,int(safe_float(ai.get("confidence")) or 0),decision,
+                          "VETOED" if decision=="VETO" else "WAITING_CORE_LINK",
+                          "Research only; AI has zero execution authority."))
+            conn.commit()
+    refresh_ai_veto_prospective_shadow()
+    return {"ok":True,"decision":decision,"research_only":True}
+
+
+def refresh_ai_veto_prospective_shadow(limit: int = 5000) -> Dict[str, Any]:
+    """Refresh KEEP rows from the matching deterministic core broker link.
+
+    Important: v1 is a *prospective veto/keep portfolio ledger*. It freezes decisions
+    prospectively and produces an investable-path sample without retrospectively choosing
+    winners. Kept trades currently inherit the core manager's close path; therefore this
+    lane does not yet claim second-order independent HWM/harvest/manager simulation.
+    """
+    ensure_ai_veto_prospective_shadow_table()
+    changed=0
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM ai_veto_prospective_shadow WHERE decision='KEEP' ORDER BY id ASC LIMIT ?", (max(1,min(int(limit or 5000),50000)),)).fetchall()]
+        links=_ai_veto_actual_link_map(conn)
+        for row in rows:
+            link=links.get(int(row["raw_signal_id"]))
+            if not link:
+                continue
+            st=safe_str(link.get("status")).upper(); pnl=safe_float(link.get("last_known_unrealized_pl")) if st=="OPEN" else safe_float(link.get("realized_pl")); risk=safe_float(link.get("estimated_risk_amount"))
+            shadow_r=(float(pnl)/float(risk)) if pnl is not None and risk not in (None,0) else None
+            status="OPEN" if st=="OPEN" else "CLOSED"
+            conn.execute("""UPDATE ai_veto_prospective_shadow SET updated_at_utc=?,status=?,core_link_id=?,broker_trade_id=?,execution_lane=?,estimated_risk_gbp=?,entry_price=?,current_or_exit_price=?,shadow_pnl_gbp=?,shadow_r=?,opened_at_utc=COALESCE(opened_at_utc,?),closed_at_utc=? WHERE raw_signal_id=?""",
+                         (now_utc_iso(),status,link.get("id"),safe_str(link.get("broker_trade_id")),safe_str(link.get("execution_lane")),risk,safe_float(link.get("fill_price")),safe_float(link.get("last_known_price")),pnl,shadow_r,safe_str(link.get("created_at_utc")),safe_str(link.get("closed_at_utc")) if status=="CLOSED" else None,int(row["raw_signal_id"])))
+            changed+=1
+        conn.commit()
+    return {"ok":True,"updated":changed,"research_only":True,"version":AI_VETO_PROSPECTIVE_VERSION}
+
+
+def build_ai_veto_prospective_summary(limit: int = 5000) -> Dict[str, Any]:
+    refresh_ai_veto_prospective_shadow(limit)
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("SELECT * FROM ai_veto_prospective_shadow ORDER BY id DESC LIMIT ?", (max(1,min(int(limit or 5000),50000)),)).fetchall()]
+    kept=[r for r in rows if r.get("decision")=="KEEP"]; veto=[r for r in rows if r.get("decision")=="VETO"]
+    return {"status":"ok","research_only":True,"execution_authority":False,"version":AI_VETO_PROSPECTIVE_VERSION,
+            "prospective_only":True,"rows":rows,"count":len(rows),"kept":len(kept),"vetoed":len(veto),
+            "open_kept":sum(1 for r in kept if r.get("status")=="OPEN"),"closed_kept":sum(1 for r in kept if r.get("status")=="CLOSED"),
+            "kept_shadow_pnl_gbp":sum(float(r.get("shadow_pnl_gbp") or 0.0) for r in kept),
+            "kept_shadow_r":sum(float(r.get("shadow_r") or 0.0) for r in kept),
+            "second_order_independent_manager":False,
+            "note":"Prospective AI veto/keep decisions are frozen before evaluation. KEEP trades currently follow the core manager close path; independent HWM/harvest/manager simulation remains intentionally disabled until separately validated."}
+
+
+@app.get("/ai-veto-prospective-shadow")
+def ai_veto_prospective_shadow_endpoint(limit: int = 5000) -> Dict[str, Any]:
+    snap=build_ai_veto_prospective_summary(limit)
+    return {k:v for k,v in snap.items() if k!="rows"}
+
+
+@app.get("/export/ai-veto-prospective-shadow.csv")
+def export_ai_veto_prospective_shadow_csv(limit: int = 5000) -> Response:
+    snap=build_ai_veto_prospective_summary(limit); rows=snap.get("rows") or []; out=io.StringIO()
+    if rows:
+        fields=[]
+        for row in rows:
+            for key in row:
+                if key not in fields: fields.append(key)
+        writer=csv.DictWriter(out,fieldnames=fields,extrasaction="ignore"); writer.writeheader(); writer.writerows(rows)
+    else:
+        out.write("note\nNo prospective AI-veto observations yet\n")
+    return Response(content=out.getvalue(),media_type="text/csv",headers={"Content-Disposition":'attachment; filename="ai-veto-prospective-shadow.csv"'})
 
 
 def build_ai_regime_veto_counterfactual(limit: int = 5000) -> Dict[str, Any]:
