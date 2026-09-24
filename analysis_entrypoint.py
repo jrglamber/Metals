@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "1.1.0"
-VISIBLE_RELEASE_VERSION = "v1.6.39"
+ANALYSIS_INTERFACE_VERSION = "2.0.0"
+VISIBLE_RELEASE_VERSION = "v1.6.40"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -47,6 +47,98 @@ def _health_snapshot() -> Dict[str, Any]:
     }
 
 
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _read_conn():
+    getter = getattr(core, "get_conn", None)
+    if not callable(getter):
+        raise RuntimeError("runtime does not expose get_conn")
+    return getter()
+
+
+def _table_inventory() -> Dict[str, Any]:
+    """Read-only Postgres schema inventory used to build producer-specific v2 views."""
+    try:
+        with _read_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_type='BASE TABLE'
+                ORDER BY table_name
+            """)
+            rows = cur.fetchall()
+            tables = []
+            for row in rows:
+                if isinstance(row, dict):
+                    tables.append(row.get("table_name"))
+                else:
+                    try:
+                        tables.append(row[0])
+                    except Exception:
+                        tables.append(str(row))
+            return {"ok": True, "tables": [t for t in tables if t]}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "tables": []}
+
+
+def _safe_table_count(table: str) -> Any:
+    # table names originate only from information_schema, never request input.
+    try:
+        with _read_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(f'SELECT COUNT(*) AS n FROM "{table}"')
+            row = cur.fetchone()
+            if isinstance(row, dict):
+                return next(iter(row.values()), None)
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+@app.get("/analysis/schema")
+def analysis_schema() -> Dict[str, Any]:
+    inv = _table_inventory()
+    return {
+        "status": "ok" if inv.get("ok") else "degraded",
+        "project": PROJECT_NAME,
+        "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
+        "app_version": VISIBLE_RELEASE_VERSION,
+        "read_only_interface": True,
+        "execution_authority": False,
+        "time_utc": _now(),
+        "data": inv,
+    }
+
+
+@app.get("/analysis/summary")
+def analysis_summary() -> Dict[str, Any]:
+    inv = _table_inventory()
+    tables = inv.get("tables", [])
+    # Compact counts only: enough to map the live research dataset without
+    # leaking credentials or shipping a giant database dump.
+    counts = {t: _safe_table_count(t) for t in tables}
+    return {
+        "status": "ok" if inv.get("ok") else "degraded",
+        "project": PROJECT_NAME,
+        "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
+        "app_version": VISIBLE_RELEASE_VERSION,
+        "read_only_interface": True,
+        "execution_authority": False,
+        "time_utc": _now(),
+        "data": {"table_counts": counts},
+    }
+
+
 @app.get("/analysis/status")
 def analysis_status() -> Dict[str, Any]:
     return {
@@ -62,8 +154,8 @@ def analysis_status() -> Dict[str, Any]:
         "time_utc": _now(),
         "operational_health": {"status": "ok", "checks": _health_snapshot()},
         "data": {
-            "producer_contract": "status-v1",
-            "rich_analysis": "pending-v2",
+            "producer_contract": "analysis-v2",
+            "rich_analysis": "schema-and-summary-ready",
         },
     }
 
