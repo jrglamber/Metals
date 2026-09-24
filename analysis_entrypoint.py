@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.5.0"
-VISIBLE_RELEASE_VERSION = "v1.6.46"
+ANALYSIS_INTERFACE_VERSION = "2.6.0"
+VISIBLE_RELEASE_VERSION = "v1.6.47"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -308,6 +308,40 @@ def metals_protection_generalisation_panel() -> Dict[str, Any]:
         return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,
           "app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),
           "study_version":"metals_protection_generalisation_v1","events":[],"error":type(exc).__name__+": "+str(exc)}
+
+
+
+@app.get("/analysis/adaptive-protection-context")
+def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
+    """Research-only state/repair ledger. No execution authority; future path is labels only."""
+    n=max(20,min(int(limit),250))
+    try:
+        rows=_recent_rows("metals_demo_basket_snapshots",n)
+        rows=list(reversed(rows)); out=[]; prev=None; peak=None
+        for x in rows:
+            side=str(x.get("side") or "").upper(); oc=int(x.get("open_count") or 0)
+            if oc<=0 or side in ("","FLAT","MIXED"): prev=None; peak=None; continue
+            br=float(x.get("basket_r") or 0); h=float(x.get("high_water_r") or br)
+            peak=max(float(peak or h),h); gb=(100*(peak-br)/peak) if peak and peak>0 else 0
+            delta=(br-float(prev.get("basket_r") or 0)) if prev else None
+            repair=bool(prev and float(prev.get("basket_r") or 0)<float(prev.get("high_water_r") or 0) and br>float(prev.get("basket_r") or 0))
+            out.append({"event_at":x.get("created_at_utc"),"side":side,"basket_r":br,"hwm_r":peak,
+              "hwm_pnl_gbp":x.get("high_water_pnl_gbp"),"giveback_pct":gb,"open_count":oc,
+              "delta_basket_r":delta,"repair_attempt":repair,
+              "state":{"giveback_accelerating":bool(prev and gb>float(prev.get("_gb") or 0)),
+                       "breadth_proxy_open_count":oc},
+              "_gb":gb})
+            prev=dict(x); prev["_gb"]=gb
+        for z in out: z.pop("_gb",None)
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1",
+          "news_layer_included":False,"principles":{"point_in_time_only":True,"future_fields_are_labels_only":True,
+          "observers":["volatility/regime","cross-market confirmation","change/acceleration","failed-repair quality","decision ledger/ablation"],
+          "note":"Current persisted basket snapshots seed acceleration/repair; external observers are forward-recording candidates, not retrospectively invented."},
+          "observations":out}
+    except Exception as exc:
+        return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
 @app.get("/analysis/catalog")
