@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.0.1"
-VISIBLE_RELEASE_VERSION = "v1.6.41"
+ANALYSIS_INTERFACE_VERSION = "2.1.0"
+VISIBLE_RELEASE_VERSION = "v1.6.42"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -99,6 +99,46 @@ def _safe_table_count(table: str) -> Any:
             return row[0] if row else None
     except Exception:
         return None
+
+
+ANALYSIS_TABLE_HINTS = ("signal", "trade", "hwm", "harvest", "manager", "exit", "challenger", "research", "execution", "basket", "highwater")
+
+
+@app.get("/analysis/catalog")
+def analysis_catalog() -> Dict[str, Any]:
+    """Compact research-table catalog: columns only, no row data."""
+    inv = _table_inventory()
+    tables = [t for t in inv.get("tables", []) if any(h in t.lower() for h in ANALYSIS_TABLE_HINTS)]
+    catalog: Dict[str, Any] = {}
+    try:
+        with _read_conn() as conn:
+            for table in tables:
+                rows = conn.execute("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=?
+                    ORDER BY ordinal_position
+                """, (table,)).fetchall()
+                cols = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        cols.append({"name": row.get("column_name"), "type": row.get("data_type")})
+                    else:
+                        cols.append({"name": row[0], "type": row[1]})
+                catalog[table] = cols
+        status, error = "ok", None
+    except Exception as exc:
+        status, error = "degraded", f"{type(exc).__name__}: {exc}"
+    return {
+        "status": status,
+        "project": PROJECT_NAME,
+        "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
+        "app_version": VISIBLE_RELEASE_VERSION,
+        "read_only_interface": True,
+        "execution_authority": False,
+        "time_utc": _now(),
+        "data": {"catalog": catalog, "error": error},
+    }
 
 
 @app.get("/analysis/schema")
