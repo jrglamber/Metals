@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.3.0"
-VISIBLE_RELEASE_VERSION = "v1.6.44"
+ANALYSIS_INTERFACE_VERSION = "2.4.0"
+VISIBLE_RELEASE_VERSION = "v1.6.45"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -196,6 +196,45 @@ def analysis_episode_index(limit: int = 100) -> Dict[str, Any]:
                     {k: _jsonable(v) for k, v in (row.items() if isinstance(row, dict) else zip(cols, row))}
                     for row in rows
                 ]
+                # Reconstruct economic family episodes only from observable lifecycle
+                # boundaries. A new episode begins when a non-flat METALS_BASKET
+                # follows a flat/zero-open snapshot, or when family direction changes.
+                seq = conn.execute("""
+                    SELECT id, created_at_utc, side, open_count, basket_r,
+                           high_water_r, high_water_pnl_gbp, giveback_pct
+                    FROM metals_demo_basket_snapshots
+                    WHERE basket_key='METALS_BASKET'
+                    ORDER BY created_at_utc, id
+                """).fetchall()
+                episodes, current, prev_side, prev_open = [], None, None, 0
+                for r in seq:
+                    x = dict(r) if isinstance(r, dict) else dict(zip(
+                        ("id","created_at_utc","side","open_count","basket_r","high_water_r","high_water_pnl_gbp","giveback_pct"), r))
+                    side = str(x.get("side") or "").upper()
+                    oc = int(x.get("open_count") or 0)
+                    active = oc > 0 and side not in ("", "FLAT", "MIXED")
+                    boundary = active and (prev_open == 0 or (prev_side not in (None,"","FLAT","MIXED") and side != prev_side))
+                    if boundary or (active and current is None):
+                        if current:
+                            episodes.append(current)
+                        current = {"episode_id": f"METALS_{side}_{x.get('created_at_utc')}",
+                                   "side": side, "first_seen_at": x.get("created_at_utc"),
+                                   "last_seen_at": x.get("created_at_utc"), "max_open_count": oc,
+                                   "max_high_water_r": x.get("high_water_r"), "max_high_water_pnl_gbp": x.get("high_water_pnl_gbp"),
+                                   "min_basket_r": x.get("basket_r"), "max_basket_r": x.get("basket_r"),
+                                   "max_giveback_pct": x.get("giveback_pct"), "snapshot_count": 0}
+                    if current and active:
+                        current["last_seen_at"] = x.get("created_at_utc")
+                        current["snapshot_count"] += 1
+                        for k, v in (("max_open_count",oc),("max_high_water_r",x.get("high_water_r")),
+                                     ("max_high_water_pnl_gbp",x.get("high_water_pnl_gbp")),
+                                     ("max_basket_r",x.get("basket_r")),("max_giveback_pct",x.get("giveback_pct"))):
+                            if v is not None and (current.get(k) is None or v > current[k]): current[k] = v
+                        v=x.get("basket_r")
+                        if v is not None and (current.get("min_basket_r") is None or v < current["min_basket_r"]): current["min_basket_r"]=v
+                    prev_open, prev_side = oc, side
+                if current: episodes.append(current)
+                data["economic_episodes"] = list(reversed(episodes[-bounded:]))
             if "metals_xau_live_hwm_events" in inv:
                 row = conn.execute("""
                     SELECT MAX(high_water_gbp) AS max_high_water_gbp,
