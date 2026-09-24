@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.6.1"
-VISIBLE_RELEASE_VERSION = "v1.6.48"
+ANALYSIS_INTERFACE_VERSION = "2.7.0"
+VISIBLE_RELEASE_VERSION = "v1.6.49"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -347,6 +347,37 @@ def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
     except Exception as exc:
         return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
           "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
+
+
+
+@app.get("/analysis/repair-quality-study")
+def metals_repair_quality_study(limit: int = 250) -> Dict[str, Any]:
+    """Sequence-level failed-repair observer from aggregate basket snapshots."""
+    try:
+        raw=metals_adaptive_protection_context(limit)
+        obs=raw.get("observations") or []; episodes=[]; active=None
+        for x in obs:
+            gb=float(x.get("giveback_pct") or 0); br=float(x.get("basket_r") or 0); h=float(x.get("hwm_r") or 0)
+            if active is None and gb>=20:
+                active={"start_at":x.get("event_at"),"start_giveback_pct":gb,"start_r":br,"hwm_r":h,
+                  "worst_giveback_pct":gb,"best_repair_r":br,"repair_observations":0,"new_hwm_after_start":False}
+            elif active is not None:
+                active["worst_giveback_pct"]=max(active["worst_giveback_pct"],gb)
+                if br>active["best_repair_r"]:
+                    active["best_repair_r"]=br; active["repair_observations"]+=1
+                if gb<=0.5 and h>=active["hwm_r"]:
+                    active["new_hwm_after_start"]=True; active["end_at"]=x.get("event_at"); active["outcome"]="REPAIRED_TO_HWM"; episodes.append(active); active=None
+                elif gb>=60:
+                    active["end_at"]=x.get("event_at"); active["outcome"]="FAILED_REPAIR_60PCT_GIVEBACK"
+                    denom=max(1e-9,active["hwm_r"]-active["start_r"])
+                    active["repair_fraction_of_initial_loss"]=max(0.0,min(1.0,(active["best_repair_r"]-active["start_r"])/denom))
+                    episodes.append(active); active=None
+        if active: active["outcome"]="OPEN_SEQUENCE"; episodes.append(active)
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_repair_quality_v1",
+          "thresholds_are_descriptive_not_optimized":True,"episodes":episodes}
+    except Exception as exc:
+        return {"status":"error","error":type(exc).__name__+": "+str(exc),"episodes":[]}
 
 
 @app.get("/analysis/catalog")
