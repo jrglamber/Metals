@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.0.0"
-VISIBLE_RELEASE_VERSION = "v1.6.40"
+ANALYSIS_INTERFACE_VERSION = "2.0.1"
+VISIBLE_RELEASE_VERSION = "v1.6.41"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -69,14 +69,12 @@ def _table_inventory() -> Dict[str, Any]:
     """Read-only Postgres schema inventory used to build producer-specific v2 views."""
     try:
         with _read_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
+            rows = conn.execute("""
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema='public' AND table_type='BASE TABLE'
                 ORDER BY table_name
-            """)
-            rows = cur.fetchall()
+            """).fetchall()
             tables = []
             for row in rows:
                 if isinstance(row, dict):
@@ -95,9 +93,7 @@ def _safe_table_count(table: str) -> Any:
     # table names originate only from information_schema, never request input.
     try:
         with _read_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(f'SELECT COUNT(*) AS n FROM "{table}"')
-            row = cur.fetchone()
+            row = conn.execute(f'SELECT COUNT(*) AS n FROM "{table}"').fetchone()
             if isinstance(row, dict):
                 return next(iter(row.values()), None)
             return row[0] if row else None
