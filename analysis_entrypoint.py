@@ -11,8 +11,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 import app_postgres_runtime as core
+from fastapi import FastAPI
 
-app = core.app
+# Keep a stable outer app: the core runtime may rebuild/rebind its FastAPI
+# object during import/startup. Analysis routes live on this wrapper and the
+# unchanged production application is mounted only after those routes exist.
+app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
 ANALYSIS_INTERFACE_VERSION = "1.0.0"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
@@ -73,3 +77,7 @@ def analysis_quality() -> Dict[str, Any]:
         "time_utc": _now(),
         "checks": checks,
     }
+
+
+# Catch-all mount must remain last so the explicit /analysis/* routes above win.
+app.mount("/", core.app)
