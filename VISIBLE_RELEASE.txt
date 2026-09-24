@@ -1,0 +1,2 @@
+Metals v1.6.39 visible release
+Analysis interface release marker. Core runtime file is intentionally unchanged in this commit.

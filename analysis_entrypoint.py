@@ -17,7 +17,8 @@ from fastapi import FastAPI
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "1.0.0"
+ANALYSIS_INTERFACE_VERSION = "1.1.0"
+VISIBLE_RELEASE_VERSION = "v1.6.39"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -52,7 +53,7 @@ def analysis_status() -> Dict[str, Any]:
         "project": PROJECT_NAME,
         "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
         "app_name": _safe_attr("APP_NAME"),
-        "app_version": _safe_attr("APP_VERSION"),
+        "app_version": _safe_attr("APP_VERSION") or _safe_attr("METALS_APP_VERSION") or _safe_attr("BUILD_VERSION") or VISIBLE_RELEASE_VERSION,
         "policy_version": _safe_attr("POLICY_VERSION"),
         "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("OANDA_ENV") or os.getenv("METALS_DEMO_OANDA_ENV"),
         "read_only_interface": True,
