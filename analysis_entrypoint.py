@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.4.0"
-VISIBLE_RELEASE_VERSION = "v1.6.45"
+ANALYSIS_INTERFACE_VERSION = "2.5.0"
+VISIBLE_RELEASE_VERSION = "v1.6.46"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -259,6 +259,57 @@ def analysis_episode_index(limit: int = 100) -> Dict[str, Any]:
     }
 
 
+
+@app.get("/analysis/protection-generalisation-panel")
+def metals_protection_generalisation_panel() -> Dict[str, Any]:
+    """Read-only anti-curve-fit pullback panel across reconstructed Metals episodes."""
+    try:
+        with _read_conn() as conn:
+            raw=conn.execute("""
+              SELECT id,created_at_utc,side,open_count,basket_r,high_water_r,high_water_pnl_gbp,giveback_pct
+              FROM metals_demo_basket_snapshots WHERE basket_key='METALS_BASKET'
+              ORDER BY created_at_utc,id
+            """).fetchall()
+        seq=[dict(r) if isinstance(r,dict) else {} for r in raw]
+        episodes=[]; cur=[]; prev_side=None; prev_open=0
+        for x in seq:
+            side=str(x.get("side") or "").upper(); oc=int(x.get("open_count") or 0)
+            active=oc>0 and side not in ("","FLAT","MIXED")
+            boundary=active and (prev_open==0 or (prev_side not in (None,"","FLAT","MIXED") and side!=prev_side))
+            if boundary and cur: episodes.append(cur); cur=[]
+            if active: cur.append(x)
+            elif cur: episodes.append(cur); cur=[]
+            prev_side,prev_open=side,oc
+        if cur: episodes.append(cur)
+        events=[]; thresholds=[25,40,50,60]
+        for ep in episodes:
+            if not ep: continue
+            eid="METALS_"+str(ep[0].get("side"))+"_"+str(ep[0].get("created_at_utc"))
+            seen=set()
+            for i,x in enumerate(ep):
+                hwm=float(x.get("high_water_r") or 0); br=float(x.get("basket_r") or 0)
+                if hwm<10: continue
+                gb=float(x.get("giveback_pct") or (100*(hwm-br)/hwm if hwm else 0))
+                for t in thresholds:
+                    if t in seen or gb<t: continue
+                    seen.add(t); future=[float(y.get("basket_r") or 0) for y in ep[i:]]
+                    events.append({"episode_id":eid,"side":x.get("side"),"event_at":_jsonable(x.get("created_at_utc")),
+                      "hwm_r":hwm,"hwm_pnl_gbp":x.get("high_water_pnl_gbp"),"threshold_pct":t,
+                      "observed_giveback_pct":gb,"basket_r":br,"open_count":x.get("open_count"),
+                      "subsequent_max_r":max(future) if future else br,"subsequent_min_r":min(future) if future else br,
+                      "subsequent_recovery_r":(max(future)-br) if future else 0,
+                      "subsequent_new_hwm":(max(future)>hwm+1e-9) if future else False})
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,
+          "app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),
+          "study_version":"metals_protection_generalisation_v1","anti_curve_fit_design":{"minimum_hwm_r":10,
+          "giveback_thresholds_pct":thresholds,"future_fields_are_labels_only":True,"thresholds_not_optimized":True},
+          "events":events}
+    except Exception as exc:
+        return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,
+          "app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),
+          "study_version":"metals_protection_generalisation_v1","events":[],"error":type(exc).__name__+": "+str(exc)}
+
+
 @app.get("/analysis/catalog")
 def analysis_catalog() -> Dict[str, Any]:
     """Compact research-table catalog: columns only, no row data."""
@@ -337,7 +388,7 @@ def analysis_status() -> Dict[str, Any]:
         "project": PROJECT_NAME,
         "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
         "app_name": _safe_attr("APP_NAME"),
-        "app_version": _safe_attr("APP_VERSION") or _safe_attr("METALS_APP_VERSION") or _safe_attr("BUILD_VERSION") or VISIBLE_RELEASE_VERSION,
+        "app_version": VISIBLE_RELEASE_VERSION,
         "policy_version": _safe_attr("POLICY_VERSION"),
         "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("OANDA_ENV") or os.getenv("METALS_DEMO_OANDA_ENV"),
         "read_only_interface": True,
