@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.2.0"
-VISIBLE_RELEASE_VERSION = "v1.6.43"
+ANALYSIS_INTERFACE_VERSION = "2.3.0"
+VISIBLE_RELEASE_VERSION = "v1.6.44"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -163,6 +163,60 @@ def analysis_slice(slice_name: str, limit: int = 100) -> Dict[str, Any]:
         "read_only_interface":True,"execution_authority":False,
         "time_utc":_now(),"slice":slice_name,"limit_per_table":max(1,min(int(limit),250)),
         "data":data,
+    }
+
+
+@app.get("/analysis/episode-index")
+def analysis_episode_index(limit: int = 100) -> Dict[str, Any]:
+    """Compact cycle-aware history for selecting episodes before drill-down."""
+    bounded = max(1, min(int(limit), 250))
+    data: Dict[str, Any] = {"demo_baskets": [], "xau_live_baskets": []}
+    inv = set(_table_inventory().get("tables", []))
+    try:
+        with _read_conn() as conn:
+            if "metals_demo_basket_snapshots" in inv:
+                rows = conn.execute("""
+                    SELECT basket_key, asset, side,
+                           MIN(created_at_utc) AS first_seen_at,
+                           MAX(created_at_utc) AS last_seen_at,
+                           MAX(open_count) AS max_open_count,
+                           MAX(high_water_r) AS max_high_water_r,
+                           MAX(high_water_pnl_gbp) AS max_high_water_pnl_gbp,
+                           MIN(basket_r) AS min_basket_r,
+                           MAX(basket_r) AS max_basket_r,
+                           MAX(giveback_pct) AS max_giveback_pct,
+                           COUNT(*) AS snapshot_count
+                    FROM metals_demo_basket_snapshots
+                    GROUP BY basket_key, asset, side
+                    ORDER BY max_high_water_pnl_gbp DESC NULLS LAST
+                    LIMIT ?
+                """, (bounded,)).fetchall()
+                cols = ("basket_key","asset","side","first_seen_at","last_seen_at","max_open_count","max_high_water_r","max_high_water_pnl_gbp","min_basket_r","max_basket_r","max_giveback_pct","snapshot_count")
+                data["demo_baskets"] = [
+                    {k: _jsonable(v) for k, v in (row.items() if isinstance(row, dict) else zip(cols, row))}
+                    for row in rows
+                ]
+            if "metals_xau_live_hwm_events" in inv:
+                row = conn.execute("""
+                    SELECT MAX(high_water_gbp) AS max_high_water_gbp,
+                           MAX(high_water_r) AS max_high_water_r,
+                           MIN(created_at_utc) AS first_seen_at,
+                           MAX(created_at_utc) AS last_seen_at,
+                           COUNT(*) AS event_count
+                    FROM metals_xau_live_hwm_events
+                """).fetchone()
+                if row:
+                    cols = ("max_high_water_gbp","max_high_water_r","first_seen_at","last_seen_at","event_count")
+                    data["xau_live_baskets"] = [{k: _jsonable(v) for k, v in (row.items() if isinstance(row, dict) else zip(cols, row))}]
+        status, error = "ok", None
+    except Exception as exc:
+        status, error = "degraded", f"{type(exc).__name__}: {exc}"
+    return {
+        "status": status, "project": PROJECT_NAME,
+        "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
+        "app_version": VISIBLE_RELEASE_VERSION,
+        "read_only_interface": True, "execution_authority": False,
+        "time_utc": _now(), "limit": bounded, "error": error, "data": data,
     }
 
 
