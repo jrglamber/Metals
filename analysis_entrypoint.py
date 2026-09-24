@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.1.0"
-VISIBLE_RELEASE_VERSION = "v1.6.42"
+ANALYSIS_INTERFACE_VERSION = "2.2.0"
+VISIBLE_RELEASE_VERSION = "v1.6.43"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -102,6 +102,68 @@ def _safe_table_count(table: str) -> Any:
 
 
 ANALYSIS_TABLE_HINTS = ("signal", "trade", "hwm", "harvest", "manager", "exit", "challenger", "research", "execution", "basket", "highwater")
+
+
+ANALYSIS_SLICE_TABLES = {
+    "trades": ("closed_trades", "open_trades", "broker_trade_links"),
+    "signals": ("raw_signals", "live_signal_pipeline_audit", "metals_signal_processing_audit", "index_pair_delivery_audit"),
+    "execution": ("execution_audit_events", "metals_demo_execution_audit", "metals_xau_live_execution_audit"),
+    "harvest": ("broker_harvest_events", "metals_demo_harvest_events", "metals_xau_live_harvest_events", "live_highwater_banking_research"),
+    "hwm": ("metals_demo_hwm_events", "metals_xau_live_hwm_events", "active_basket_cycles", "active_family_basket_cycles"),
+    "exits": ("post48_review_log", "dynamic_exit_shadow_trades", "atr2_exit_shadow_research", "metals_exit_challenger_shadow"),
+    "research": ("index_entry_challenger_shadow", "index_directional_intelligence_research", "metals_directional_intelligence_research", "metals_focused_highwater", "metals_focused_recovery", "metals_focused_efficiency", "metals_focused_alignment"),
+}
+
+def _table_columns(table: str):
+    with _read_conn() as conn:
+        rows = conn.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=?
+            ORDER BY ordinal_position
+        """, (table,)).fetchall()
+    return [r.get("column_name") if isinstance(r, dict) else r[0] for r in rows]
+
+def _recent_rows(table: str, limit: int = 100):
+    inv = set(_table_inventory().get("tables", []))
+    if table not in inv:
+        return []
+    cols = _table_columns(table)
+    order_col = next((x for x in ("created_at_utc","updated_at_utc","signal_time","entry_time","exit_time","id") if x in cols), None)
+    sql = f'SELECT * FROM "{table}"'
+    if order_col:
+        sql += f' ORDER BY "{order_col}" DESC'
+    sql += ' LIMIT ?'
+    with _read_conn() as conn:
+        rows = conn.execute(sql, (max(1, min(int(limit), 250)),)).fetchall()
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append({k: _jsonable(v) for k, v in row.items()})
+        else:
+            out.append({cols[i]: _jsonable(v) for i, v in enumerate(row)})
+    return out
+
+@app.get("/analysis/slice/{slice_name}")
+def analysis_slice(slice_name: str, limit: int = 100) -> Dict[str, Any]:
+    allowed = ANALYSIS_SLICE_TABLES.get(slice_name)
+    if not allowed:
+        return {"status":"error","error":"unknown analysis slice","allowed":sorted(ANALYSIS_SLICE_TABLES)}
+    inv = set(_table_inventory().get("tables", []))
+    data = {}
+    for table in allowed:
+        if table in inv:
+            try:
+                data[table] = _recent_rows(table, limit)
+            except Exception as exc:
+                data[table] = {"error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "status":"ok","project":PROJECT_NAME,
+        "analysis_interface_version":ANALYSIS_INTERFACE_VERSION,
+        "app_version":VISIBLE_RELEASE_VERSION,
+        "read_only_interface":True,"execution_authority":False,
+        "time_utc":_now(),"slice":slice_name,"limit_per_table":max(1,min(int(limit),250)),
+        "data":data,
+    }
 
 
 @app.get("/analysis/catalog")
