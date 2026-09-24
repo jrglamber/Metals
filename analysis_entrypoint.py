@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.6.0"
-VISIBLE_RELEASE_VERSION = "v1.6.47"
+ANALYSIS_INTERFACE_VERSION = "2.6.1"
+VISIBLE_RELEASE_VERSION = "v1.6.48"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -317,11 +317,16 @@ def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
     n=max(20,min(int(limit),250))
     try:
         rows=_recent_rows("metals_demo_basket_snapshots",n)
-        rows=list(reversed(rows)); out=[]; prev=None; peak=None
+        rows=list(reversed(rows)); out=[]; prev=None; peak=None; prev_key=None
         for x in rows:
             side=str(x.get("side") or "").upper(); oc=int(x.get("open_count") or 0)
-            if oc<=0 or side in ("","FLAT","MIXED"): prev=None; peak=None; continue
+            if oc<=0 or side in ("","FLAT","MIXED"): prev=None; peak=None; prev_key=None; continue
             br=float(x.get("basket_r") or 0); h=float(x.get("high_water_r") or br)
+            key=(x.get("created_at_utc"),side,oc,round(br,8),round(h,8))
+            if key==prev_key: continue
+            # Snapshot table can contain component/sub-basket rows. Reject obvious partial-state artifacts
+            # where the persisted HWM PnL is zero while the aggregate episode HWM is positive.
+            if peak and float(x.get("high_water_pnl_gbp") or 0)==0 and h < peak: continue
             peak=max(float(peak or h),h); gb=(100*(peak-br)/peak) if peak and peak>0 else 0
             delta=(br-float(prev.get("basket_r") or 0)) if prev else None
             repair=bool(prev and float(prev.get("basket_r") or 0)<float(prev.get("high_water_r") or 0) and br>float(prev.get("basket_r") or 0))
@@ -331,7 +336,7 @@ def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
               "state":{"giveback_accelerating":bool(prev and gb>float(prev.get("_gb") or 0)),
                        "breadth_proxy_open_count":oc},
               "_gb":gb})
-            prev=dict(x); prev["_gb"]=gb
+            prev=dict(x); prev["_gb"]=gb; prev_key=key
         for z in out: z.pop("_gb",None)
         return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
           "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1",
