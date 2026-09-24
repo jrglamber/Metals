@@ -11,8 +11,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 import app_postgres_runtime as core
+from fastapi import FastAPI
 
-app = core.app
+# Do not attach routes to core.app here: the large runtime rebuilds/rebinds its
+# FastAPI object during import/startup. Mounting it under a stable wrapper keeps
+# the analysis routes present while preserving the core application unchanged.
+app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
+app.mount("/", core.app)
 ANALYSIS_INTERFACE_VERSION = "1.0.0"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
