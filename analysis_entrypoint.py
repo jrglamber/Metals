@@ -360,6 +360,58 @@ def metals_repair_quality_study(limit: int = 250) -> Dict[str, Any]:
         return {"status":"error","error":type(exc).__name__+": "+str(exc),"episodes":[]}
 
 
+@app.get("/analysis/adaptive-protection-phase2-cohorts")
+def metals_adaptive_protection_phase2_cohorts(limit: int = 250) -> Dict[str, Any]:
+    """Research-only exact link-id cohort reconstruction from manager reviews."""
+    n=max(50,min(int(limit),1000))
+    try:
+        with _read_conn() as conn:
+            raw=conn.execute("""
+              SELECT r.id,r.created_at_utc,r.review_signal_id,r.link_id,r.asset,r.instrument,r.side,
+                     r.current_r,r.high_water_r,r.giveback_pct,r.manager_phase,r.decision,
+                     l.broker_trade_id,l.status,l.signal_time,l.closed_at_utc
+              FROM metals_demo_manager_reviews r
+              JOIN metals_demo_trade_links l ON l.id=r.link_id
+              ORDER BY r.created_at_utc DESC,r.id DESC LIMIT ?
+            """,(n,)).fetchall()
+        rows=list(reversed([dict(x) if isinstance(x,dict) else {} for x in raw]))
+        batches={}
+        for x in rows:
+            key=(str(x.get("created_at_utc") or ""),str(x.get("side") or "").upper())
+            batches.setdefault(key,[]).append(x)
+        obs=[]
+        for (ts,side),grp in sorted(batches.items()):
+            if side in ("","FLAT","MIXED"): continue
+            ids=tuple(sorted({int(x.get("link_id")) for x in grp if x.get("link_id") is not None}))
+            if not ids: continue
+            rs=[float(x.get("current_r") or 0) for x in grp]
+            obs.append({"event_at":ts,"side":side,"cohort_link_ids":list(ids),"cohort_size":len(ids),
+                        "basket_r":sum(rs),"trade_hwm_r_sum":sum(float(x.get("high_water_r") or 0) for x in grp)})
+        # Compare only consecutive observations with the exact same constituent set.
+        prev=None; peak_by_cohort={}; out=[]
+        for x in obs:
+            sig=(x["side"],tuple(x["cohort_link_ids"]))
+            peak_by_cohort[sig]=max(float(peak_by_cohort.get(sig,x["basket_r"])),float(x["basket_r"]))
+            peak=peak_by_cohort[sig]
+            comparable=bool(prev is not None and (prev["side"],tuple(prev["cohort_link_ids"]))==sig)
+            delta=(float(x["basket_r"])-float(prev["basket_r"])) if comparable else None
+            gb=(100.0*(peak-float(x["basket_r"]))/peak) if peak>0 else 0.0
+            out.append({**x,"cohort_hwm_r":peak,"giveback_pct":gb,"cohort_comparable":comparable,
+                        "exclusion_reason":None if comparable or prev is None else "trade_set_changed",
+                        "delta_basket_r":delta,
+                        "repair_attempt":bool(delta is not None and delta>0 and float(x["basket_r"])<peak)})
+            prev=x
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,
+                "app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,
+                "time_utc":_now(),"study_version":"metals_phase2_exact_cohort_v1",
+                "cohort_policy":"exact sorted manager-review link_id set; changed sets excluded from economic deltas",
+                "future_fields_are_labels_only":True,"thresholds_not_optimized":True,"observations":out}
+    except Exception as exc:
+        return {"status":"error","project":PROJECT_NAME,"read_only_interface":True,"execution_authority":False,
+                "study_version":"metals_phase2_exact_cohort_v1","observations":[],
+                "error":type(exc).__name__+": "+str(exc)}
+
+
 @app.get("/analysis/catalog")
 def analysis_catalog() -> Dict[str, Any]:
     """Compact research-table catalog: columns only, no row data."""
