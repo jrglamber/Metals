@@ -18,8 +18,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.8.0"
-VISIBLE_RELEASE_VERSION = "v1.6.50"
+ANALYSIS_INTERFACE_VERSION = "2.9.0"
+VISIBLE_RELEASE_VERSION = "v1.6.51"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -313,80 +313,52 @@ def metals_protection_generalisation_panel() -> Dict[str, Any]:
 
 @app.get("/analysis/adaptive-protection-context")
 def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
-    """Research-only state/repair ledger. No execution authority; future path is labels only."""
+    """Research-only state/repair ledger from canonical METALS_BASKET snapshots."""
     n=max(20,min(int(limit),250))
     try:
-        rows=_recent_rows("metals_demo_basket_snapshots",n)
-        rows=list(reversed(rows)); out=[]; prev=None; peak=None; prev_key=None
+        with _read_conn() as conn:
+            raw=conn.execute("""SELECT id,created_at_utc,side,open_count,basket_r,high_water_r,high_water_pnl_gbp,giveback_pct FROM metals_demo_basket_snapshots WHERE basket_key='METALS_BASKET' ORDER BY created_at_utc DESC,id DESC LIMIT ?""",(n,)).fetchall()
+        rows=list(reversed([dict(r) if isinstance(r,dict) else {} for r in raw])); out=[]; prev=None; peak=None; prev_side=None
         for x in rows:
             side=str(x.get("side") or "").upper(); oc=int(x.get("open_count") or 0)
-            if oc<=0 or side in ("","FLAT","MIXED"): prev=None; peak=None; prev_key=None; continue
-            br=float(x.get("basket_r") or 0); h=float(x.get("high_water_r") or br)
-            key=(x.get("created_at_utc"),side,oc,round(br,8),round(h,8))
-            if key==prev_key: continue
-            # Snapshot table can contain component/sub-basket rows. Reject obvious partial-state artifacts
-            # where the persisted HWM PnL is zero while the aggregate episode HWM is positive.
-            if peak and float(x.get("high_water_pnl_gbp") or 0)==0 and h < peak: continue
-            peak=max(float(peak or h),h); gb=(100*(peak-br)/peak) if peak and peak>0 else 0
-            delta=(br-float(prev.get("basket_r") or 0)) if prev else None
-            repair=bool(prev and float(prev.get("basket_r") or 0)<float(prev.get("high_water_r") or 0) and br>float(prev.get("basket_r") or 0))
-            out.append({"event_at":x.get("created_at_utc"),"side":side,"basket_r":br,"hwm_r":peak,
-              "hwm_pnl_gbp":x.get("high_water_pnl_gbp"),"giveback_pct":gb,"open_count":oc,
-              "delta_basket_r":delta,"repair_attempt":repair,
-              "state":{"giveback_accelerating":bool(prev and gb>float(prev.get("_gb") or 0)),
-                       "breadth_proxy_open_count":oc},
-              "_gb":gb})
-            prev=dict(x); prev["_gb"]=gb; prev_key=key
-        for z in out: z.pop("_gb",None)
-        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
-          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1",
-          "news_layer_included":False,"principles":{"point_in_time_only":True,"future_fields_are_labels_only":True,
-          "observers":["volatility/regime","cross-market confirmation","change/acceleration","failed-repair quality","decision ledger/ablation"],
-          "note":"Current persisted basket snapshots seed acceleration/repair; external observers are forward-recording candidates, not retrospectively invented."},
-          "observations":out}
+            if oc<=0 or side in ("","FLAT","MIXED"):
+                prev=None; peak=None; prev_side=None; continue
+            if prev_side is not None and side!=prev_side: prev=None; peak=None
+            br=float(x.get("basket_r") or 0); persisted_h=float(x.get("high_water_r") or br); peak=max(float(peak if peak is not None else persisted_h),persisted_h,br)
+            gb=(100*(peak-br)/peak) if peak>0 else 0; delta=(br-float(prev["basket_r"])) if prev else None
+            out.append({"event_at":_jsonable(x.get("created_at_utc")),"side":side,"basket_r":br,"hwm_r":peak,"hwm_pnl_gbp":x.get("high_water_pnl_gbp"),"giveback_pct":gb,"open_count":oc,
+              "delta_basket_r":delta,"repair_attempt":bool(delta is not None and delta>0 and br<peak),"state":{"giveback_accelerating":bool(prev and gb>prev["gb"]),"breadth_proxy_open_count":oc}})
+            prev={"basket_r":br,"gb":gb}; prev_side=side
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),
+          "study_version":"metals_adaptive_context_v2","canonical_snapshot_filter":"basket_key=METALS_BASKET","news_layer_included":False,"observations":out}
     except Exception as exc:
-        return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
-          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_adaptive_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
-
+        return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
 @app.get("/analysis/repair-quality-study")
 def metals_repair_quality_study(limit: int = 250) -> Dict[str, Any]:
-    """Consolidated deterioration/repair episodes from aggregate basket snapshots."""
+    """Consolidated deterioration/repair episodes from canonical aggregate snapshots."""
     try:
-        raw=metals_adaptive_protection_context(limit)
-        obs=raw.get("observations") or []; episodes=[]; active=None
+        obs=(metals_adaptive_protection_context(limit).get("observations") or []); episodes=[]; active=None; active_side=None
         for x in obs:
-            gb=float(x.get("giveback_pct") or 0); br=float(x.get("basket_r") or 0); h=float(x.get("hwm_r") or 0)
+            side=x.get("side"); gb=float(x.get("giveback_pct") or 0); br=float(x.get("basket_r") or 0); h=float(x.get("hwm_r") or 0)
+            if active is not None and side!=active_side:
+                active["outcome"]="ENDED_ON_DIRECTION_CHANGE"; episodes.append(active); active=None
             if active is None:
-                if gb>=20:
-                    active={"start_at":x.get("event_at"),"start_giveback_pct":gb,"start_r":br,"hwm_r":h,
-                      "worst_giveback_pct":gb,"best_repair_r":br,"repair_observations":0,"new_hwm_after_start":False,
-                      "crossed_60pct":gb>=60,"first_60pct_at":x.get("event_at") if gb>=60 else None}
+                if h>=10 and gb>=20:
+                    active={"side":side,"start_at":x.get("event_at"),"start_giveback_pct":gb,"start_r":br,"hwm_r":h,"worst_giveback_pct":gb,"best_repair_r":br,"repair_observations":0,"new_hwm_after_start":False,"crossed_60pct":gb>=60,"first_60pct_at":x.get("event_at") if gb>=60 else None}; active_side=side
                 continue
             active["worst_giveback_pct"]=max(active["worst_giveback_pct"],gb)
-            if br>active["best_repair_r"]:
-                active["best_repair_r"]=br; active["repair_observations"]+=1
-            if gb>=60 and not active["crossed_60pct"]:
-                active["crossed_60pct"]=True; active["first_60pct_at"]=x.get("event_at")
-            # A 60% crossing is evidence inside the same episode, not a new episode boundary.
-            # Close only on genuine repair to HWM; otherwise retain one open deterioration path.
+            if br>active["best_repair_r"]: active["best_repair_r"]=br; active["repair_observations"]+=1
+            if gb>=60 and not active["crossed_60pct"]: active["crossed_60pct"]=True; active["first_60pct_at"]=x.get("event_at")
             if gb<=0.5 and h>=active["hwm_r"]:
-                active["new_hwm_after_start"]=True; active["end_at"]=x.get("event_at"); active["outcome"]="REPAIRED_TO_HWM"
-                denom=max(1e-9,active["hwm_r"]-active["start_r"])
-                active["repair_fraction_of_initial_loss"]=max(0.0,min(1.0,(active["best_repair_r"]-active["start_r"])/denom))
-                episodes.append(active); active=None
+                active["new_hwm_after_start"]=True; active["end_at"]=x.get("event_at"); active["outcome"]="REPAIRED_TO_HWM"; denom=max(1e-9,active["hwm_r"]-active["start_r"]); active["repair_fraction_of_initial_loss"]=max(0.0,min(1.0,(active["best_repair_r"]-active["start_r"])/denom)); episodes.append(active); active=None
         if active:
-            denom=max(1e-9,active["hwm_r"]-active["start_r"])
-            active["repair_fraction_of_initial_loss"]=max(0.0,min(1.0,(active["best_repair_r"]-active["start_r"])/denom))
-            active["outcome"]="OPEN_FAILED_REPAIR_PATH" if active["crossed_60pct"] else "OPEN_SEQUENCE"
-            episodes.append(active)
-        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
-          "read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_repair_quality_v2",
-          "thresholds_are_descriptive_not_optimized":True,"episode_policy":"20pct starts; 60pct is an in-episode deterioration marker; only HWM repair closes",
-          "episodes":episodes}
+            denom=max(1e-9,active["hwm_r"]-active["start_r"]); active["repair_fraction_of_initial_loss"]=max(0.0,min(1.0,(active["best_repair_r"]-active["start_r"])/denom)); active["outcome"]="OPEN_FAILED_REPAIR_PATH" if active["crossed_60pct"] else "OPEN_SEQUENCE"; episodes.append(active)
+        return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),"study_version":"metals_repair_quality_v3","canonical_snapshot_filter":"basket_key=METALS_BASKET","minimum_hwm_r":10,"thresholds_are_descriptive_not_optimized":True,"episodes":episodes}
     except Exception as exc:
         return {"status":"error","error":type(exc).__name__+": "+str(exc),"episodes":[]}
+
 
 @app.get("/analysis/catalog")
 def analysis_catalog() -> Dict[str, Any]:
