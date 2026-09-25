@@ -325,12 +325,12 @@ def metals_adaptive_protection_context(limit: int = 160) -> Dict[str, Any]:
                 prev=None; peak=None; prev_side=None; continue
             if prev_side is not None and side!=prev_side: prev=None; peak=None
             br=float(x.get("basket_r") or 0); persisted_h=float(x.get("high_water_r") or br); peak=max(float(peak if peak is not None else persisted_h),persisted_h,br)
-            gb=(100*(peak-br)/peak) if peak>0 else 0; delta=(br-float(prev["basket_r"])) if prev else None
+            gb=(100*(peak-br)/peak) if peak>0 else 0\n            comparable=bool(prev is not None and int(prev.get("open_count") or 0)==oc)\n            delta=(br-float(prev["basket_r"])) if comparable else None
             out.append({"event_at":_jsonable(x.get("created_at_utc")),"side":side,"basket_r":br,"hwm_r":peak,"hwm_pnl_gbp":x.get("high_water_pnl_gbp"),"giveback_pct":gb,"open_count":oc,
-              "delta_basket_r":delta,"repair_attempt":bool(delta is not None and delta>0 and br<peak),"state":{"giveback_accelerating":bool(prev and gb>prev["gb"]),"breadth_proxy_open_count":oc}})
-            prev={"basket_r":br,"gb":gb}; prev_side=side
+              "cohort_comparable":comparable,"exclusion_reason":None if comparable or prev is None else "open_count_changed","delta_basket_r":delta,"repair_attempt":bool(delta is not None and delta>0 and br<peak),"state":{"giveback_accelerating":bool(comparable and gb>prev["gb"]),"breadth_proxy_open_count":oc}})
+            prev={"basket_r":br,"gb":gb,"open_count":oc}; prev_side=side
         return {"status":"ok","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),
-          "study_version":"metals_adaptive_context_v2","canonical_snapshot_filter":"basket_key=METALS_BASKET","news_layer_included":False,"observations":out}
+          "study_version":"metals_adaptive_context_v3","canonical_snapshot_filter":"basket_key=METALS_BASKET","news_layer_included":False,"observations":out}
     except Exception as exc:
         return {"status":"error","project":PROJECT_NAME,"analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"observations":[],"error":type(exc).__name__+": "+str(exc)}
 
