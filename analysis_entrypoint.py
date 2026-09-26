@@ -431,6 +431,14 @@ def analysis_summary() -> Dict[str, Any]:
     }
 
 
+@app.get("/analysis/performance")
+def analysis_performance() -> Dict[str, Any]:
+    """Canonical read-only performance data for automated reviews."""
+    top = core.metals_standard_top_snapshot(force=False)
+    account = top.get("account") or {}; accounting = top.get("accounting") or {}; strategy = top.get("strategy") or {}
+    return {"status":"ok","project":PROJECT_NAME,"contract_version":1,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),"mode":"live","live_capital":True,"scope":"XAUUSD LONG live lane; practice lanes excluded from live totals","realised":{"week_gbp":accounting.get("week_pnl"),"month_gbp":accounting.get("month_pnl")},"open":{"unrealised_gbp":strategy.get("headline_pnl"),"basket_r":strategy.get("basket_r"),"open_trades":strategy.get("open_trades")},"nav_gbp":account.get("nav")}
+
+
 @app.get("/analysis/status")
 def analysis_status() -> Dict[str, Any]:
     return {
