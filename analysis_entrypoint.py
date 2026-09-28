@@ -1,8 +1,9 @@
 """Project Exit Plan — read-only analysis interface v1.
 
-Observability only. This module imports the existing runtime and attaches
-read-only endpoints. It has no broker-write, sizing, entry, exit, stop,
-harvest, or research-decision authority.
+Analysis endpoints remain read-only. This wrapper also exposes one explicit,
+authenticated manual risk-per-new-trade control requested by the user. It does
+not place/close trades, move stops, harvest, resize existing positions, or give
+research layers execution authority.
 """
 from __future__ import annotations
 
@@ -549,6 +550,13 @@ async def control_risk_per_trade_apply(
 
     previous = _restore_metals_xau_risk_override()
     core.set_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, f"{requested:.2f}")
+    persisted = core.get_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, "")
+    try:
+        persisted_value = float(persisted)
+    except Exception:
+        persisted_value = None
+    if persisted_value is None or abs(persisted_value - requested) > 0.005:
+        raise HTTPException(status_code=500, detail="Risk override did not persist; no confirmed change")
     core.set_broker_runtime_setting("metals_xau_manual_risk_last_review_utc", _now())
     core.set_broker_runtime_setting("metals_xau_manual_risk_last_applied_risk", f"{requested:.2f}")
     core.METALS_XAU_LIVE_RISK_AMOUNT = float(requested)
