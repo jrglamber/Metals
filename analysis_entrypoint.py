@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 import app_postgres_runtime as core
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 
 # Keep a stable outer app: the core runtime may rebuild/rebind its FastAPI
@@ -19,7 +19,7 @@ from fastapi.responses import Response
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
 ANALYSIS_INTERFACE_VERSION = "2.9.0"
-VISIBLE_RELEASE_VERSION = "v1.6.51"
+VISIBLE_RELEASE_VERSION = "v1.6.52"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -470,6 +470,108 @@ def analysis_quality() -> Dict[str, Any]:
         "execution_authority": False,
         "time_utc": _now(),
         "checks": checks,
+    }
+
+
+
+_METALS_XAU_RISK_OVERRIDE_KEY = "metals_xau_live_risk_amount"
+
+
+def _restore_metals_xau_risk_override() -> float:
+    """Restore the durable XAU-LONG live risk override into the runtime global."""
+    try:
+        core.init_db()
+        raw = core.get_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, "")
+        value = float(raw) if str(raw).strip() else float(core.METALS_XAU_LIVE_RISK_AMOUNT)
+        min_risk = 0.01
+        max_risk = float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0)
+        if value < min_risk or value > max_risk:
+            value = float(core.METALS_XAU_LIVE_RISK_AMOUNT)
+        core.METALS_XAU_LIVE_RISK_AMOUNT = float(value)
+    except Exception:
+        pass
+    return float(getattr(core, "METALS_XAU_LIVE_RISK_AMOUNT", 0.0) or 0.0)
+
+
+@app.on_event("startup")
+def restore_manual_metals_risk_control() -> None:
+    _restore_metals_xau_risk_override()
+
+
+@app.get("/control/risk-per-trade")
+def control_risk_per_trade_status() -> Dict[str, Any]:
+    current = _restore_metals_xau_risk_override()
+    return {
+        "status": "ok",
+        "strategy": "metals",
+        "lane": "XAU_LONG_LIVE",
+        "current_risk_per_trade_gbp": current,
+        "min_risk_gbp": 0.01,
+        "max_risk_gbp": float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0),
+        "applies_to_new_trades_only": True,
+        "existing_positions_resized": False,
+        "practice_lanes_unchanged": True,
+        "persistent": True,
+        "time_utc": _now(),
+    }
+
+
+@app.post("/control/risk-per-trade")
+async def control_risk_per_trade_apply(
+    request: Request,
+    x_control_secret: str | None = Header(default=None),
+) -> Dict[str, Any]:
+    """Authenticated manual risk control for NEW XAU-LONG live entries only."""
+    expected = str(getattr(core, "WEBHOOK_SECRET", "") or "")
+    if not expected or expected == "change-me" or x_control_secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid control secret")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    if str(body.get("confirm") or "") != "APPLY_NEW_TRADE_RISK":
+        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_NEW_TRADE_RISK")
+
+    try:
+        requested = float(body.get("risk_per_trade_gbp"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="risk_per_trade_gbp must be numeric")
+
+    min_risk = 0.01
+    max_risk = float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0)
+    if requested < min_risk or requested > max_risk:
+        raise HTTPException(
+            status_code=400,
+            detail=f"risk_per_trade_gbp must be between £{min_risk:.2f} and £{max_risk:.2f}",
+        )
+
+    previous = _restore_metals_xau_risk_override()
+    core.set_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, f"{requested:.2f}")
+    core.set_broker_runtime_setting("metals_xau_manual_risk_last_review_utc", _now())
+    core.set_broker_runtime_setting("metals_xau_manual_risk_last_applied_risk", f"{requested:.2f}")
+    core.METALS_XAU_LIVE_RISK_AMOUNT = float(requested)
+    current = float(core.METALS_XAU_LIVE_RISK_AMOUNT)
+    try:
+        core.log_system_event(
+            "metals_xau_manual_live_risk_control_applied",
+            f"Portfolio Hub/manual control changed XAU-LONG new-trade risk from £{previous:.2f} to £{current:.2f}; existing positions and practice lanes unchanged.",
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "strategy": "metals",
+        "lane": "XAU_LONG_LIVE",
+        "previous_risk_per_trade_gbp": previous,
+        "current_risk_per_trade_gbp": current,
+        "applies_to_new_trades_only": True,
+        "existing_positions_resized": False,
+        "practice_lanes_unchanged": True,
+        "persistent": True,
+        "time_utc": _now(),
     }
 
 
