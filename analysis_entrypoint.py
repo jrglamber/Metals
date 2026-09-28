@@ -19,8 +19,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.9.0"
-VISIBLE_RELEASE_VERSION = "v1.6.52"
+ANALYSIS_INTERFACE_VERSION = "2.10.0"
+VISIBLE_RELEASE_VERSION = "v1.6.53"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -476,6 +476,7 @@ def analysis_quality() -> Dict[str, Any]:
 
 
 _METALS_XAU_RISK_OVERRIDE_KEY = "metals_xau_live_risk_amount"
+METALS_XAU_FIXED_RISK_PCT_OF_NAV = 0.075
 
 
 def _restore_metals_xau_risk_override() -> float:
@@ -494,6 +495,61 @@ def _restore_metals_xau_risk_override() -> float:
     return float(getattr(core, "METALS_XAU_LIVE_RISK_AMOUNT", 0.0) or 0.0)
 
 
+def _metals_live_nav() -> Dict[str, Any]:
+    try:
+        resp = core._metals_xau_live_request(
+            f"/v3/accounts/{core.METALS_XAU_LIVE_OANDA_ACCOUNT_ID}/summary"
+        )
+        acct = ((resp.get("data") or {}).get("account") or {}) if resp.get("ok") else {}
+        nav = core.safe_float(acct.get("NAV"))
+        return {
+            "ok": bool(resp.get("ok")) and nav is not None and float(nav) > 0,
+            "nav_gbp": float(nav) if nav is not None else None,
+            "balance_gbp": core.safe_float(acct.get("balance")),
+            "currency": core.safe_str(acct.get("currency")),
+            "error": core.safe_str(resp.get("error")),
+        }
+    except Exception as exc:
+        return {"ok": False, "nav_gbp": None, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _metals_fixed_risk_snapshot() -> Dict[str, Any]:
+    current = _restore_metals_xau_risk_override()
+    nav_resp = _metals_live_nav()
+    nav = float(nav_resp.get("nav_gbp") or 0.0)
+    min_risk = 0.01
+    max_risk = float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0)
+    raw_target = nav * (METALS_XAU_FIXED_RISK_PCT_OF_NAV / 100.0) if nav > 0 else 0.0
+    bounded = max(min_risk, min(max_risk, raw_target)) if raw_target > 0 else 0.0
+    target = round(bounded, 2) if bounded > 0 else 0.0
+    current_preview = {}
+    try:
+        current_preview = core.metals_xau_live_sizing_preview()
+    except Exception:
+        current_preview = {}
+    return {
+        "status": "ok" if nav > 0 and target > 0 else "error",
+        "strategy": "metals",
+        "lane": "XAU_LONG_LIVE",
+        "fixed_risk_pct_of_nav": METALS_XAU_FIXED_RISK_PCT_OF_NAV,
+        "nav_gbp": nav or None,
+        "raw_calculated_risk_gbp": raw_target or None,
+        "calculated_risk_per_trade_gbp": target or None,
+        "current_risk_per_trade_gbp": current,
+        "min_risk_gbp": min_risk,
+        "max_risk_gbp": max_risk,
+        "minimum_position_size_rule": "If calculated XAU units are below OANDA minimumTradeSize, use the broker minimum size. Existing live overage guardrails remain authoritative.",
+        "current_sizing_preview": current_preview,
+        "applies_to_new_trades_only": True,
+        "existing_positions_resized": False,
+        "practice_lanes_unchanged": True,
+        "persistent": True,
+        "nav_source": "fresh_oanda_account_summary",
+        "error": "" if nav > 0 else str(nav_resp.get("error") or "OANDA NAV unavailable"),
+        "time_utc": _now(),
+    }
+
+
 @app.on_event("startup")
 def restore_manual_metals_risk_control() -> None:
     _restore_metals_xau_risk_override()
@@ -501,20 +557,7 @@ def restore_manual_metals_risk_control() -> None:
 
 @app.get("/control/risk-per-trade")
 def control_risk_per_trade_status() -> Dict[str, Any]:
-    current = _restore_metals_xau_risk_override()
-    return {
-        "status": "ok",
-        "strategy": "metals",
-        "lane": "XAU_LONG_LIVE",
-        "current_risk_per_trade_gbp": current,
-        "min_risk_gbp": 0.01,
-        "max_risk_gbp": float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0),
-        "applies_to_new_trades_only": True,
-        "existing_positions_resized": False,
-        "practice_lanes_unchanged": True,
-        "persistent": True,
-        "time_utc": _now(),
-    }
+    return _metals_fixed_risk_snapshot()
 
 
 @app.post("/control/risk-per-trade")
@@ -522,7 +565,7 @@ async def control_risk_per_trade_apply(
     request: Request,
     x_control_secret: str | None = Header(default=None),
 ) -> Dict[str, Any]:
-    """Authenticated manual risk control for NEW XAU-LONG live entries only."""
+    """Apply the agreed 0.075% NAV risk target to NEW XAU-LONG live entries only."""
     expected = str(getattr(core, "WEBHOOK_SECRET", "") or "")
     if not expected or expected == "change-me" or x_control_secret != expected:
         raise HTTPException(status_code=401, detail="Invalid control secret")
@@ -532,22 +575,14 @@ async def control_risk_per_trade_apply(
     except Exception:
         body = {}
     body = body if isinstance(body, dict) else {}
-    if str(body.get("confirm") or "") != "APPLY_NEW_TRADE_RISK":
-        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_NEW_TRADE_RISK")
+    if str(body.get("confirm") or "") != "APPLY_FIXED_RISK_PCT":
+        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_FIXED_RISK_PCT")
 
-    try:
-        requested = float(body.get("risk_per_trade_gbp"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="risk_per_trade_gbp must be numeric")
+    preview = _metals_fixed_risk_snapshot()
+    if preview.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=preview.get("error") or "Could not calculate fixed risk from live NAV")
 
-    min_risk = 0.01
-    max_risk = float(getattr(core, "BROKER_MAX_RISK_TEST_AMOUNT", 50.0) or 50.0)
-    if requested < min_risk or requested > max_risk:
-        raise HTTPException(
-            status_code=400,
-            detail=f"risk_per_trade_gbp must be between £{min_risk:.2f} and £{max_risk:.2f}",
-        )
-
+    requested = float(preview["calculated_risk_per_trade_gbp"])
     previous = _restore_metals_xau_risk_override()
     core.set_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, f"{requested:.2f}")
     persisted = core.get_broker_runtime_setting(_METALS_XAU_RISK_OVERRIDE_KEY, "")
@@ -557,14 +592,24 @@ async def control_risk_per_trade_apply(
         persisted_value = None
     if persisted_value is None or abs(persisted_value - requested) > 0.005:
         raise HTTPException(status_code=500, detail="Risk override did not persist; no confirmed change")
+
+    core.set_broker_runtime_setting("metals_xau_fixed_risk_pct_of_nav", f"{METALS_XAU_FIXED_RISK_PCT_OF_NAV:.6f}")
     core.set_broker_runtime_setting("metals_xau_manual_risk_last_review_utc", _now())
+    core.set_broker_runtime_setting("metals_xau_manual_risk_last_nav", f"{float(preview['nav_gbp']):.2f}")
+    core.set_broker_runtime_setting("metals_xau_manual_risk_last_raw_formula_risk", f"{float(preview['raw_calculated_risk_gbp']):.6f}")
     core.set_broker_runtime_setting("metals_xau_manual_risk_last_applied_risk", f"{requested:.2f}")
     core.METALS_XAU_LIVE_RISK_AMOUNT = float(requested)
     current = float(core.METALS_XAU_LIVE_RISK_AMOUNT)
+    sizing_preview = {}
+    try:
+        sizing_preview = core.metals_xau_live_sizing_preview()
+    except Exception:
+        sizing_preview = {}
+
     try:
         core.log_system_event(
-            "metals_xau_manual_live_risk_control_applied",
-            f"Portfolio Hub/manual control changed XAU-LONG new-trade risk from £{previous:.2f} to £{current:.2f}; existing positions and practice lanes unchanged.",
+            "metals_xau_fixed_pct_live_risk_applied",
+            f"Applied XAU-LONG fixed risk {METALS_XAU_FIXED_RISK_PCT_OF_NAV:.3f}% of NAV: NAV £{float(preview['nav_gbp']):.2f}, target £{current:.2f}/new trade; broker minimum size may set higher effective risk; existing positions/practice lanes unchanged.",
         )
     except Exception:
         pass
@@ -573,8 +618,13 @@ async def control_risk_per_trade_apply(
         "status": "ok",
         "strategy": "metals",
         "lane": "XAU_LONG_LIVE",
+        "fixed_risk_pct_of_nav": METALS_XAU_FIXED_RISK_PCT_OF_NAV,
+        "nav_gbp": preview.get("nav_gbp"),
+        "raw_calculated_risk_gbp": preview.get("raw_calculated_risk_gbp"),
         "previous_risk_per_trade_gbp": previous,
         "current_risk_per_trade_gbp": current,
+        "sizing_preview": sizing_preview,
+        "minimum_position_size_rule": preview.get("minimum_position_size_rule"),
         "applies_to_new_trades_only": True,
         "existing_positions_resized": False,
         "practice_lanes_unchanged": True,

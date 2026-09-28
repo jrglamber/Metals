@@ -1,2 +1,2 @@
-Metals v1.6.52 visible release
-Analysis wrapper adds persistent authenticated XAU-LONG risk-per-new-trade control; core strategy rules remain unchanged.
+Metals v1.6.53 visible release
+Analysis wrapper applies the agreed fixed 0.075% of live NAV risk to NEW XAU-LONG live trades on manual review; OANDA minimumTradeSize remains authoritative; practice lanes/existing positions unchanged.
