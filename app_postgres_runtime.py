@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.38"
+METALS_APP_VERSION = "v1.6.39"
 METALS_BUILD_BASELINE = "cumulative supplied Metals v1.6.37 / 2026-09-19"
 APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — AI Retry + Prospective Veto Shadow + Directional Research + Intrahour HWM Harvest + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
@@ -2822,6 +2822,87 @@ def trend_efficiency_research_csv_rows(limit: int = RESEARCH_ROW_EXPORT_LIMIT) -
             LIMIT ?
         """, (limit,)).fetchall()]
     return rows
+
+
+INDEX_REGIME_OVERLAY_VERSION = "v1_candidate_gates_2026-09-29"
+
+
+def _index_efficiency_at_or_before(conn: sqlite3.Connection, asset: str, lookback: int, raw_signal_id: int) -> Dict[str, Any]:
+    row = conn.execute("SELECT trend_efficiency, efficiency_state FROM trend_efficiency_research WHERE asset=? AND lookback_candles=? AND raw_signal_id<=? ORDER BY id DESC LIMIT 1", (safe_str(asset), int(lookback), int(raw_signal_id or 0))).fetchone()
+    return dict(row) if row else {}
+
+
+def record_index_regime_overlay_research_for_raw_signal(raw_signal_id: int) -> Dict[str, Any]:
+    raw_signal_id = int(raw_signal_id or 0)
+    if raw_signal_id <= 0:
+        return {"ok": False, "reason": "invalid_raw_signal_id", "research_only": True}
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1", (raw_signal_id,)).fetchone()
+        if not row:
+            return {"ok": False, "reason": "raw_signal_not_found", "research_only": True}
+        asset = normalise_index_asset(row["pair"])
+        if asset not in INDEX_TREND_EFFICIENCY_ASSETS:
+            return {"ok": True, "skipped": True, "reason": "non_index_asset", "asset": asset, "research_only": True}
+        if conn.execute("SELECT 1 FROM index_regime_overlay_research WHERE raw_signal_id=? AND asset=? LIMIT 1", (raw_signal_id, asset)).fetchone():
+            return {"ok": True, "skipped": True, "reason": "already_recorded", "research_only": True}
+        e8 = _index_efficiency_at_or_before(conn, asset, 8, raw_signal_id)
+        e12 = _index_efficiency_at_or_before(conn, asset, 12, raw_signal_id)
+        e24 = _index_efficiency_at_or_before(conn, asset, 24, raw_signal_id)
+        al = _latest_alignment_state_at_or_before(conn, raw_signal_id)
+        sr = conn.execute("SELECT short_candidate, short_state FROM index_short_regime_research WHERE asset=? AND raw_signal_id=? LIMIT 1", (asset, raw_signal_id)).fetchone()
+        s8, s12, s24 = safe_str(e8.get("efficiency_state")), safe_str(e12.get("efficiency_state")), safe_str(e24.get("efficiency_state"))
+        chop = s8 == "CHOPPY" and s12 in {"CHOPPY", "MIXED"} and s24 in {"CHOPPY", "MIXED"}
+        flat = "BLOCK" if chop else "ALLOW"
+        strong = s8 in {"TRENDING", "CLEAN_TREND"} and al not in {"BOTH_CHOPPY", "BOTH_WEAK", "DIVERGENT_MIXED", "INSUFFICIENT_DATA"}
+        strength = "ALLOW" if strong else "BLOCK"
+        combined = "ALLOW" if flat == "ALLOW" and strength == "ALLOW" else "BLOCK"
+        short_candidate = int(sr["short_candidate"] or 0) if sr else 0
+        short_state = safe_str(sr["short_state"]) if sr else ""
+        long_candidate = int(str(row["forward_test_candidate"] or "").strip().upper() in {"YES", "Y", "TRUE", "1", "TAKE", "CANDIDATE"})
+        conn.execute("""INSERT INTO index_regime_overlay_research (
+            created_at_utc, updated_at_utc, raw_signal_id, pair, asset, signal_time, candidate_long, entry_close, sl_pct, research_version,
+            efficiency_8h, efficiency_state_8h, efficiency_12h, efficiency_state_12h, efficiency_24h, efficiency_state_24h, family_alignment_state,
+            short_candidate, short_state, flat_chop_brake_decision, flat_chop_reason, trend_strength_gate_decision, trend_strength_reason,
+            combined_long_shadow_decision, combined_long_reason, short_shadow_decision, short_shadow_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            now_utc_iso(), now_utc_iso(), raw_signal_id, safe_str(row["pair"]), asset, safe_str(row["timestamp_readable"]), long_candidate,
+            row["exec_close"], None, INDEX_REGIME_OVERLAY_VERSION, e8.get("trend_efficiency"), s8, e12.get("trend_efficiency"), s12,
+            e24.get("trend_efficiency"), s24, al, short_candidate, short_state, flat, "PERSISTENT_CHOP_8_12_24" if chop else "NO_PERSISTENT_CHOP",
+            strength, "8H_TREND_AND_FAMILY_SUPPORT" if strong else "NO_8H_TREND_OR_FAMILY_SUPPORT", combined,
+            "BOTH_GATES_ALLOW" if combined == "ALLOW" else "CHOP_OR_STRENGTH_GATE_BLOCKED", "WATCH" if short_candidate else "NONE", short_state or "NO_SHORT_ROW"))
+        conn.commit()
+    return {"ok": True, "raw_signal_id": raw_signal_id, "asset": asset, "combined_long_shadow_decision": combined, "research_only": True}
+
+
+def index_regime_overlay_research_csv_rows(limit: int = RESEARCH_ROW_HARD_LIMIT) -> List[Dict[str, Any]]:
+    init_db()
+    limit = max(1, min(int(limit or 5000), RESEARCH_ROW_HARD_LIMIT))
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM index_regime_overlay_research ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+
+
+def latest_index_regime_overlay_snapshot(limit: int = 120) -> Dict[str, Any]:
+    rows = index_regime_overlay_research_csv_rows(limit)
+    counts = {}
+    for r in rows:
+        k = "%s:%s" % (safe_str(r.get("asset")), safe_str(r.get("combined_long_shadow_decision")))
+        counts[k] = counts.get(k, 0) + 1
+    return {"research_version": INDEX_REGIME_OVERLAY_VERSION, "rows": rows, "counts": counts, "research_only": True}
+
+
+def build_index_regime_overlay_research_html() -> str:
+    try:
+        snap = latest_index_regime_overlay_snapshot(120)
+        rows = snap.get("rows") or []
+        counts = snap.get("counts") or {}
+        allow = sum(v for k, v in counts.items() if k.endswith(":ALLOW"))
+        block = sum(v for k, v in counts.items() if k.endswith(":BLOCK"))
+        body = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(r.get("asset")), esc(r.get("signal_time")), esc(r.get("efficiency_state_8h")), esc(r.get("family_alignment_state")),
+            esc(r.get("flat_chop_brake_decision")), esc(r.get("trend_strength_gate_decision"))) for r in rows[:12])
+        return '<details class="priority dashboard-group"><summary>Index Regime Overlay — Candidate Entry Gates (Research Only)</summary><div class="section-note small">Reuses existing trend-efficiency, alignment and short-research rows; no duplicate outcome engine. Persistent-chop brake, trend-strength gate and combined decision are counterfactual only and have zero live/OANDA authority.</div><div class="cards three"><div class="card"><div class="label">Rows</div><div class="value flat">%s</div></div><div class="card"><div class="label">ALLOW</div><div class="value flat">%s</div></div><div class="card"><div class="label">BLOCK</div><div class="value flat">%s</div></div></div><details><summary>Recent decisions</summary><div class="table-scroll"><table><thead><tr><th>Asset</th><th>Signal</th><th>8h State</th><th>Alignment</th><th>Chop Brake</th><th>Strength Gate</th></tr></thead><tbody>%s</tbody></table></div></details></details>' % (len(rows), allow, block, body)
+    except Exception as e:
+        return '<details class="priority"><summary>Index Regime Overlay — Research Only</summary><div class="section-note warn">Unavailable: %s</div></details>' % esc(e)
 
 
 def build_trend_efficiency_research_html() -> str:
@@ -8878,6 +8959,51 @@ def _init_db_full() -> None:
 
 
         conn.execute("""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_regime_overlay_research (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT,
+                raw_signal_id INTEGER NOT NULL,
+                pair TEXT,
+                asset TEXT NOT NULL,
+                signal_time TEXT,
+                candidate_long INTEGER,
+                entry_close REAL,
+                sl_pct REAL,
+                research_version TEXT,
+                efficiency_8h REAL,
+                efficiency_state_8h TEXT,
+                efficiency_12h REAL,
+                efficiency_state_12h TEXT,
+                efficiency_24h REAL,
+                efficiency_state_24h TEXT,
+                family_alignment_state TEXT,
+                short_candidate INTEGER,
+                short_state TEXT,
+                flat_chop_brake_decision TEXT,
+                flat_chop_reason TEXT,
+                trend_strength_gate_decision TEXT,
+                trend_strength_reason TEXT,
+                combined_long_shadow_decision TEXT,
+                combined_long_reason TEXT,
+                short_shadow_decision TEXT,
+                short_shadow_reason TEXT,
+                UNIQUE(raw_signal_id, asset)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_index_regime_overlay_asset_time
+            ON index_regime_overlay_research(asset, signal_time)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_index_regime_overlay_signal_asset
+            ON index_regime_overlay_research(raw_signal_id, asset)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_index_regime_overlay_decision
+            ON index_regime_overlay_research(combined_long_shadow_decision, asset, signal_time)
+        """)
             CREATE TABLE IF NOT EXISTS system_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at_utc TEXT NOT NULL,
@@ -16705,6 +16831,13 @@ def process_shadow_manager(new_signal_db_id: int, source: str = "signal_worker")
         result["candidate"] = bool(is_true(signal["forward_test_candidate"]))
         upsert_live_signal_pipeline_audit(new_signal_db_id, "PROCESSING", "RUNNING", worker_source=source, conn=conn)
 
+    # v10.1.58: unified regime overlay reusing existing efficiency, alignment and short rows.
+    try:
+        result["index_regime_overlay_research"] = record_index_regime_overlay_research_for_raw_signal(int(new_signal_db_id))
+    except Exception as e:
+        result["ok"] = False
+        result["index_regime_overlay_research"] = {"ok": False, "status": "error", "error": f"{type(e).__name__}: {e}", "research_only": True}
+
         if asset not in CONFIG:
             result.update({"skipped": True, "reason": "asset_not_in_config"})
             upsert_live_signal_pipeline_audit(new_signal_db_id, "SKIPPED", "SKIPPED", "asset_not_in_config", worker_source=source, conn=conn)
@@ -23073,6 +23206,24 @@ def export_basket_recovery_research_csv(limit: int = RESEARCH_ROW_EXPORT_LIMIT) 
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="basket-recovery-research.csv"'},
     )
+
+
+@app.get("/index-regime-overlay-research")
+def index_regime_overlay_research_route() -> Dict[str, Any]:
+    return latest_index_regime_overlay_snapshot()
+
+
+@app.get("/export/index-regime-overlay-research.json")
+def export_index_regime_overlay_research_json() -> Response:
+    return Response(content=json.dumps(latest_index_regime_overlay_snapshot(), indent=2, default=str), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="index-regime-overlay-research.json"'})
+
+
+@app.get("/export/index-regime-overlay-research.csv")
+def export_index_regime_overlay_research_csv(limit: int = 5000) -> Response:
+    rows = index_regime_overlay_research_csv_rows(limit=limit)
+    if not rows:
+        rows = [{"note": "No index regime overlay rows available", "time_utc": now_utc_iso()}]
+    return Response(dicts_to_csv(rows), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="index-regime-overlay-research.csv"'})
 
 
 @app.get("/index-short-regime-research")
@@ -31061,6 +31212,7 @@ def export_indices_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT, table_
         # Derived research layers for improving the main NAS100/US500 project.
         derived_builders = [
             ("trend-efficiency-research.csv", lambda: trend_efficiency_research_csv_rows(limit=limit), ["note"]),
+            ("index-regime-overlay-research.csv", lambda: index_regime_overlay_research_csv_rows(limit=limit), ["note"]),
             ("index-alignment-research.csv", lambda: index_alignment_research_csv_rows(limit=limit), ["note"]),
             ("basket-recovery-research.csv", lambda: basket_recovery_research_csv_rows(limit=limit), ["note"]),
             ("index-short-regime-research.csv", lambda: index_short_regime_research_csv_rows(limit=limit), ["note"]),
