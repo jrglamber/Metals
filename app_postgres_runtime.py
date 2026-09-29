@@ -8959,7 +8959,6 @@ def _init_db_full() -> None:
 
 
         conn.execute("""
-        conn.execute("""
             CREATE TABLE IF NOT EXISTS index_regime_overlay_research (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at_utc TEXT NOT NULL,
@@ -9004,6 +9003,7 @@ def _init_db_full() -> None:
             CREATE INDEX IF NOT EXISTS idx_index_regime_overlay_decision
             ON index_regime_overlay_research(combined_long_shadow_decision, asset, signal_time)
         """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS system_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at_utc TEXT NOT NULL,
