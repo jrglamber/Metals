@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 import app_postgres_runtime as core
+import metals_exit_override as _metals_exit_override
+_METALS_EXIT_INSTALL = _metals_exit_override.install(core)
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 
@@ -19,8 +21,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.10.0"
-VISIBLE_RELEASE_VERSION = "v1.6.53"
+ANALYSIS_INTERFACE_VERSION = "2.11.0-xau-atr2-live"
+VISIBLE_RELEASE_VERSION = "v1.6.54-xau-atr2-48h"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -438,6 +440,28 @@ def analysis_performance() -> Dict[str, Any]:
     top = core.metals_standard_top_snapshot(force=False)
     account = top.get("account") or {}; accounting = top.get("accounting") or {}; strategy = top.get("strategy") or {}
     return {"status":"ok","project":PROJECT_NAME,"contract_version":1,"read_only_interface":True,"execution_authority":False,"time_utc":_now(),"mode":"live","live_capital":True,"scope":"XAUUSD LONG live lane; practice lanes excluded from live totals","realised":{"week_gbp":accounting.get("week_pnl"),"month_gbp":accounting.get("month_pnl")},"open":{"unrealised_gbp":strategy.get("headline_pnl"),"basket_r":strategy.get("basket_r"),"open_trades":strategy.get("open_trades")},"nav_gbp":account.get("nav")}
+
+
+@app.get("/analysis/strategy-config")
+def strategy_config() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "project": PROJECT_NAME,
+        "live_scope": "XAUUSD LONG only",
+        "live_strategy": "ATR2_CHANDELIER",
+        "strategy_version": "metals_xau_long_atr2_48h_v1_2026_09_29",
+        "minimum_hold_candles": 48,
+        "atr_multiplier": 2.0,
+        "emergency_stop_preserved": True,
+        "basket_harvesting_preserved": True,
+        "shadow_lanes": {
+            "XAGUSD_LONG": "CURRENT_MANAGER / research-only",
+            "XAGUSD_SHORT": "CURRENT_MANAGER / research-only",
+            "XAUUSD_SHORT": "CURRENT_MANAGER / research-only",
+        },
+        "execution_authority": {"xau_long": True, "shadow_lanes": False},
+        "time_utc": _now(),
+    }
 
 
 @app.get("/analysis/status")
