@@ -1,2 +1,2 @@
-Metals v1.6.53 visible release
-Analysis wrapper applies the agreed fixed 0.075% of live NAV risk to NEW XAU-LONG live trades on manual review; OANDA minimumTradeSize remains authoritative; practice lanes/existing positions unchanged.
+Metals v1.6.55 visible release
+New live XAU-LONG entries now use the frozen persistent-chop brake: block only when 8h is CHOPPY and 12h/24h are CHOPPY or MIXED. Existing trades, ATR2 exits, emergency stops, harvesting, 0.075% NAV risk, XAU shorts and XAG are unchanged.

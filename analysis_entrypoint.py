@@ -21,8 +21,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.11.0-xau-atr2-live"
-VISIBLE_RELEASE_VERSION = "v1.6.54-xau-atr2-48h"
+ANALYSIS_INTERFACE_VERSION = "2.11.1-xau-chop-brake-live"
+VISIBLE_RELEASE_VERSION = "v1.6.55-xau-chop-brake"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
@@ -452,6 +452,8 @@ def strategy_config() -> Dict[str, Any]:
         "strategy_version": "metals_xau_long_atr2_48h_v1_2026_09_29",
         "minimum_hold_candles": 48,
         "atr_multiplier": 2.0,
+        "xau_long_persistent_chop_brake": "LIVE_ENTRY_ONLY",
+        "xau_long_persistent_chop_brake_version": core.METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_VERSION,
         "emergency_stop_preserved": True,
         "basket_harvesting_preserved": True,
         "shadow_lanes": {

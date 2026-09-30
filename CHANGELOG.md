@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.55 — Live XAU Long Persistent-Chop Entry Brake
+
+- Blocks only new live XAUUSD LONG entries when 8-hour efficiency is `CHOPPY` and both 12-hour and 24-hour efficiency are `CHOPPY` or `MIXED`.
+- Uses only XAU closes available at the decision time. Insufficient history fails open.
+- Revalidates deferred market-reopen entries against the latest XAU signal.
+- Records blocked entries in the dedicated live-XAU execution audit.
+- Existing trades, ATR2 exits, emergency stops, harvesting, risk sizing, XAU shorts and all XAG lanes are unchanged.
+
 ## v1.0.0 — Standalone Metals Project
 
 Created from the combined Project Exit Plan v10.1.27 indices + metals runtime.

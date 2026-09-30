@@ -1,5 +1,5 @@
-# VERIFIED BUILD: Metals v1.6.38 Durable AI Retry + Prospective AI Veto Shadow + Directional Intelligence Research v1 + Intrahour HWM Harvest — cumulative on v1.6.37
-# Cumulative on supplied Metals v1.6.37. Adds durable AI 429/5xx/network retry with backoff and a prospective research-only AI-veto decision/portfolio ledger. Preserves deterministic execution authority, last-trade visibility, directional research, intrahour HWM/harvesting, MARKET_HALTED recovery, queue cleanup, live-pilot, accounting, direction-flip, manager and broker execution behaviour.
+# VERIFIED BUILD: Metals v1.6.55 XAU LONG Persistent-Chop Entry Brake — cumulative on v1.6.54
+# Adds one narrow deterministic production change: new live XAUUSD LONG entries are blocked only when 8h efficiency is CHOPPY and both 12h/24h are CHOPPY or MIXED. Existing trades, ATR2 exits, emergency stops, harvesting, risk, XAU shorts and all XAG lanes remain unchanged.
 import os
 import json
 import csv
@@ -26,9 +26,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.39"
-METALS_BUILD_BASELINE = "cumulative supplied Metals v1.6.37 / 2026-09-19"
-APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — AI Retry + Prospective Veto Shadow + Directional Research + Intrahour HWM Harvest + Live Pilot"
+METALS_APP_VERSION = "v1.6.55"
+METALS_BUILD_BASELINE = "cumulative Metals v1.6.54 / 2026-09-30"
+APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU Persistent-Chop Brake + ATR2 + Intrahour HWM Harvest + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
 DASHBOARD_DEFAULT_STATE_VERSION = "metals_v1.0.0_standalone"
 PROJECT_SCOPE = "METALS_ONLY"
@@ -1049,6 +1049,15 @@ METALS_XAU_LIVE_MANAGER_ENABLED = env_bool("METALS_XAU_LIVE_MANAGER_ENABLED", Tr
 METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED = env_bool("METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED", True)
 METALS_XAU_LIVE_POLICY_VERSION = "metals_xau_long_live_pilot_v1_2026_09_04"
 METALS_XAU_LIVE_HARVEST_POLICY_VERSION = "metals_xau_live_harvest_v1_50r_spacing_20_20_25_2026_09_04"
+# v1.6.55 — entry-only XAU LONG persistent-chop brake.
+# This is evaluated before any OANDA sizing/order request. It never closes or
+# modifies an existing trade and has no authority over XAU SHORT or XAG.
+METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_ENABLED = env_bool(
+    "METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_ENABLED", True
+)
+METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_VERSION = (
+    "metals_xau_long_persistent_chop_brake_v1_2026_09_30"
+)
 
 # v10.1.27: isolated OANDA-practice basket-manager simulation for both metal directions.
 METALS_DEMO_SIMULATE_LONGS = env_bool("METALS_DEMO_SIMULATE_LONGS", True)
@@ -24874,6 +24883,133 @@ def metals_xau_live_config_status() -> Dict[str, Any]:
         "active_exit_policy": METALS_XAU_LONG_MFE50_POLICY,
         "active_exit_policy_version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
         "harvest_policy_version": METALS_XAU_LIVE_HARVEST_POLICY_VERSION,
+        "persistent_chop_brake_enabled": METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_ENABLED,
+        "persistent_chop_brake_version": METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_VERSION,
+        "persistent_chop_brake_rule": (
+            "BLOCK new XAU LONG only when 8h=CHOPPY and "
+            "12h/24h are each CHOPPY or MIXED"
+        ),
+    }
+
+
+def _metals_xau_persistent_chop_from_states(
+    state_8h: Any,
+    state_12h: Any,
+    state_24h: Any,
+) -> bool:
+    """Frozen v1.6.55 entry-brake predicate; deliberately no parameter sweep."""
+    s8 = safe_str(state_8h).upper()
+    s12 = safe_str(state_12h).upper()
+    s24 = safe_str(state_24h).upper()
+    return bool(
+        s8 == "CHOPPY"
+        and s12 in {"CHOPPY", "MIXED"}
+        and s24 in {"CHOPPY", "MIXED"}
+    )
+
+
+def metals_xau_live_persistent_chop_gate(
+    raw_signal_id: int,
+    revalidate_latest: bool = False,
+) -> Dict[str, Any]:
+    """Point-in-time XAU LONG entry gate using only closes already observed.
+
+    Insufficient history fails open. Deferred market-reopen entries use the
+    latest production XAU signal so a queued order cannot bypass a newly formed
+    persistent-chop state.
+    """
+    base: Dict[str, Any] = {
+        "enabled": bool(METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_ENABLED),
+        "version": METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_VERSION,
+        "asset": "XAUUSD",
+        "side": "long",
+        "entry_only": True,
+        "existing_trades_unchanged": True,
+        "revalidate_latest": bool(revalidate_latest),
+    }
+    if not METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_ENABLED:
+        return {**base, "allow": True, "decision": "ALLOW", "reason": "brake_disabled"}
+
+    rid = int(raw_signal_id or 0)
+    with get_conn() as conn:
+        if revalidate_latest:
+            latest = conn.execute("""
+                SELECT id
+                FROM raw_signals
+                WHERE UPPER(REPLACE(REPLACE(COALESCE(pair,''),'_',''),'-','')) IN ('XAUUSD','XAU','GOLD')
+                  AND exec_close IS NOT NULL
+                  AND UPPER(COALESCE(model_version,'')) != 'RESEARCH_MULTI_CTX_1H'
+                ORDER BY id DESC
+                LIMIT 1
+            """).fetchone()
+            if latest:
+                rid = int(latest["id"])
+
+        signal = conn.execute("""
+            SELECT id, timestamp_readable
+            FROM raw_signals
+            WHERE id=?
+            LIMIT 1
+        """, (rid,)).fetchone()
+        if not signal:
+            return {
+                **base,
+                "allow": True,
+                "decision": "ALLOW",
+                "reason": "signal_not_found_fail_open",
+                "evaluated_raw_signal_id": rid,
+            }
+
+        states: Dict[int, str] = {}
+        efficiencies: Dict[int, Optional[float]] = {}
+        candles_found: Dict[int, int] = {}
+        for lookback in (8, 12, 24):
+            rows = conn.execute("""
+                SELECT exec_close
+                FROM raw_signals
+                WHERE id <= ?
+                  AND UPPER(REPLACE(REPLACE(COALESCE(pair,''),'_',''),'-','')) IN ('XAUUSD','XAU','GOLD')
+                  AND exec_close IS NOT NULL
+                  AND UPPER(COALESCE(model_version,'')) != 'RESEARCH_MULTI_CTX_1H'
+                ORDER BY id DESC
+                LIMIT ?
+            """, (rid, int(lookback) + 1)).fetchall()
+            closes = [
+                float(v)
+                for v in (safe_float(r["exec_close"]) for r in reversed(rows))
+                if v is not None
+            ]
+            calc = calculate_trend_efficiency_from_closes(closes)
+            states[lookback] = safe_str(calc.get("efficiency_state") or "INSUFFICIENT_DATA")
+            efficiencies[lookback] = safe_float(calc.get("trend_efficiency"))
+            candles_found[lookback] = len(closes)
+
+    insufficient = any(candles_found.get(lb, 0) < lb + 1 for lb in (8, 12, 24))
+    blocked = False if insufficient else _metals_xau_persistent_chop_from_states(
+        states.get(8), states.get(12), states.get(24)
+    )
+    return {
+        **base,
+        "allow": not blocked,
+        "blocked": blocked,
+        "decision": "BLOCK" if blocked else "ALLOW",
+        "reason": (
+            "xau_persistent_chop_8h_12h_24h"
+            if blocked
+            else "insufficient_history_fail_open"
+            if insufficient
+            else "no_persistent_chop"
+        ),
+        "requested_raw_signal_id": int(raw_signal_id or 0),
+        "evaluated_raw_signal_id": rid,
+        "signal_time": safe_str(signal["timestamp_readable"]),
+        "efficiency_8h": efficiencies.get(8),
+        "efficiency_state_8h": states.get(8),
+        "efficiency_12h": efficiencies.get(12),
+        "efficiency_state_12h": states.get(12),
+        "efficiency_24h": efficiencies.get(24),
+        "efficiency_state_24h": states.get(24),
+        "candles_found": candles_found,
     }
 
 
@@ -26257,6 +26393,34 @@ def execute_metals_xau_live_candidate(
             "reason": "xau_short_remains_practice",
         }
 
+    chop_brake = metals_xau_live_persistent_chop_gate(
+        int(raw_signal_id),
+        revalidate_latest=(safe_str(source) == "market_reopen_retry"),
+    )
+    if not bool(chop_brake.get("allow", True)):
+        _metals_xau_live_audit(
+            raw_signal_id,
+            "entry_persistent_chop_brake",
+            "BLOCKED",
+            (
+                "New LIVE XAU LONG blocked by persistent chop: "
+                f"8h={safe_str(chop_brake.get('efficiency_state_8h'))}, "
+                f"12h={safe_str(chop_brake.get('efficiency_state_12h'))}, "
+                f"24h={safe_str(chop_brake.get('efficiency_state_24h'))}"
+            ),
+            response=chop_brake,
+        )
+        return {
+            "ok": True,
+            "blocked": True,
+            "execution_lane": "LIVE_XAU_LONG",
+            "asset": "XAUUSD",
+            "side": "long",
+            "reason": "xau_persistent_chop_brake",
+            "persistent_chop_brake": chop_brake,
+            "existing_trades_unchanged": True,
+        }
+
     cfg = metals_xau_live_config_status()
     if not cfg.get("orders_allowed"):
         _metals_xau_live_audit(
@@ -26559,6 +26723,7 @@ def execute_metals_xau_live_candidate(
         "preview": preview,
         "candidate": model,
         "production_candidate": effective,
+        "persistent_chop_brake": chop_brake,
         "active_exit_policy": {
             "policy": METALS_XAU_LONG_MFE50_POLICY,
             "version": METALS_XAU_LONG_MFE50_POLICY_VERSION,
@@ -42494,7 +42659,7 @@ def _metals_xau_live_dashboard_html() -> str:
             <div class="mini-card"><div class="k">All-Time XAU Live</div><div class="v {pnl_class(all_time.get('net_realized_gbp'))}">{money(all_time.get('net_realized_gbp'),'GBP')}</div><div class="small">{_metals_fmt(all_time.get('realized_r'),2)}R</div></div>
             <div class="mini-card"><div class="k">Next Live Harvest</div><div class="v">{_metals_fmt(harvest.get('next_harvest_r'),0)}R</div><div class="small">50R ladder · live XAU only</div></div>
           </div>
-          <div class="section-note small"><strong>Active live exit:</strong> MFE50 after the existing 48h minimum. Live HWM/harvest/accounting are XAU LONG only and cannot include demo XAG/XAU-short P&amp;L.</div>
+          <div class="section-note small"><strong>Live XAU entry protection:</strong> persistent-chop brake {'ON' if cfg.get('persistent_chop_brake_enabled') else 'OFF'} — blocks only new XAU LONG entries when 8h is CHOPPY and 12h/24h are CHOPPY or MIXED. Existing trades are untouched.<br><strong>Active live exit:</strong> ATR2 after the existing 48h minimum. Live HWM/harvest/accounting are XAU LONG only and cannot include demo XAG/XAU-short P&amp;L.</div>
           <h3>Open XAU LONG Live Trades</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Signal</th><th>Effective Risk</th><th>Entry</th><th>Stop</th><th>Current R</th><th>MFE</th><th>Hold</th><th>MFE50 Decision</th></tr></thead><tbody>{rows or '<tr><td colspan="9">No live XAU LONG trades open.</td></tr>'}</tbody></table></div>
           <div class="section-note small"><a href="/broker/xau-live/status">live status JSON</a> · <a href="/broker/xau-live/preview">live sizing preview</a> · <a href="/broker/xau-live/accounting">live accounting</a> · <a href="/broker/xau-live/harvest">live harvest</a></div>
         """
@@ -42965,6 +43130,7 @@ def metals_build_integrity() -> Dict[str, Any]:
         "_metals_accounting_performance_html",
         "_metals_accounting_performance_safe_html",
         "metals_xau_live_config_status",
+        "metals_xau_live_persistent_chop_gate",
         "execute_metals_xau_live_candidate",
         "metals_xau_live_manager_tick",
         "metals_xau_live_broker_snapshot",
@@ -43133,7 +43299,7 @@ def metals_standard_status() -> Dict[str, Any]:
         "environment": "practice",
         "dashboard_mode": "dark_compact_lazy",
         "legacy_dashboard": "/dashboard-full",
-        "trading_logic_changed": False,
+        "trading_logic_changed": True,
         "manager_contract": {
             "minimum_hold_candles": METALS_DEMO_MANAGER_MIN_HOLD_CANDLES,
             "hourly_post_48h_review": True,
@@ -43149,6 +43315,8 @@ def metals_standard_status() -> Dict[str, Any]:
             "weekly_monthly_broker_accounting": True,
             "split_live_demo_execution": True,
             "xau_long_execution_lane": "LIVE_XAU_LONG",
+            "xau_long_persistent_chop_brake": "LIVE_ENTRY_ONLY",
+            "xau_long_persistent_chop_brake_version": METALS_XAU_LONG_PERSISTENT_CHOP_BRAKE_VERSION,
             "xau_short_execution_lane": "PRACTICE",
             "xag_long_execution_lane": "PRACTICE",
             "xag_short_execution_lane": "PRACTICE",
