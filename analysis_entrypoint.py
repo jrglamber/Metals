@@ -434,6 +434,66 @@ def analysis_summary() -> Dict[str, Any]:
     }
 
 
+@app.get("/analysis/practice-performance")
+def analysis_practice_performance() -> Dict[str, Any]:
+    """Full-history read-only practice-lane performance from the demo audit ledger."""
+    lanes = ("XAUUSD_SHORT", "XAGUSD_LONG", "XAGUSD_SHORT")
+    result = {k: {"all_time":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0},
+                  "week":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0},
+                  "month":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0}} for k in lanes}
+    try:
+        with _read_conn() as conn:
+            rows = conn.execute("""SELECT created_at_utc, link_id, asset, action, status, actual_units, raw_json
+                                   FROM metals_demo_execution_audit
+                                   WHERE action IN ('entry','manager_close')
+                                   ORDER BY created_at_utc ASC, id ASC""").fetchall()
+        entry_lane = {}
+        now = datetime.now(timezone.utc)
+        week_start = now.replace(hour=0,minute=0,second=0,microsecond=0) - __import__("datetime").timedelta(days=now.weekday())
+        month_start = now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+        def lane(asset, units):
+            try: u=float(units)
+            except Exception: return None
+            a=str(asset or "").upper()
+            side="LONG" if u>0 else "SHORT"
+            key=a+"_"+side
+            return key if key in result else None
+        for rr in rows:
+            r=dict(rr) if isinstance(rr,dict) else {}
+            ts=r.get("created_at_utc")
+            if isinstance(ts,str):
+                try: ts=datetime.fromisoformat(ts.replace("Z","+00:00"))
+                except Exception: ts=None
+            windows=["all_time"]
+            if ts and ts>=week_start: windows.append("week")
+            if ts and ts>=month_start: windows.append("month")
+            if r.get("action")=="entry" and r.get("status")=="OPENED":
+                key=lane(r.get("asset"),r.get("actual_units"))
+                if key:
+                    entry_lane[r.get("link_id")]=key
+                    for w in windows: result[key][w]["entries"]+=1
+            elif r.get("action")=="manager_close" and r.get("status")=="CLOSED":
+                key=entry_lane.get(r.get("link_id"))
+                if not key: continue
+                try:
+                    raw=__import__("json").loads(r.get("raw_json") or "{}")
+                    fill=(((raw.get("response") or {}).get("data") or {}).get("orderFillTransaction") or {})
+                    pl=float(fill.get("pl"))
+                except Exception: continue
+                for w in windows:
+                    x=result[key][w]; x["closes"]+=1; x["realised_gbp"]+=pl
+                    if pl>0: x["wins"]+=1
+                    elif pl<0: x["losses"]+=1
+        for lane_data in result.values():
+            for x in lane_data.values(): x["realised_gbp"]=round(x["realised_gbp"],4)
+        return {"status":"ok","project":PROJECT_NAME,"read_only_interface":True,"execution_authority":False,
+                "time_utc":_now(),"week_start_utc":week_start.isoformat(),"month_start_utc":month_start.isoformat(),
+                "source":"full metals_demo_execution_audit history","lanes":result}
+    except Exception as exc:
+        return {"status":"error","read_only_interface":True,"execution_authority":False,
+                "time_utc":_now(),"error":type(exc).__name__+": "+str(exc),"lanes":result}
+
+
 @app.get("/analysis/performance")
 def analysis_performance() -> Dict[str, Any]:
     """Canonical read-only performance data for automated reviews."""
