@@ -1,4 +1,4 @@
-# VERIFIED BUILD: Metals v1.6.55 XAU LONG Persistent-Chop Entry Brake — cumulative on v1.6.54
+# VERIFIED BUILD: Metals v1.6.56 Entry Lab Shadow — cumulative on v1.6.55
 # Adds one narrow deterministic production change: new live XAUUSD LONG entries are blocked only when 8h efficiency is CHOPPY and both 12h/24h are CHOPPY or MIXED. Existing trades, ATR2 exits, emergency stops, harvesting, risk, XAU shorts and all XAG lanes remain unchanged.
 import os
 import json
@@ -13,6 +13,7 @@ import time
 import shutil
 import threading
 import queue
+import entry_lab
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -26,7 +27,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-METALS_APP_VERSION = "v1.6.55"
+METALS_APP_VERSION = "v1.6.56"
 METALS_BUILD_BASELINE = "cumulative Metals v1.6.54 / 2026-09-30"
 APP_NAME = f"Project Exit Plan — Metals {METALS_APP_VERSION} — XAU Persistent-Chop Brake + ATR2 + Intrahour HWM Harvest + Live Pilot"
 RUNTIME_MODULE = "app_postgres_runtime.py"
@@ -10762,6 +10763,32 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
                 result["xau_long_live_manager"] = metals_xau_live_manager_tick(force=True, source=source)
             result["focused_research"] = record_metals_focused_research(int(new_signal_db_id))
             result["directional_intelligence_research"] = record_metals_directional_intelligence(int(new_signal_db_id))
+            # v1.6.56: common research-only Entry Lab; zero execution authority.
+            try:
+                with get_conn() as _elc:
+                    _elsig = _elc.execute("SELECT pair,forward_test_candidate FROM raw_signals WHERE id=? LIMIT 1",(int(new_signal_db_id),)).fetchone()
+                    _elasset = _project_scope_pair(_elsig["pair"]) if _elsig else ""
+                    _sl = METALS_DEMO_XAU_SL_PCT if _elasset == "XAUUSD" else METALS_DEMO_XAG_SL_PCT
+                    _lane = result.get("metals_demo_lane") if isinstance(result.get("metals_demo_lane"), dict) else {}
+                    _actual = _lane.get("entry_created")
+                    result["entry_lab_shadow"] = entry_lab.capture(
+                        _elc,
+                        project="METALS",
+                        raw_signal_id=int(new_signal_db_id),
+                        baseline_candidate=bool(is_true(_elsig["forward_test_candidate"])) if _elsig else False,
+                        actual_entry=(bool(_actual) if _actual is not None else None),
+                        sl_pct=float(_sl),
+                        now_utc_iso=now_utc_iso(),
+                    )
+                    result["entry_lab_outcomes"] = entry_lab.update_outcomes(
+                        _elc, safe_str(_elsig["pair"]) if _elsig else "", now_utc_iso(), max_rows=400
+                    ) if _elsig else {"ok":True,"skipped":True}
+                    _elc.commit()
+            except Exception as _el_exc:
+                result["entry_lab_shadow"] = {
+                    "ok":False,"research_only":True,"execution_authority":False,
+                    "error":f"{type(_el_exc).__name__}: {_el_exc}",
+                }
             try:
                 _scope_asset = _metals_demo_asset(_scope_pair)
                 if _scope_asset == "XAGUSD":
