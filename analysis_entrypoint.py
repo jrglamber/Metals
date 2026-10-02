@@ -21,8 +21,8 @@ from fastapi.responses import Response
 # object during import/startup. Analysis routes live on this wrapper and the
 # unchanged production application is mounted only after those routes exist.
 app = FastAPI(title="Project Exit Plan — Analysis Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.11.1-xau-chop-brake-live"
-VISIBLE_RELEASE_VERSION = "v1.6.55-xau-chop-brake"
+ANALYSIS_INTERFACE_VERSION = "2.11.2-entry-lab-shadow"
+VISIBLE_RELEASE_VERSION = "v1.6.56-entry-lab-shadow"
 PROJECT_NAME = os.getenv("PEP_ANALYSIS_PROJECT", "metals")
 
 
