@@ -434,6 +434,21 @@ def analysis_summary() -> Dict[str, Any]:
     }
 
 
+def _practice_accounting_schema():
+    """Read-only schema metadata for practice accounting tables."""
+    names=("metals_demo_execution_audit","metals_demo_harvest_events","metals_demo_hwm_events","broker_trade_links","open_trades","closed_trades")
+    out={}
+    for name in names:
+        try: out[name]=_table_columns(name)
+        except Exception: out[name]=[]
+    return out
+
+@app.get("/analysis/practice-accounting-schema")
+def analysis_practice_accounting_schema() -> Dict[str, Any]:
+    return {"status":"ok","read_only_interface":True,"execution_authority":False,
+            "time_utc":_now(),"tables":_practice_accounting_schema()}
+
+
 @app.get("/analysis/practice-performance")
 def analysis_practice_performance() -> Dict[str, Any]:
     """Full-history read-only practice-lane performance from the demo audit ledger."""
