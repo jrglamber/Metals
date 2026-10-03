@@ -472,7 +472,7 @@ def analysis_practice_performance() -> Dict[str, Any]:
                                      ORDER BY created_at_utc,id""").fetchall()
             links=conn.execute("""SELECT id,shadow_asset,instrument,side,status,last_known_units,last_known_unrealized_pl
                                   FROM broker_trade_links
-                                  WHERE mode='practice' OR environment='practice' OR source ILIKE '%demo%'""").fetchall()
+                                  WHERE mode='practice' OR environment='practice' OR source ILIKE '%%demo%%'""").fetchall()
         now=datetime.now(timezone.utc)
         td=__import__("datetime").timedelta
         week_start=now.replace(hour=0,minute=0,second=0,microsecond=0)-td(days=now.weekday())
