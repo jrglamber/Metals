@@ -443,6 +443,23 @@ def _practice_accounting_schema():
         except Exception: out[name]=[]
     return out
 
+@app.get("/analysis/practice-accounting-sample")
+def analysis_practice_accounting_sample() -> Dict[str, Any]:
+    """Sanitized recent rows to validate lane/link semantics; no raw broker payloads."""
+    out={}
+    queries={
+      "harvests": """SELECT created_at_utc,cycle_id,stage_id,link_id,broker_trade_id,asset,side,realized_pl_gbp,status,reason FROM metals_demo_harvest_events ORDER BY id DESC LIMIT 20""",
+      "links": """SELECT id,source,mode,shadow_asset,instrument,side,status,last_known_units,last_known_unrealized_pl,opened_at_utc,closed_at_utc FROM broker_trade_links ORDER BY id DESC LIMIT 30"""
+    }
+    try:
+        with _read_conn() as conn:
+            for k,q in queries.items():
+                rows=conn.execute(q).fetchall()
+                out[k]=[{kk:_jsonable(vv) for kk,vv in (dict(r) if isinstance(r,dict) else {}).items()} for r in rows]
+        return {"status":"ok","read_only_interface":True,"execution_authority":False,"time_utc":_now(),"data":out}
+    except Exception as exc:
+        return {"status":"error","error":type(exc).__name__+": "+str(exc),"data":out}
+
 @app.get("/analysis/practice-accounting-schema")
 def analysis_practice_accounting_schema() -> Dict[str, Any]:
     return {"status":"ok","read_only_interface":True,"execution_authority":False,
