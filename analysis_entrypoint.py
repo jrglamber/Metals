@@ -443,6 +443,23 @@ def _practice_accounting_schema():
         except Exception: out[name]=[]
     return out
 
+@app.get("/analysis/practice-history-sample")
+def analysis_practice_history_sample() -> Dict[str, Any]:
+    """Sanitized populated practice sources for P&L/HWM reconciliation."""
+    out={}
+    queries={
+      "execution_actions": """SELECT action,status,COUNT(*) AS n FROM metals_demo_execution_audit GROUP BY action,status ORDER BY n DESC""",
+      "hwm_recent": """SELECT created_at_utc,observed_at_utc,event_type,open_count,current_gbp,current_r,high_water_gbp,high_water_r,source FROM metals_demo_hwm_events ORDER BY id DESC LIMIT 40"""
+    }
+    try:
+        with _read_conn() as conn:
+            for k,q in queries.items():
+                rows=conn.execute(q).fetchall()
+                out[k]=[{kk:_jsonable(vv) for kk,vv in (dict(r) if isinstance(r,dict) else {}).items()} for r in rows]
+        return {"status":"ok","read_only_interface":True,"execution_authority":False,"time_utc":_now(),"data":out}
+    except Exception as exc:
+        return {"status":"error","error":type(exc).__name__+": "+str(exc),"data":out}
+
 @app.get("/analysis/practice-accounting-sample")
 def analysis_practice_accounting_sample() -> Dict[str, Any]:
     """Sanitized recent rows to validate lane/link semantics; no raw broker payloads."""
