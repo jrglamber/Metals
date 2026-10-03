@@ -451,59 +451,91 @@ def analysis_practice_accounting_schema() -> Dict[str, Any]:
 
 @app.get("/analysis/practice-performance")
 def analysis_practice_performance() -> Dict[str, Any]:
-    """Full-history read-only practice-lane performance from the demo audit ledger."""
-    lanes = ("XAUUSD_SHORT", "XAGUSD_LONG", "XAGUSD_SHORT")
-    result = {k: {"all_time":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0},
-                  "week":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0},
-                  "month":{"entries":0,"closes":0,"wins":0,"losses":0,"realised_gbp":0.0}} for k in lanes}
+    """Full-history broker-reconciled practice performance, including harvests and open UPL."""
+    lanes=("XAUUSD_SHORT","XAGUSD_LONG","XAGUSD_SHORT")
+    blank=lambda: {"entries":0,"final_closes":0,"harvests":0,"wins":0,"losses":0,"realised_gbp":0.0}
+    result={k:{"all_time":blank(),"week":blank(),"month":blank(),
+               "open":{"trades":0,"unrealised_gbp":0.0}} for k in lanes}
     try:
         with _read_conn() as conn:
-            rows = conn.execute("""SELECT created_at_utc, link_id, asset, action, status, actual_units, raw_json
+            entries=conn.execute("""SELECT created_at_utc,link_id,asset,actual_units
+                                    FROM metals_demo_execution_audit
+                                    WHERE action='entry' AND status='OPENED'
+                                    ORDER BY created_at_utc,id""").fetchall()
+            closes=conn.execute("""SELECT created_at_utc,link_id,raw_json
                                    FROM metals_demo_execution_audit
-                                   WHERE action IN ('entry','manager_close')
-                                   ORDER BY created_at_utc ASC, id ASC""").fetchall()
-        entry_lane = {}
-        now = datetime.now(timezone.utc)
-        week_start = now.replace(hour=0,minute=0,second=0,microsecond=0) - __import__("datetime").timedelta(days=now.weekday())
-        month_start = now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
-        def lane(asset, units):
-            try: u=float(units)
+                                   WHERE action='manager_close' AND status='CLOSED'
+                                   ORDER BY created_at_utc,id""").fetchall()
+            harvests=conn.execute("""SELECT created_at_utc,link_id,asset,side,realized_pl_gbp,status
+                                     FROM metals_demo_harvest_events
+                                     WHERE realized_pl_gbp IS NOT NULL
+                                     ORDER BY created_at_utc,id""").fetchall()
+            links=conn.execute("""SELECT id,shadow_asset,instrument,side,status,last_known_units,last_known_unrealized_pl
+                                  FROM broker_trade_links
+                                  WHERE mode='practice' OR environment='practice' OR source ILIKE '%demo%'""").fetchall()
+        now=datetime.now(timezone.utc)
+        td=__import__("datetime").timedelta
+        week_start=now.replace(hour=0,minute=0,second=0,microsecond=0)-td(days=now.weekday())
+        month_start=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+        def d(r): return dict(r) if isinstance(r,dict) else {}
+        def parse_ts(v):
+            if isinstance(v,datetime): return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+            try: return datetime.fromisoformat(str(v).replace("Z","+00:00"))
             except Exception: return None
-            a=str(asset or "").upper()
-            side="LONG" if u>0 else "SHORT"
-            key=a+"_"+side
+        def windows(ts):
+            out=["all_time"]
+            if ts and ts>=week_start: out.append("week")
+            if ts and ts>=month_start: out.append("month")
+            return out
+        def lane(asset,side=None,units=None):
+            a=str(asset or "").upper().replace("_","")
+            if a=="XAU": a="XAUUSD"
+            if a=="XAG": a="XAGUSD"
+            s=str(side or "").upper()
+            if not s and units is not None:
+                try: s="LONG" if float(units)>0 else "SHORT"
+                except Exception: return None
+            key=a+"_"+s
             return key if key in result else None
-        for rr in rows:
-            r=dict(rr) if isinstance(rr,dict) else {}
-            ts=r.get("created_at_utc")
-            if isinstance(ts,str):
-                try: ts=datetime.fromisoformat(ts.replace("Z","+00:00"))
-                except Exception: ts=None
-            windows=["all_time"]
-            if ts and ts>=week_start: windows.append("week")
-            if ts and ts>=month_start: windows.append("month")
-            if r.get("action")=="entry" and r.get("status")=="OPENED":
-                key=lane(r.get("asset"),r.get("actual_units"))
-                if key:
-                    entry_lane[r.get("link_id")]=key
-                    for w in windows: result[key][w]["entries"]+=1
-            elif r.get("action")=="manager_close" and r.get("status")=="CLOSED":
-                key=entry_lane.get(r.get("link_id"))
-                if not key: continue
-                try:
-                    raw=__import__("json").loads(r.get("raw_json") or "{}")
-                    fill=(((raw.get("response") or {}).get("data") or {}).get("orderFillTransaction") or {})
-                    pl=float(fill.get("pl"))
-                except Exception: continue
-                for w in windows:
-                    x=result[key][w]; x["closes"]+=1; x["realised_gbp"]+=pl
-                    if pl>0: x["wins"]+=1
-                    elif pl<0: x["losses"]+=1
-        for lane_data in result.values():
-            for x in lane_data.values(): x["realised_gbp"]=round(x["realised_gbp"],4)
+        entry_lane={}
+        for rr in entries:
+            r=d(rr); key=lane(r.get("asset"),units=r.get("actual_units"))
+            if not key: continue
+            entry_lane[r.get("link_id")]=key
+            for w in windows(parse_ts(r.get("created_at_utc"))): result[key][w]["entries"]+=1
+        for rr in closes:
+            r=d(rr); key=entry_lane.get(r.get("link_id"))
+            if not key: continue
+            try:
+                raw=__import__("json").loads(r.get("raw_json") or "{}")
+                pl=float(((((raw.get("response") or {}).get("data") or {}).get("orderFillTransaction") or {}).get("pl")))
+            except Exception: continue
+            for w in windows(parse_ts(r.get("created_at_utc"))):
+                x=result[key][w]; x["final_closes"]+=1; x["realised_gbp"]+=pl
+                if pl>0:x["wins"]+=1
+                elif pl<0:x["losses"]+=1
+        for rr in harvests:
+            r=d(rr); key=entry_lane.get(r.get("link_id")) or lane(r.get("asset"),side=r.get("side"))
+            if not key: continue
+            try: pl=float(r.get("realized_pl_gbp"))
+            except Exception: continue
+            for w in windows(parse_ts(r.get("created_at_utc"))):
+                x=result[key][w]; x["harvests"]+=1; x["realised_gbp"]+=pl
+        for rr in links:
+            r=d(rr)
+            if str(r.get("status") or "").upper() not in ("OPEN","OPENED","ACTIVE"): continue
+            key=lane(r.get("shadow_asset") or r.get("instrument"),side=r.get("side"),units=r.get("last_known_units"))
+            if not key: continue
+            try: upl=float(r.get("last_known_unrealized_pl") or 0)
+            except Exception: upl=0.0
+            result[key]["open"]["trades"]+=1; result[key]["open"]["unrealised_gbp"]+=upl
+        for ld in result.values():
+            for w in ("all_time","week","month"): ld[w]["realised_gbp"]=round(ld[w]["realised_gbp"],4)
+            ld["open"]["unrealised_gbp"]=round(ld["open"]["unrealised_gbp"],4)
         return {"status":"ok","project":PROJECT_NAME,"read_only_interface":True,"execution_authority":False,
                 "time_utc":_now(),"week_start_utc":week_start.isoformat(),"month_start_utc":month_start.isoformat(),
-                "source":"full metals_demo_execution_audit history","lanes":result}
+                "accounting":"broker-reconciled manager closes + harvest realized P/L + current broker-link UPL",
+                "lanes":result}
     except Exception as exc:
         return {"status":"error","read_only_interface":True,"execution_authority":False,
                 "time_utc":_now(),"error":type(exc).__name__+": "+str(exc),"lanes":result}
