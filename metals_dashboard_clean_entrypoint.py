@@ -1,9 +1,10 @@
-"""Metals production entrypoint with strict LIVE vs DEMO dashboard separation.
+"""Metals production entrypoint with standard LIVE vs DEMO dashboard layout.
 
 Presentation-only layer on top of metals_unified_entrypoint. Trading/execution
-logic is unchanged. Live XAU and demo/research controls are kept in separate,
-collapsed footer sections so practice positions/accounting cannot visually leak
-into the live portfolio area.
+logic is unchanged. The dashboard follows the standard portfolio layout:
+- Open Trades / Positions = LIVE XAU only
+- Broker / OANDA / Accounting = one section containing LIVE XAU and DEMO / RESEARCH subsections
+- all expandable sections collapsed by default
 """
 from __future__ import annotations
 
@@ -23,7 +24,6 @@ def _scalar(v: Any) -> Any:
 
 @core.app.get("/api/live-xau-open-positions")
 def live_xau_open_positions() -> Dict[str, Any]:
-    """Read-only live XAU position view; excludes all demo/practice positions."""
     try:
         snap = core.metals_xau_live_broker_snapshot() or {}
         trades = []
@@ -38,25 +38,16 @@ def live_xau_open_positions() -> Dict[str, Any]:
                 "price": core.safe_str(t.get("price")),
                 "unrealized_pl": core.safe_float(t.get("unrealizedPL")),
             })
-        return {
-            "ok": bool(snap.get("ok", True)),
-            "scope": "LIVE_XAU_ONLY",
-            "count": len(trades),
-            "trades": trades,
-        }
+        return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "count": len(trades), "trades": trades}
     except Exception as exc:
         return {"ok": False, "scope": "LIVE_XAU_ONLY", "count": 0, "trades": [], "error": f"{type(exc).__name__}: {exc}"}
 
 
 @core.app.get("/api/live-xau-broker-accounting")
 def live_xau_broker_accounting() -> Dict[str, Any]:
-    """Small read-only accounting summary from the LIVE XAU broker snapshot."""
     try:
         snap = core.metals_xau_live_broker_snapshot() or {}
-        wanted = (
-            "nav", "balance", "unrealized", "unrealised", "realized", "realised",
-            "margin", "pl", "pnl", "open_count", "trade_count", "position_count",
-        )
+        wanted = ("nav", "balance", "unrealized", "unrealised", "realized", "realised", "margin", "pl", "pnl", "open_count", "trade_count", "position_count")
         metrics: Dict[str, Any] = {}
 
         def collect(prefix: str, obj: Any, depth: int = 0) -> None:
@@ -74,224 +65,147 @@ def live_xau_broker_accounting() -> Dict[str, Any]:
                         collect(path, v, depth + 1)
 
         collect("", snap)
-        return {
-            "ok": bool(snap.get("ok", True)),
-            "scope": "LIVE_XAU_ONLY",
-            "owned_open_count": len(snap.get("owned_open_trades") or []),
-            "metrics": metrics,
-        }
+        return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "owned_open_count": len(snap.get("owned_open_trades") or []), "metrics": metrics}
     except Exception as exc:
         return {"ok": False, "scope": "LIVE_XAU_ONLY", "owned_open_count": 0, "metrics": {}, "error": f"{type(exc).__name__}: {exc}"}
 
 
 _base_rewrite = analysis._rewrite_dashboard_version
 
-_DASHBOARD_FOOTER_LAYOUT = r'''
-<style id="pep-dashboard-footer-layout-style">
-  #pep-live-open-positions,
-  #pep-live-broker-accounting {
-    margin: 12px 0;
-    border: 1px solid rgba(95,220,145,.30);
-    border-radius: 12px;
-    background: rgba(40,160,90,.055);
-    overflow: hidden;
-  }
-  #pep-live-open-positions summary,
-  #pep-live-broker-accounting summary {
-    cursor: pointer;
-    padding: 13px 15px;
-    font-weight: 800;
-  }
-  #pep-live-open-positions .pep-live-pos-body,
-  #pep-live-broker-accounting .pep-live-account-body { padding: 0 15px 14px; }
-  #pep-live-open-positions table,
-  #pep-live-broker-accounting table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+_STANDARD_LAYOUT = r'''
+<style id="pep-standard-metals-layout-style">
+  #pep-live-section-label, #pep-demo-section-label { display:none !important; }
+  #pep-live-open-positions, #pep-broker-accounting-combined { margin:12px 0; }
+  #pep-live-open-positions .pep-body, #pep-broker-accounting-combined .pep-body { padding:0 14px 14px; }
+  #pep-live-open-positions table, #pep-broker-accounting-combined table { width:100%; border-collapse:collapse; font-size:.88rem; }
   #pep-live-open-positions th, #pep-live-open-positions td,
-  #pep-live-broker-accounting th, #pep-live-broker-accounting td {
-    padding: 7px 8px;
-    border-bottom: 1px solid rgba(255,255,255,.08);
-    text-align: left;
-  }
-  .pep-empty { opacity: .72; padding: 8px 0 2px; }
-  #pep-dashboard-footer-separation { margin-top: 42px; }
+  #pep-broker-accounting-combined th, #pep-broker-accounting-combined td { padding:7px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }
+  .pep-empty { opacity:.72; padding:8px 0 2px; }
+  .pep-nested { margin:10px 0; border:1px solid rgba(255,255,255,.12); border-radius:10px; overflow:hidden; }
+  .pep-nested > summary { cursor:pointer; padding:11px 12px; font-weight:750; }
+  .pep-nested-body { padding:0 12px 12px; }
 </style>
-<script id="pep-dashboard-footer-layout-script">
-(function () {
-  function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
-  function allEls() { return Array.prototype.slice.call(document.querySelectorAll('body *')); }
-
-  function nearestWidget(el) {
-    var p = el;
-    for (var i = 0; i < 8 && p; i++, p = p.parentElement) {
-      if (!p) break;
-      var tag = (p.tagName || '').toLowerCase();
-      var cls = String(p.className || '').toLowerCase();
-      if (tag === 'details' || tag === 'section' || /card|panel|block|widget|section/.test(cls)) return p;
+<script id="pep-standard-metals-layout-script">
+(function(){
+  function norm(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+  function allEls(){ return Array.prototype.slice.call(document.querySelectorAll('body *')); }
+  function nearestWidget(el){
+    var p=el;
+    for(var i=0;i<8 && p;i++,p=p.parentElement){
+      if(!p) break;
+      var tag=(p.tagName||'').toLowerCase();
+      var cls=String(p.className||'').toLowerCase();
+      if(tag==='details'||tag==='section'||/card|panel|block|widget|section/.test(cls)) return p;
     }
     return el;
   }
-
-  function findText(needle) {
-    var n = needle.toLowerCase();
-    var els = allEls();
-    for (var i = 0; i < els.length; i++) {
-      var t = norm(els[i].textContent).toLowerCase();
-      if (t === n || t.indexOf(n) !== -1) return els[i];
+  function findExact(labels, excludeSelector){
+    var els=allEls();
+    for(var i=0;i<els.length;i++){
+      if(excludeSelector && els[i].closest && els[i].closest(excludeSelector)) continue;
+      var t=norm(els[i].textContent).toLowerCase();
+      for(var j=0;j<labels.length;j++) if(t===labels[j]) return els[i];
     }
     return null;
   }
+  function collapseAll(root){ (root||document).querySelectorAll('details').forEach(function(d){ d.open=false; }); }
 
-  function findLegacyOpenTrades() {
-    var els = allEls();
-    for (var i = 0; i < els.length; i++) {
-      var t = norm(els[i].textContent).toLowerCase();
-      if ((t === 'open trades / positions' || t === 'open trades/positions' || t === 'demo open trades / positions') &&
-          !els[i].closest('#pep-live-open-positions')) return els[i];
-    }
-    return null;
+  function findDemoOpenWidget(){
+    var h=findExact(['demo open trades / positions','open trades / positions','open trades/positions'],'#pep-live-open-positions');
+    return h ? nearestWidget(h) : null;
+  }
+  function findDemoAccountingWidget(){
+    var h=findExact(['demo broker / oanda / accounting','broker / oanda / accounting'],'#pep-broker-accounting-combined');
+    return h ? nearestWidget(h) : null;
   }
 
-  function relabelDemoOpen(widget) {
-    if (!widget) return;
-    var candidates = widget.querySelectorAll('summary,h1,h2,h3,h4,h5,strong,b,div,span');
-    for (var i = 0; i < candidates.length; i++) {
-      var t = norm(candidates[i].textContent).toLowerCase();
-      if (t === 'open trades / positions' || t === 'open trades/positions' || t === 'demo open trades / positions') {
-        candidates[i].textContent = 'Demo Open Trades / Positions';
-        break;
-      }
-    }
-    widget.setAttribute('data-pep-demo-only', '1');
-  }
-
-  function ensureLiveOpenPositions() {
-    var d = document.getElementById('pep-live-open-positions');
-    if (!d) {
-      d = document.createElement('details');
-      d.id = 'pep-live-open-positions';
-      d.innerHTML = '<summary>Live Open Trades / Positions — XAU only</summary><div class="pep-live-pos-body"><div class="pep-empty">Loading live XAU positions…</div></div>';
-      fetch('/api/live-xau-open-positions', {cache:'no-store'})
-        .then(function(r){ return r.json(); })
-        .then(function(data){
-          var body = d.querySelector('.pep-live-pos-body');
-          var rows = (data && data.trades) || [];
-          if (!rows.length) {
-            body.innerHTML = '<div class="pep-empty">No live XAU positions open.</div>';
-            return;
-          }
-          var html = '<table><thead><tr><th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L</th><th>Opened</th></tr></thead><tbody>';
-          rows.forEach(function(x){
-            html += '<tr><td>'+(x.instrument||'XAU_USD')+'</td><td>'+String(x.side||'').toUpperCase()+'</td><td>'+x.units+'</td><td>'+(x.price||'')+'</td><td>'+(x.unrealized_pl == null ? '' : x.unrealized_pl)+'</td><td>'+(x.open_time||'')+'</td></tr>';
-          });
-          html += '</tbody></table>';
-          body.innerHTML = html;
-        })
-        .catch(function(){
-          var body = d.querySelector('.pep-live-pos-body');
-          if (body) body.innerHTML = '<div class="pep-empty">Live XAU position view unavailable.</div>';
-        });
-    }
-    d.open = false;
+  function makeLiveOpen(){
+    var d=document.getElementById('pep-live-open-positions');
+    if(d) return d;
+    d=document.createElement('details');
+    d.id='pep-live-open-positions';
+    d.innerHTML='<summary>Open Trades / Positions</summary><div class="pep-body"><div class="pep-empty">Loading live XAU positions…</div></div>';
+    fetch('/api/live-xau-open-positions',{cache:'no-store'}).then(function(r){return r.json();}).then(function(data){
+      var body=d.querySelector('.pep-body'), rows=(data&&data.trades)||[];
+      if(!rows.length){ body.innerHTML='<div class="pep-empty">No live XAU positions open.</div>'; return; }
+      var html='<table><thead><tr><th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L</th><th>Opened</th></tr></thead><tbody>';
+      rows.forEach(function(x){ html+='<tr><td>'+(x.instrument||'XAU_USD')+'</td><td>'+String(x.side||'').toUpperCase()+'</td><td>'+x.units+'</td><td>'+(x.price||'')+'</td><td>'+(x.unrealized_pl==null?'':x.unrealized_pl)+'</td><td>'+(x.open_time||'')+'</td></tr>'; });
+      body.innerHTML=html+'</tbody></table>';
+    }).catch(function(){ var body=d.querySelector('.pep-body'); if(body) body.innerHTML='<div class="pep-empty">Live XAU position view unavailable.</div>'; });
+    d.open=false;
     return d;
   }
 
-  function ensureLiveAccounting() {
-    var d = document.getElementById('pep-live-broker-accounting');
-    if (!d) {
-      d = document.createElement('details');
-      d.id = 'pep-live-broker-accounting';
-      d.innerHTML = '<summary>Live Broker / OANDA / Accounting — XAU only</summary><div class="pep-live-account-body"><div class="pep-empty">Loading live broker/accounting summary…</div></div>';
-      fetch('/api/live-xau-broker-accounting', {cache:'no-store'})
-        .then(function(r){ return r.json(); })
-        .then(function(data){
-          var body = d.querySelector('.pep-live-account-body');
-          var metrics = (data && data.metrics) || {};
-          var keys = Object.keys(metrics);
-          var html = '<div class="pep-empty">Live owned open trades: '+((data && data.owned_open_count) || 0)+'</div>';
-          if (keys.length) {
-            html += '<table><tbody>';
-            keys.forEach(function(k){ html += '<tr><th>'+k+'</th><td>'+metrics[k]+'</td></tr>'; });
-            html += '</tbody></table>';
-          }
-          body.innerHTML = html;
-        })
-        .catch(function(){
-          var body = d.querySelector('.pep-live-account-body');
-          if (body) body.innerHTML = '<div class="pep-empty">Live broker/accounting view unavailable.</div>';
-        });
-    }
-    d.open = false;
-    return d;
-  }
+  function buildCombinedBroker(demoOpen,demoAccounting){
+    var outer=document.getElementById('pep-broker-accounting-combined');
+    if(outer) return outer;
+    outer=document.createElement('details');
+    outer.id='pep-broker-accounting-combined';
+    outer.innerHTML='<summary>Broker / OANDA / Accounting</summary><div class="pep-body"></div>';
+    var body=outer.querySelector('.pep-body');
 
-  function findDemoAccountingWidget() {
-    var el = findText('demo broker / oanda / accounting') || findText('broker / oanda / accounting');
-    if (!el) return null;
-    var w = nearestWidget(el);
-    var cands = w.querySelectorAll ? w.querySelectorAll('summary,h1,h2,h3,h4,h5,strong,b,div,span') : [];
-    for (var i = 0; i < cands.length; i++) {
-      var t = norm(cands[i].textContent).toLowerCase();
-      if (t === 'broker / oanda / accounting' || t === 'demo broker / oanda / accounting') {
-        cands[i].textContent = 'Demo Broker / OANDA / Accounting';
-        break;
+    var live=document.createElement('details');
+    live.className='pep-nested';
+    live.innerHTML='<summary>LIVE — XAU LONG + XAU SHORT</summary><div class="pep-nested-body"><div class="pep-empty">Loading live broker/accounting summary…</div></div>';
+    body.appendChild(live);
+    fetch('/api/live-xau-broker-accounting',{cache:'no-store'}).then(function(r){return r.json();}).then(function(data){
+      var b=live.querySelector('.pep-nested-body'), metrics=(data&&data.metrics)||{}, keys=Object.keys(metrics);
+      var html='<div class="pep-empty">Live owned open trades: '+((data&&data.owned_open_count)||0)+'</div>';
+      if(keys.length){ html+='<table><tbody>'; keys.forEach(function(k){ html+='<tr><th>'+k+'</th><td>'+metrics[k]+'</td></tr>'; }); html+='</tbody></table>'; }
+      b.innerHTML=html;
+    }).catch(function(){ var b=live.querySelector('.pep-nested-body'); if(b) b.innerHTML='<div class="pep-empty">Live broker/accounting view unavailable.</div>'; });
+
+    var demo=document.createElement('details');
+    demo.className='pep-nested';
+    demo.innerHTML='<summary>DEMO / RESEARCH — XAG + legacy practice positions</summary><div class="pep-nested-body"></div>';
+    var db=demo.querySelector('.pep-nested-body');
+    if(demoOpen){
+      var candidates=demoOpen.querySelectorAll ? demoOpen.querySelectorAll('summary,h1,h2,h3,h4,h5,strong,b,div,span') : [];
+      for(var i=0;i<candidates.length;i++){
+        var t=norm(candidates[i].textContent).toLowerCase();
+        if(t==='open trades / positions'||t==='open trades/positions'||t==='demo open trades / positions'){ candidates[i].textContent='Demo Open Trades / Positions'; break; }
       }
+      db.appendChild(demoOpen);
     }
-    w.setAttribute('data-pep-demo-only', '1');
-    return w;
+    if(demoAccounting){
+      var cands=demoAccounting.querySelectorAll ? demoAccounting.querySelectorAll('summary,h1,h2,h3,h4,h5,strong,b,div,span') : [];
+      for(var j=0;j<cands.length;j++){
+        var tt=norm(cands[j].textContent).toLowerCase();
+        if(tt==='broker / oanda / accounting'||tt==='demo broker / oanda / accounting'){ cands[j].textContent='Demo Broker / OANDA / Accounting'; break; }
+      }
+      db.appendChild(demoAccounting);
+    }
+    body.appendChild(demo);
+    outer.open=false; live.open=false; demo.open=false;
+    return outer;
   }
 
-  function collapseEverything(root) {
-    (root || document).querySelectorAll('details').forEach(function(d){ d.open = false; });
-  }
+  function apply(){
+    if(document.documentElement.getAttribute('data-pep-standard-metals')==='1') return true;
+    var demoOpen=findDemoOpenWidget();
+    var demoAccounting=findDemoAccountingWidget();
+    if(!demoOpen || !demoAccounting) return false;
 
-  function applyFooterLayout() {
-    var liveLabel = document.getElementById('pep-live-section-label');
-    var demoLabel = document.getElementById('pep-demo-section-label');
-    var liveOpen = ensureLiveOpenPositions();
-    var liveAccounting = ensureLiveAccounting();
-    var legacyHeading = findLegacyOpenTrades();
-    var demoOpen = legacyHeading ? nearestWidget(legacyHeading) : null;
-    if (demoOpen && demoOpen.id !== 'pep-live-open-positions') relabelDemoOpen(demoOpen);
-    var demoAccounting = findDemoAccountingWidget();
+    // Use the old demo open-trades location as the standard LIVE open-trades location.
+    var openParent=demoOpen.parentNode, openNext=demoOpen.nextSibling;
+    var liveOpen=makeLiveOpen();
+    if(openParent) openParent.insertBefore(liveOpen,openNext);
 
-    var footer = document.getElementById('pep-dashboard-footer-separation');
-    if (!footer) {
-      footer = document.createElement('div');
-      footer.id = 'pep-dashboard-footer-separation';
-      document.body.appendChild(footer);
-    }
+    // Use the old accounting location for one standard combined accounting section.
+    var acctParent=demoAccounting.parentNode, acctNext=demoAccounting.nextSibling;
+    var combined=buildCombinedBroker(demoOpen,demoAccounting);
+    if(acctParent) acctParent.insertBefore(combined,acctNext);
 
-    // Requested order: all live controls together, then all demo/research controls.
-    if (liveLabel) footer.appendChild(liveLabel);
-    footer.appendChild(liveOpen);
-    footer.appendChild(liveAccounting);
-    if (demoLabel) footer.appendChild(demoLabel);
-    if (demoOpen && demoOpen !== footer && !footer.contains(demoOpen)) footer.appendChild(demoOpen);
-    if (demoAccounting && demoAccounting !== footer && !footer.contains(demoAccounting)) footer.appendChild(demoAccounting);
-
-    collapseEverything(document);
-    document.documentElement.setAttribute('data-pep-footer-layout', '1');
+    collapseAll(document);
+    document.documentElement.setAttribute('data-pep-standard-metals','1');
     return true;
   }
 
-  // Run after the older separation script, and keep late-rendered details collapsed.
-  var attempts = 0;
-  var timer = setInterval(function(){
-    attempts += 1;
-    applyFooterLayout();
-    if (attempts > 24) clearInterval(timer);
-  }, 250);
-
-  var observer = new MutationObserver(function(mutations){
-    mutations.forEach(function(m){
-      m.addedNodes.forEach(function(n){
-        if (n && n.nodeType === 1) collapseEverything(n);
-      });
-    });
-  });
-  observer.observe(document.documentElement, {childList:true, subtree:true});
-
-  applyFooterLayout();
+  var attempts=0;
+  var timer=setInterval(function(){ attempts++; if(apply()||attempts>40) clearInterval(timer); },250);
+  var observer=new MutationObserver(function(ms){ ms.forEach(function(m){ m.addedNodes.forEach(function(n){ if(n&&n.nodeType===1) collapseAll(n); }); }); });
+  observer.observe(document.documentElement,{childList:true,subtree:true});
+  apply();
 })();
 </script>
 '''
@@ -303,11 +217,11 @@ def _rewrite_dashboard_version(body: bytes, content_type: str) -> bytes:
         return body
     try:
         text = body.decode("utf-8")
-        if "pep-dashboard-footer-layout-script" not in text:
+        if "pep-standard-metals-layout-script" not in text:
             if "</body>" in text:
-                text = text.replace("</body>", _DASHBOARD_FOOTER_LAYOUT + "\n</body>", 1)
+                text = text.replace("</body>", _STANDARD_LAYOUT + "\n</body>", 1)
             else:
-                text += _DASHBOARD_FOOTER_LAYOUT
+                text += _STANDARD_LAYOUT
         return text.encode("utf-8")
     except Exception:
         return body
