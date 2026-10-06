@@ -1,6 +1,7 @@
 """Temporary read-only runtime diagnostic for XAU short live promotion."""
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Dict
 
@@ -9,10 +10,23 @@ def _pick(row: Dict[str, Any]) -> Dict[str, Any]:
     keep = {}
     for k, v in row.items():
         lk = str(k).lower()
-        if any(t in lk for t in ("id", "time", "asset", "symbol", "instrument", "side", "direction", "action", "signal", "status", "model", "decision", "reason")):
+        if any(t in lk for t in ("id", "time", "asset", "symbol", "instrument", "side", "direction", "action", "signal", "status", "model", "decision", "reason", "candidate", "long", "short")):
             if "secret" not in lk and "token" not in lk and "key" not in lk:
                 keep[str(k)] = v
     return keep
+
+
+def _source_matches(obj: Any, needles: tuple[str, ...]) -> list[str]:
+    try:
+        src = inspect.getsource(obj)
+    except Exception:
+        return []
+    out = []
+    for i, line in enumerate(src.splitlines(), 1):
+        lo = line.lower()
+        if any(n in lo for n in needles):
+            out.append(f"{i}: {line.strip()}")
+    return out[:120]
 
 
 def run(core: Any) -> Dict[str, Any]:
@@ -23,6 +37,8 @@ def run(core: Any) -> Dict[str, Any]:
         "recent_raw_signals": [],
         "recent_live_links": [],
         "broker_open_trades": [],
+        "candidate_callers": {},
+        "webhook_source_matches": [],
     }
     try:
         cfg = dict(core.metals_xau_live_config_status() or {})
@@ -34,7 +50,7 @@ def run(core: Any) -> Dict[str, Any]:
         with core.get_conn() as conn:
             for table, target in (("raw_signals", "recent_raw_signals"), ("metals_xau_live_trade_links", "recent_live_links")):
                 try:
-                    rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 20").fetchall()
+                    rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 30").fetchall()
                     vals = []
                     for r in rows:
                         try:
@@ -47,6 +63,37 @@ def run(core: Any) -> Dict[str, Any]:
                     out[target + "_error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         out["db_error"] = f"{type(exc).__name__}: {exc}"
+
+    # Find every core function whose source directly invokes the live XAU candidate.
+    try:
+        for name, obj in vars(core).items():
+            if not callable(obj):
+                continue
+            try:
+                src = inspect.getsource(obj)
+            except Exception:
+                continue
+            if "execute_metals_xau_live_candidate" in src and name != "execute_metals_xau_live_candidate":
+                out["candidate_callers"][name] = _source_matches(
+                    obj,
+                    ("execute_metals_xau_live_candidate", "xau", "side", "long", "short", "candidate", "production"),
+                )
+    except Exception as exc:
+        out["candidate_callers_error"] = f"{type(exc).__name__}: {exc}"
+
+    # Inspect the actual TradingView route handler as registered in FastAPI.
+    try:
+        for route in getattr(core.app, "routes", []):
+            if getattr(route, "path", None) == "/webhook/tradingview":
+                endpoint = getattr(route, "endpoint", None)
+                out["webhook_endpoint"] = getattr(endpoint, "__name__", None)
+                out["webhook_source_matches"] = _source_matches(
+                    endpoint,
+                    ("execute_metals_xau_live_candidate", "xau", "side", "long", "short", "candidate", "production"),
+                )
+                break
+    except Exception as exc:
+        out["webhook_source_error"] = f"{type(exc).__name__}: {exc}"
 
     try:
         account = getattr(core, "METALS_XAU_LIVE_OANDA_ACCOUNT_ID", "")
