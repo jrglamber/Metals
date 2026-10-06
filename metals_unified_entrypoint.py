@@ -5,6 +5,8 @@ promotion and expanded XAU SHORT challenger suite installed into the same core
 runtime. Dashboard wording is updated through the existing safe dashboard
 passthrough in analysis_entrypoint, which rebuilds response headers rather than
 mutating an already-sized ASGI body.
+
+Build marker: 2026-10-06 upstream-error recovery.
 """
 from __future__ import annotations
 
