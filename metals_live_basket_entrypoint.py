@@ -3,7 +3,7 @@
 - Installs the explicit long+short live basket-manager adapter.
 - Builds the LIVE basket/profit-protection panel only from live XAU state.
 - Moves legacy practice/demo basket-manager widgets into demo/research.
-- Supports an idempotent one-shot live protection-cycle rebase via Railway token.
+- Supports an idempotent one-shot live protection-cycle rebase via Railway reset id.
 """
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ analysis = base.analysis
 core = base.core
 LIVE_XAU_BASKET_MANAGER_STATUS = xau_live_basket_manager_override.install(core)
 
-RESET_TOKEN_ENV = "METALS_XAU_LIVE_PROTECTION_RESET_TOKEN"
-RESET_MARKER_KEY = "live_dashboard_protection_reset_token"
+RESET_ID_ENV = "METALS_XAU_LIVE_PROTECTION_RESET_ID"
+RESET_MARKER_KEY = "live_dashboard_protection_reset_id"
 RESET_AT_KEY = "live_dashboard_protection_reset_at"
 RESET_SOURCE = "manual_live_xau_dashboard_rebase"
 
@@ -64,26 +64,26 @@ def _rows(conn: Any, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
         return []
 
 
-def _live_reset_token_applied(token: str) -> bool:
-    if not token:
+def _live_reset_id_applied(reset_id: str) -> bool:
+    if not reset_id:
         return True
     try:
         with core.get_conn() as conn:
-            return _ss(core._metals_xau_live_runtime_get(conn, RESET_MARKER_KEY, "")) == token
+            return _ss(core._metals_xau_live_runtime_get(conn, RESET_MARKER_KEY, "")) == reset_id
     except Exception:
         return False
 
 
-def _reset_live_xau_protection_cycle(token: str) -> Dict[str, Any]:
+def _reset_live_xau_protection_cycle(reset_id: str) -> Dict[str, Any]:
     """Rebase only the LIVE-XAU HWM/protection cycle to the current live basket.
 
     No OANDA order is sent and no trade is changed. Historical rows are preserved.
     The reset fails closed unless every owned live XAU trade reconciles exactly.
     """
-    if not token:
-        return {"ok": True, "skipped": True, "reason": "no_reset_token"}
-    if _live_reset_token_applied(token):
-        return {"ok": True, "skipped": True, "reason": "token_already_applied", "token": token}
+    if not reset_id:
+        return {"ok": True, "skipped": True, "reason": "no_reset_id"}
+    if _live_reset_id_applied(reset_id):
+        return {"ok": True, "skipped": True, "reason": "reset_id_already_applied", "reset_id": reset_id}
 
     broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
     if not broker.get("ok"):
@@ -136,7 +136,7 @@ def _reset_live_xau_protection_cycle(token: str) -> Dict[str, Any]:
             ("broker_hwm_seen_at", observed if (new_hwm_gbp > 0 or new_hwm_r > 0) else ""),
             ("active_harvest_cycle_id", ""),
             ("harvest_last_seen_hwm_r", 0.0),
-            (RESET_MARKER_KEY, token),
+            (RESET_MARKER_KEY, reset_id),
             (RESET_AT_KEY, observed),
         ):
             core._metals_xau_live_runtime_set(conn, key, value)
@@ -159,7 +159,7 @@ def _reset_live_xau_protection_cycle(token: str) -> Dict[str, Any]:
                             "current_r": current_r, "high_water_gbp": new_hwm_gbp,
                             "high_water_r": new_hwm_r,
                         },
-                        "token": token, "no_broker_orders": True,
+                        "reset_id": reset_id, "no_broker_orders": True,
                         "trades_unchanged": True, "history_preserved": True,
                     }, default=str),
                 ),
@@ -179,13 +179,13 @@ def _reset_live_xau_protection_cycle(token: str) -> Dict[str, Any]:
         core.log_system_event(
             "metals_xau_live_protection_reset",
             "LIVE XAU basket HWM/protection cycle rebased",
-            {"previous": previous, "new_hwm": hwm, "new_cycle": new_cycle, "token": token},
+            {"previous": previous, "new_hwm": hwm, "new_cycle": new_cycle, "reset_id": reset_id},
         )
     except Exception:
         pass
 
     return {
-        "ok": True, "reset": True, "token": token, "reset_at": observed,
+        "ok": True, "reset": True, "reset_id": reset_id, "reset_at": observed,
         "previous": previous, "current_gbp": current_gbp, "current_r": current_r,
         "high_water_gbp": new_hwm_gbp, "high_water_r": new_hwm_r,
         "new_cycle_id": new_cycle, "open_count": open_count,
@@ -194,10 +194,10 @@ def _reset_live_xau_protection_cycle(token: str) -> Dict[str, Any]:
 
 
 _LIVE_RESET_RESULT: Dict[str, Any] = {"ok": True, "skipped": True, "reason": "not_requested"}
-_reset_token = os.getenv(RESET_TOKEN_ENV, "").strip()
-if _reset_token:
+_reset_id = os.getenv(RESET_ID_ENV, "").strip()
+if _reset_id:
     try:
-        _LIVE_RESET_RESULT = _reset_live_xau_protection_cycle(_reset_token)
+        _LIVE_RESET_RESULT = _reset_live_xau_protection_cycle(_reset_id)
     except Exception as exc:
         _LIVE_RESET_RESULT = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
