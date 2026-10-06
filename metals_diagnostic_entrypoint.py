@@ -12,7 +12,9 @@ def _xau_short_runtime_diagnostic_once() -> None:
         print(f"XAU_SHORT_RUNTIME_DIAGNOSTIC_ERROR {type(exc).__name__}: {exc}", flush=True)
 
 
-@base.app.post("/analysis/xau-short-runtime-diagnostic")
+# analysis_entrypoint already mounts core.app at "/" as a catch-all. Register
+# this temporary route on the core app so it remains reachable through that mount.
+@base.analysis.core.app.post("/analysis/xau-short-runtime-diagnostic")
 def xau_short_runtime_diagnostic_route():
     return diag.run(base.analysis.core)
 
