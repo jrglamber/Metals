@@ -1,0 +1,1 @@
+Trigger build after Railway start command switched to metals_dashboard_clean_entrypoint.
