@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from typing import Any, Dict
 
 
@@ -26,7 +27,7 @@ def _source_matches(obj: Any, needles: tuple[str, ...]) -> list[str]:
         lo = line.lower()
         if any(n in lo for n in needles):
             out.append(f"{i}: {line.strip()}")
-    return out[:160]
+    return out[:180]
 
 
 def run(core: Any) -> Dict[str, Any]:
@@ -34,13 +35,9 @@ def run(core: Any) -> Dict[str, Any]:
         "gate": bool(getattr(core, "_metals_xau_short_live_gate_enabled", lambda: False)()),
         "candidate_fn": getattr(getattr(core, "execute_metals_xau_live_candidate", None), "__name__", None),
         "router_fn": getattr(getattr(core, "execute_metals_demo_candidate", None), "__name__", None),
-        "config": {},
-        "recent_raw_signals": [],
-        "recent_live_links": [],
-        "broker_open_trades": [],
-        "candidate_callers": {},
-        "webhook_source_matches": [],
-        "management_source_matches": {},
+        "config": {}, "recent_raw_signals": [], "recent_live_links": [], "broker_open_trades": [],
+        "candidate_callers": {}, "webhook_source_matches": [], "management_source_matches": {},
+        "manager_helper_matches": {},
     }
     try:
         cfg = dict(core.metals_xau_live_config_status() or {})
@@ -53,14 +50,7 @@ def run(core: Any) -> Dict[str, Any]:
             for table, target in (("raw_signals", "recent_raw_signals"), ("metals_xau_live_trade_links", "recent_live_links")):
                 try:
                     rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 30").fetchall()
-                    vals = []
-                    for r in rows:
-                        try:
-                            d = dict(r)
-                        except Exception:
-                            continue
-                        vals.append(_pick(d))
-                    out[target] = vals
+                    out[target] = [_pick(dict(r)) for r in rows]
                 except Exception as exc:
                     out[target + "_error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
@@ -68,17 +58,11 @@ def run(core: Any) -> Dict[str, Any]:
 
     try:
         for name, obj in vars(core).items():
-            if not callable(obj):
-                continue
-            try:
-                src = inspect.getsource(obj)
-            except Exception:
-                continue
+            if not callable(obj): continue
+            try: src = inspect.getsource(obj)
+            except Exception: continue
             if "execute_metals_xau_live_candidate" in src and name != "execute_metals_xau_live_candidate":
-                out["candidate_callers"][name] = _source_matches(
-                    obj,
-                    ("execute_metals_xau_live_candidate", "xau", "side", "long", "short", "candidate", "production"),
-                )
+                out["candidate_callers"][name] = _source_matches(obj,("execute_metals_xau_live_candidate","xau","side","long","short","candidate","production"))
     except Exception as exc:
         out["candidate_callers_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -87,50 +71,38 @@ def run(core: Any) -> Dict[str, Any]:
             if getattr(route, "path", None) == "/webhook/tradingview":
                 endpoint = getattr(route, "endpoint", None)
                 out["webhook_endpoint"] = getattr(endpoint, "__name__", None)
-                out["webhook_source_matches"] = _source_matches(
-                    endpoint,
-                    ("execute_metals_xau_live_candidate", "xau", "side", "long", "short", "candidate", "production"),
-                )
+                out["webhook_source_matches"] = _source_matches(endpoint,("execute_metals_xau_live_candidate","xau","side","long","short","candidate","production"))
                 break
     except Exception as exc:
         out["webhook_source_error"] = f"{type(exc).__name__}: {exc}"
 
-    # Read-only inspection of the downstream live-XAU ownership/management path.
-    for name in (
-        "metals_xau_live_broker_snapshot",
-        "metals_xau_live_manager_tick",
-        "_metals_xau_live_highwater_state",
-        "metals_xau_live_harvest_maintenance_tick",
-        "_metals_xau_live_recover_broker_only",
-        "_metals_xau_live_transaction_owned",
-        "_metals_xau_live_pending_close_retry_tick",
-    ):
+    manager = getattr(core, "metals_xau_live_manager_tick", None)
+    if callable(manager):
+        try:
+            msrc = inspect.getsource(manager)
+            calls = sorted(set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", msrc)))
+            for name in calls:
+                if name.startswith("_metals_xau_live") or name.startswith("metals_xau_live"):
+                    obj = getattr(core, name, None)
+                    if callable(obj) and obj is not manager:
+                        out["manager_helper_matches"][name] = _source_matches(obj,("side","long","short","entry","price","currentunits","units","mfe","mae","current_r","stop","close","policy"))
+        except Exception as exc:
+            out["manager_helper_error"] = f"{type(exc).__name__}: {exc}"
+
+    for name in ("metals_xau_live_broker_snapshot","metals_xau_live_manager_tick","_metals_xau_live_highwater_state","metals_xau_live_harvest_maintenance_tick","_metals_xau_live_recover_broker_only","_metals_xau_live_transaction_owned","_metals_xau_live_pending_close_retry_tick"):
         obj = getattr(core, name, None)
         if callable(obj):
-            out["management_source_matches"][name] = _source_matches(
-                obj,
-                ("currentunits", "units", "side", "long", "short", "owned", "xau_usd", "instrument", "trade_links", "active_exit_policy", "mfe", "close"),
-            )
+            out["management_source_matches"][name] = _source_matches(obj,("currentunits","units","side","long","short","owned","xau_usd","instrument","trade_links","active_exit_policy","mfe","close"))
 
     try:
         account = getattr(core, "METALS_XAU_LIVE_OANDA_ACCOUNT_ID", "")
         resp = core._metals_xau_live_request(f"/v3/accounts/{account}/openTrades")
         data = (resp.get("data") or {}) if isinstance(resp, dict) else {}
-        trades = data.get("trades") or []
-        for t in trades:
+        for t in data.get("trades") or []:
             units = t.get("currentUnits")
-            try:
-                u = float(units)
-            except Exception:
-                u = None
-            out["broker_open_trades"].append({
-                "id": t.get("id"),
-                "instrument": t.get("instrument"),
-                "currentUnits": units,
-                "side": "short" if u is not None and u < 0 else ("long" if u is not None and u > 0 else "flat"),
-                "openTime": t.get("openTime"),
-                "price": t.get("price"),
-            })
+            try: u = float(units)
+            except Exception: u = None
+            out["broker_open_trades"].append({"id":t.get("id"),"instrument":t.get("instrument"),"currentUnits":units,"side":"short" if u is not None and u<0 else ("long" if u is not None and u>0 else "flat"),"openTime":t.get("openTime"),"price":t.get("price")})
         out["broker_open_ok"] = bool(resp.get("ok")) if isinstance(resp, dict) else False
         out["broker_open_error"] = resp.get("error") if isinstance(resp, dict) else None
     except Exception as exc:
