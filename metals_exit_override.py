@@ -1,11 +1,17 @@
-"""Live XAU-long exit-policy override.
+"""Metals live/practice exit-policy override.
 
-Strategy:
-- XAUUSD LONG only
-- 48 hourly candles minimum hold
-- 2x ATR trailing protection after maturity
+Production strategy:
+- XAUUSD LONG: 48 hourly candles minimum hold + 2x ATR chandelier
+- XAUUSD SHORT: 48 hourly candles minimum hold + MFE25 giveback manager
 - existing emergency broker stop and basket harvesting remain authoritative
-- XAG long/short and XAU short remain CURRENT_MANAGER/research-only
+- XAG long/short remain CURRENT_MANAGER/research-only
+
+Important execution boundary:
+The core live-XAU broker lane is historically XAU-LONG-only and explicitly
+rejects shorts before order construction. This module promotes the XAU short
+manager/policy without bypassing that broker guard. A live short order must not
+be enabled until the downstream signed-units and short emergency-stop path is
+verified side-safe.
 """
 from __future__ import annotations
 
@@ -17,6 +23,11 @@ POLICY = "ATR2_CHANDELIER"
 POLICY_VERSION = "metals_xau_long_atr2_48h_v1_2026_09_29"
 MIN_HOLD = 48
 ATR_MULTIPLIER = 2.0
+
+XAU_SHORT_POLICY = "MFE_GIVEBACK_25"
+XAU_SHORT_POLICY_VERSION = "metals_xau_short_mfe25_48h_v1_2026_10_06"
+XAU_SHORT_MIN_HOLD = 48
+XAU_SHORT_GIVEBACK_FRACTION = 0.25
 
 
 def _num(core: Any, value: Any) -> Optional[float]:
@@ -112,24 +123,112 @@ def _old_mfe50(core: Any, metrics: Dict[str, Any]) -> Dict[str, Any]:
     return {"decision": "EXTEND", "phase": phase, "active_exit_policy": "MFE_GIVEBACK_50", "mfe_r": mfe, "mfe_floor_r": floor if mfe > 0 else None, "reason": "Legacy XAU MFE50 policy retained for pre-cutover trade."}
 
 
+def _xau_short_mfe25(core: Any, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """48h minimum, then close after a 25% giveback from MFE.
+
+    A 25% giveback means retaining 75% of the best R achieved. This mirrors the
+    forward-shadow MFE_GIVEBACK_25 definition used in the research export.
+    """
+    h = int(metrics.get("hold_candles") or 0)
+    r = _num(core, metrics.get("current_r"))
+    mfe = max(0.0, _num(core, metrics.get("mfe_r")) or 0.0)
+    phase = core._metals_demo_phase(h)
+    if h < XAU_SHORT_MIN_HOLD:
+        return {
+            "decision": "HOLD_MIN_48",
+            "phase": phase,
+            "active_exit_policy": XAU_SHORT_POLICY,
+            "mfe_r": mfe,
+            "reason": "XAU SHORT MFE25: normal exit locked before 48h; emergency broker stop remains active.",
+        }
+    floor = mfe * (1.0 - XAU_SHORT_GIVEBACK_FRACTION)
+    if mfe > 0 and r is not None and r <= floor:
+        return {
+            "decision": "CLOSE_MFE25_GIVEBACK",
+            "phase": phase,
+            "active_exit_policy": XAU_SHORT_POLICY,
+            "mfe_r": mfe,
+            "mfe_floor_r": floor,
+            "giveback_fraction": XAU_SHORT_GIVEBACK_FRACTION,
+            "reason": "XAU SHORT MFE25 giveback floor reached after 48h.",
+        }
+    return {
+        "decision": "EXTEND",
+        "phase": phase,
+        "active_exit_policy": XAU_SHORT_POLICY,
+        "mfe_r": mfe,
+        "mfe_floor_r": floor if mfe > 0 else None,
+        "giveback_fraction": XAU_SHORT_GIVEBACK_FRACTION,
+        "reason": "XAU SHORT MFE25 active: retain 75% of MFE and review next hourly signal.",
+    }
+
+
+def _xau_short_stop_candidate(core: Any, link: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate the MFE25 R-floor into a tightening short-side broker stop.
+
+    This is inert until the core broker lane supports live shorts; it is kept
+    here so the promoted policy has a side-correct protection implementation
+    ready rather than reusing the long ATR stop formula.
+    """
+    h = int(metrics.get("hold_candles") or 0)
+    if h < XAU_SHORT_MIN_HOLD:
+        return {"eligible": False, "reason": "xau_short_mfe25_pre48"}
+    mfe = max(0.0, _num(core, metrics.get("mfe_r")) or 0.0)
+    current = _num(core, metrics.get("current_price"))
+    entry = _num(core, link.get("entry_price"))
+    if mfe <= 0 or current is None or entry is None or entry <= 0:
+        return {"eligible": False, "reason": "xau_short_mfe25_missing_metrics"}
+    floor_r = mfe * (1.0 - XAU_SHORT_GIVEBACK_FRACTION)
+    initial_stop = _num(core, link.get("stop_price"))
+    if initial_stop is not None and initial_stop > entry:
+        risk_price = initial_stop - entry
+    else:
+        sl_pct = _num(core, getattr(core, "METALS_XAU_LIVE_SL_PCT", 2.21)) or 2.21
+        risk_price = entry * sl_pct / 100.0
+    stop_price = entry - floor_r * risk_price
+    previous = _num(core, link.get("current_stop_price")) or initial_stop
+    step = entry * (_num(core, getattr(core, "METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT", 0.02)) or 0.02) / 100.0
+    if stop_price <= current:
+        return {"eligible": False, "reason": "mfe25_short_stop_at_or_below_current_price", "stop_price": stop_price, "mfe_floor_r": floor_r}
+    if previous is not None and stop_price >= previous - step:
+        return {"eligible": False, "reason": "mfe25_short_would_not_tighten_enough", "stop_price": stop_price, "mfe_floor_r": floor_r}
+    return {
+        "eligible": True,
+        "stop_price": stop_price,
+        "mfe_r": mfe,
+        "mfe_floor_r": floor_r,
+        "giveback_fraction": XAU_SHORT_GIVEBACK_FRACTION,
+        "reason": f"XAU SHORT MFE25 protected stop {stop_price:.3f} retaining 75% of MFE.",
+    }
+
+
 def install(core: Any) -> Dict[str, Any]:
     original_stop = core._metals_xau_live_stop_candidate
     original_status = core.metals_exit_policy_status
+    original_live_config = getattr(core, "metals_xau_live_config_status", None)
 
     core.METALS_XAU_LONG_MFE50_POLICY = POLICY
     core.METALS_XAU_LONG_MFE50_POLICY_VERSION = POLICY_VERSION
     core.METALS_XAU_LONG_MFE50_MIN_HOLD_CANDLES = MIN_HOLD
     core.METALS_XAU_LONG_MFE50_GIVEBACK_FRACTION = 0.50
+    core.METALS_XAU_SHORT_ACTIVE_POLICY = XAU_SHORT_POLICY
+    core.METALS_XAU_SHORT_ACTIVE_POLICY_VERSION = XAU_SHORT_POLICY_VERSION
+    core.METALS_XAU_SHORT_MIN_HOLD_CANDLES = XAU_SHORT_MIN_HOLD
+    core.METALS_XAU_SHORT_GIVEBACK_FRACTION = XAU_SHORT_GIVEBACK_FRACTION
 
     def new_policy(asset: str, side: str) -> Dict[str, str]:
         a = core._metals_demo_asset(asset)
         d = core._metals_demo_side(side)
         if a == "XAUUSD" and d == "long" and getattr(core, "METALS_XAU_LONG_MFE50_ACTIVE_ENABLED", True):
             return {"policy": POLICY, "version": POLICY_VERSION}
+        if a == "XAUUSD" and d == "short":
+            return {"policy": XAU_SHORT_POLICY, "version": XAU_SHORT_POLICY_VERSION}
         return {"policy": "CURRENT_MANAGER", "version": core.METALS_DEMO_MANAGER_VERSION}
 
     def decision(metrics: Dict[str, Any], link: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         policy = core._metals_demo_link_exit_policy(link)
+        if policy == XAU_SHORT_POLICY:
+            return _xau_short_mfe25(core, metrics)
         if policy == "MFE_GIVEBACK_50":
             return _old_mfe50(core, metrics)
         if policy != POLICY:
@@ -147,6 +246,9 @@ def install(core: Any) -> Dict[str, Any]:
 
     def stop_candidate(link: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
         policy = core.safe_str(link.get("active_exit_policy")).upper()
+        side = core.safe_str(link.get("side")).lower()
+        if policy == XAU_SHORT_POLICY and side == "short":
+            return _xau_short_stop_candidate(core, link, metrics)
         if policy != POLICY:
             return original_stop(link, metrics)
         h = int(metrics.get("hold_candles") or 0)
@@ -167,21 +269,52 @@ def install(core: Any) -> Dict[str, Any]:
     def status() -> Dict[str, Any]:
         d = original_status()
         active = d.setdefault("active_execution", {})
-        active.update({"XAUUSD_LONG_new_trades": POLICY, "xau_long_atr2_min_hold_candles": MIN_HOLD,
-                       "xau_long_atr2_multiplier": ATR_MULTIPLIER, "hard_sl_remains_active": True,
-                       "basket_defence_remains_active": True})
+        active.update({
+            "XAUUSD_LONG_new_trades": POLICY,
+            "XAUUSD_SHORT_new_trades": XAU_SHORT_POLICY,
+            "xau_long_atr2_min_hold_candles": MIN_HOLD,
+            "xau_long_atr2_multiplier": ATR_MULTIPLIER,
+            "xau_short_mfe25_min_hold_candles": XAU_SHORT_MIN_HOLD,
+            "xau_short_mfe25_giveback_fraction": XAU_SHORT_GIVEBACK_FRACTION,
+            "xau_short_broker_execution": "BLOCKED_BY_EXISTING_LONG_ONLY_LIVE_GUARD_PENDING_SIDE_SAFE_PROMOTION",
+            "hard_sl_remains_active": True,
+            "basket_defence_remains_active": True,
+        })
         sh = d.setdefault("forward_shadow", {})
         sh["XAUUSD_LONG"] = ["ATR2_CHANDELIER", "MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "MFE_GIVEBACK_75", "FIXED_120H"]
         sh["XAGUSD_LONG"] = ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "MFE_GIVEBACK_75", "ATR2_CHANDELIER"]
-        sh["XAUUSD_SHORT"] = ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"]
+        sh["XAUUSD_SHORT"] = ["MFE_GIVEBACK_50", "ATR2_CHANDELIER"]
         sh["XAGUSD_SHORT"] = ["MFE_GIVEBACK_25", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"]
+        d["promotion_note"] = "XAU SHORT MFE25 is the active policy for new XAU short practice/research-manager trades; broker entry guard remains intentionally intact until the long-only order path is made side-safe."
+        return d
+
+    def live_config_status() -> Dict[str, Any]:
+        d = original_live_config() if callable(original_live_config) else {}
+        d["xau_short_policy"] = XAU_SHORT_POLICY
+        d["xau_short_policy_version"] = XAU_SHORT_POLICY_VERSION
+        d["xau_short_min_hold_candles"] = XAU_SHORT_MIN_HOLD
+        d["xau_short_mfe_giveback_fraction"] = XAU_SHORT_GIVEBACK_FRACTION
+        d["xau_short_policy_promoted"] = True
+        d["xau_short_broker_orders_allowed"] = False
+        d["xau_short_broker_block_reason"] = "core_live_xau_lane_is_long_only_and_requires_side-safe_order/stop promotion"
         return d
 
     core._metals_demo_new_trade_exit_policy = new_policy
     core._metals_demo_decision = decision
     core._metals_xau_live_stop_candidate = stop_candidate
     core.metals_exit_policy_status = status
+    if callable(original_live_config):
+        core.metals_xau_live_config_status = live_config_status
     core.METALS_EXIT_SHADOW_EXECUTION_AUTHORITY = False
-    core.METALS_EXIT_SHADOW_VERSION = "metals_exit_shadow_v2_xau_atr2_48h_2026_09_29"
-    return {"installed": True, "policy": POLICY, "version": POLICY_VERSION, "min_hold_candles": MIN_HOLD,
-            "atr_multiplier": ATR_MULTIPLIER, "practice_lanes_unchanged": True}
+    core.METALS_EXIT_SHADOW_VERSION = "metals_exit_shadow_v3_xau_short_mfe25_promoted_2026_10_06"
+    return {
+        "installed": True,
+        "xau_long_policy": POLICY,
+        "xau_long_version": POLICY_VERSION,
+        "xau_short_policy": XAU_SHORT_POLICY,
+        "xau_short_version": XAU_SHORT_POLICY_VERSION,
+        "xau_short_min_hold_candles": XAU_SHORT_MIN_HOLD,
+        "xau_short_giveback_fraction": XAU_SHORT_GIVEBACK_FRACTION,
+        "xau_short_broker_orders_allowed": False,
+        "xag_lanes_unchanged": True,
+    }
