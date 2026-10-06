@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import analysis_entrypoint as analysis
 import xau_short_live_override
+import xau_short_management_override
 import xau_short_research_override
 
 # analysis_entrypoint has already installed metals_exit_override into this same
-# core module. Layer the approved XAU SHORT live adapter and research-only
-# challenger declaration on top.
+# core module. Layer the approved XAU SHORT live adapter, side-aware live
+# management/reconciliation, and research-only challenger declaration on top.
 XAU_SHORT_LIVE_OVERRIDE_STATUS = xau_short_live_override.install(analysis.core)
+XAU_SHORT_MANAGEMENT_STATUS = xau_short_management_override.install(analysis.core)
 XAU_SHORT_CHALLENGER_STATUS = xau_short_research_override.install(analysis.core)
 
 # Extend the existing safe dashboard rewrite. analysis_entrypoint's dashboard
