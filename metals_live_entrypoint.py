@@ -1,7 +1,9 @@
 import app_postgres_runtime as core
 import xau_short_live_override
+import xau_short_research_override
 
 XAU_SHORT_LIVE_OVERRIDE_STATUS = xau_short_live_override.install(core)
+XAU_SHORT_RESEARCH_OVERRIDE_STATUS = xau_short_research_override.install(core)
 
 
 class _LiveMetalsDashboardCopy:
