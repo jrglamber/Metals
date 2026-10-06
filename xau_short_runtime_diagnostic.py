@@ -26,19 +26,21 @@ def _source_matches(obj: Any, needles: tuple[str, ...]) -> list[str]:
         lo = line.lower()
         if any(n in lo for n in needles):
             out.append(f"{i}: {line.strip()}")
-    return out[:120]
+    return out[:160]
 
 
 def run(core: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "gate": bool(getattr(core, "_metals_xau_short_live_gate_enabled", lambda: False)()),
         "candidate_fn": getattr(getattr(core, "execute_metals_xau_live_candidate", None), "__name__", None),
+        "router_fn": getattr(getattr(core, "execute_metals_demo_candidate", None), "__name__", None),
         "config": {},
         "recent_raw_signals": [],
         "recent_live_links": [],
         "broker_open_trades": [],
         "candidate_callers": {},
         "webhook_source_matches": [],
+        "management_source_matches": {},
     }
     try:
         cfg = dict(core.metals_xau_live_config_status() or {})
@@ -64,7 +66,6 @@ def run(core: Any) -> Dict[str, Any]:
     except Exception as exc:
         out["db_error"] = f"{type(exc).__name__}: {exc}"
 
-    # Find every core function whose source directly invokes the live XAU candidate.
     try:
         for name, obj in vars(core).items():
             if not callable(obj):
@@ -81,7 +82,6 @@ def run(core: Any) -> Dict[str, Any]:
     except Exception as exc:
         out["candidate_callers_error"] = f"{type(exc).__name__}: {exc}"
 
-    # Inspect the actual TradingView route handler as registered in FastAPI.
     try:
         for route in getattr(core.app, "routes", []):
             if getattr(route, "path", None) == "/webhook/tradingview":
@@ -94,6 +94,23 @@ def run(core: Any) -> Dict[str, Any]:
                 break
     except Exception as exc:
         out["webhook_source_error"] = f"{type(exc).__name__}: {exc}"
+
+    # Read-only inspection of the downstream live-XAU ownership/management path.
+    for name in (
+        "metals_xau_live_broker_snapshot",
+        "metals_xau_live_manager_tick",
+        "_metals_xau_live_highwater_state",
+        "metals_xau_live_harvest_maintenance_tick",
+        "_metals_xau_live_recover_broker_only",
+        "_metals_xau_live_transaction_owned",
+        "_metals_xau_live_pending_close_retry_tick",
+    ):
+        obj = getattr(core, name, None)
+        if callable(obj):
+            out["management_source_matches"][name] = _source_matches(
+                obj,
+                ("currentunits", "units", "side", "long", "short", "owned", "xau_usd", "instrument", "trade_links", "active_exit_policy", "mfe", "close"),
+            )
 
     try:
         account = getattr(core, "METALS_XAU_LIVE_OANDA_ACCOUNT_ID", "")
