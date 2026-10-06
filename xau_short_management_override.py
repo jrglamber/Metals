@@ -107,7 +107,8 @@ def install(core: Any) -> Dict[str, Any]:
         "broker recovery side derivation",
     )
     rec = _replace_once(rec, 'METALS_XAU_LIVE_ALLOWED_INSTRUMENT, "long",', 'METALS_XAU_LIVE_ALLOWED_INSTRUMENT, recovery_side,', "broker recovery hard-coded side")
-    rec = _replace_once(rec, '            METALS_XAU_LONG_MFE50_POLICY,\n            METALS_XAU_LONG_MFE50_POLICY_VERSION,\n', '            recovery_policy,\n            recovery_policy_version,\n', "broker recovery hard-coded policy")
+    rec = _replace_once(rec, 'METALS_XAU_LONG_MFE50_POLICY,', 'recovery_policy,', "broker recovery hard-coded policy")
+    rec = _replace_once(rec, 'METALS_XAU_LONG_MFE50_POLICY_VERSION,', 'recovery_policy_version,', "broker recovery hard-coded policy version")
     exec(compile(rec, "<xau-short-live-broker-recovery>", "exec"), ns, ns)
     patched_recovery = ns.get("_metals_xau_live_recover_broker_only_side_aware")
     if not callable(patched_recovery):
