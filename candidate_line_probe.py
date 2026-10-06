@@ -13,12 +13,14 @@ def emit(core) -> None:
     except Exception as exc:
         print(f"XAU_PROBE source_error={type(exc).__name__}", flush=True)
         return
-    keys = ("side", "unit", "stop", "order", "risk", "price", "request", "trade")
+    lines = src.splitlines()
     print(f"XAU_PROBE signature={inspect.signature(fn)}", flush=True)
-    for idx, line in enumerate(src.splitlines(), 1):
-        low = line.lower()
-        if any(k in low for k in keys):
-            clean = line.rstrip()
+    ranges = ((55, 85), (195, 235), (305, 355), (360, 410))
+    for start, end in ranges:
+        print(f"XAU_PROBE RANGE {start}-{end}", flush=True)
+        for idx in range(start, min(end, len(lines)) + 1):
+            line = lines[idx - 1].rstrip()
+            low = line.lower()
             if "token" in low or "secret" in low or "account_id" in low:
                 continue
-            print(f"XAU_PROBE L{idx:03d} {clean}", flush=True)
+            print(f"XAU_PROBE L{idx:03d} {line}", flush=True)
