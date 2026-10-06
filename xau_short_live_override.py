@@ -1,8 +1,9 @@
 """Side-safe promotion of XAU SHORT into the existing live-XAU broker lane.
 
-Fail-closed runtime patch: the existing XAU LONG execution function is sourced
-at startup and only a small, asserted set of long-only assumptions is made
-side-aware. If upstream structure changes, install raises before serving.
+Fail-closed runtime patch: the existing XAU LONG execution function and split
+execution router are sourced at startup and only a small, asserted set of
+long-only assumptions is made side-aware. If upstream structure changes,
+install raises before serving.
 """
 from __future__ import annotations
 
@@ -36,13 +37,8 @@ def _side_sizing_preview(core: Any, original_preview, side: str) -> Dict[str, An
         p["executable"] = False
         return p
 
-    # A market short enters on/near bid and its emergency SL must sit ABOVE entry.
     entry = float(bid)
     stop = entry * (1.0 + float(sl_pct) / 100.0)
-
-    # Reuse the long preview's already broker-validated unit quantity. Because
-    # ask >= bid and SL is percentage based, this is marginally conservative
-    # for a short (never increases the long preview's requested units).
     long_est = core.safe_float(p.get("estimated_risk_gbp"))
     estimated = (float(long_est) * entry / float(ask)) if long_est is not None and ask > 0 else None
     requested = core.safe_float(p.get("risk_amount")) or core.safe_float(p.get("requested_risk_gbp"))
@@ -78,6 +74,7 @@ def install(core: Any) -> Dict[str, Any]:
     original = core.execute_metals_xau_live_candidate
     original_preview = core.metals_xau_live_sizing_preview
     original_cfg = core.metals_xau_live_config_status
+    original_router = core.execute_metals_demo_candidate
 
     src = textwrap.dedent(inspect.getsource(original))
     src = _replace_once(
@@ -107,9 +104,6 @@ def install(core: Any) -> Dict[str, Any]:
         "signed order units",
     )
 
-    # Persist/report the true direction everywhere the live function formerly
-    # hard-coded LONG. These replacements are intentionally broad inside this
-    # one function source; LONG strategy constants are handled separately.
     src = src.replace('"execution_lane": "LIVE_XAU_LONG"', '"execution_lane": f"LIVE_XAU_{side.upper()}"')
     src = src.replace('"side": "long"', '"side": side')
     src = src.replace('METALS_XAU_LIVE_ALLOWED_INSTRUMENT, "long",', 'METALS_XAU_LIVE_ALLOWED_INSTRUMENT, side,')
@@ -117,9 +111,6 @@ def install(core: Any) -> Dict[str, Any]:
     src = src.replace('METALS_XAU_LONG_MFE50_POLICY', 'active_exit_policy')
     src = src.replace('f"LIVE XAU LONG opened from {source}; "', 'f"LIVE XAU {side.upper()} opened from {source}; "')
 
-    # The source-level substitution above also touches the newly inserted local
-    # assignment names if done blindly. Repair those two assignment expressions
-    # to the real globals explicitly and assert they exist afterwards.
     src = src.replace(
         'active_exit_policy = (\n        active_exit_policy if side == "long"\n        else METALS_XAU_SHORT_ACTIVE_POLICY\n    )',
         'active_exit_policy = (\n        METALS_XAU_LONG_MFE50_POLICY if side == "long"\n        else METALS_XAU_SHORT_ACTIVE_POLICY\n    )',
@@ -149,6 +140,25 @@ def install(core: Any) -> Dict[str, Any]:
         raise RuntimeError("XAU short live patch refused: transformed candidate not callable")
     core.execute_metals_xau_live_candidate = patched
 
+    # Patch the split execution router itself. Historically it only forwarded
+    # XAU LONG to the live executor, so XAU SHORT could never reach the side-safe
+    # broker function above and silently remained on the practice lane.
+    router_src = textwrap.dedent(inspect.getsource(original_router))
+    old_router = '    if METALS_XAU_LONG_LIVE_PROMOTION_ENABLED and asset == "XAUUSD" and side == "long":\n'
+    new_router = '    if asset == "XAUUSD" and ((side == "long" and METALS_XAU_LONG_LIVE_PROMOTION_ENABLED) or (side == "short" and _metals_xau_short_live_gate_enabled())):\n'
+    router_src = _replace_once(router_src, old_router, new_router, "XAU live split-router condition")
+    router_src = _replace_once(
+        router_src,
+        "def execute_metals_demo_candidate(",
+        "def _execute_metals_demo_candidate_xau_side_aware(",
+        "split-router function header",
+    )
+    exec(compile(router_src, "<xau-short-live-router>", "exec"), ns, ns)
+    patched_router = ns.get("_execute_metals_demo_candidate_xau_side_aware")
+    if not callable(patched_router):
+        raise RuntimeError("XAU short live patch refused: transformed split router not callable")
+    core.execute_metals_demo_candidate = patched_router
+
     def cfg_status() -> Dict[str, Any]:
         d = dict(original_cfg() or {})
         armed = bool(d.get("orders_allowed")) and _enabled()
@@ -161,6 +171,7 @@ def install(core: Any) -> Dict[str, Any]:
             "xau_short_signed_units": "NEGATIVE",
             "xau_short_emergency_stop_side": "ABOVE_ENTRY",
             "xau_short_sizing": "REUSE_LONG_VALIDATED_UNITS_CONSERVATIVELY_WITH_SHORT_SIDE_PRICE_AND_STOP",
+            "xau_short_live_router": "SIDE_AWARE",
         })
         if armed:
             d.pop("xau_short_broker_block_reason", None)
@@ -176,4 +187,5 @@ def install(core: Any) -> Dict[str, Any]:
         "short_negative_units": True,
         "short_stop_above_entry": True,
         "long_path_side_aware": True,
+        "split_router_side_aware": True,
     }
