@@ -24,8 +24,8 @@ finally:
     basket_base._reset_live_xau_protection_cycle = _real_reset
 
 import metals_intrahour_exit_override as intrahour
-import metals_intrahour_force_diag as force_diag
+import metals_intrahour_runtime_diag as runtime_diag
 
 INTRAHOUR_EXIT_STATUS = intrahour.install(base.core, base.app)
-force_diag.run(base.core)
+runtime_diag.run(base.core)
 app = base.app
