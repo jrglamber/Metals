@@ -9,7 +9,7 @@ import inspect
 import textwrap
 from typing import Any, Dict
 
-VERSION = "metals_xau_live_basket_both_sides_v1_2026_10_06"
+VERSION = "metals_xau_live_basket_both_sides_v2_2026_10_07"
 
 
 def _replace_once(src: str, old: str, new: str, label: str) -> str:
@@ -38,6 +38,18 @@ def install(core: Any) -> Dict[str, Any]:
         "    if not (METALS_XAU_LONG_LIVE_PROMOTION_ENABLED or METALS_XAU_SHORT_LIVE_PROMOTION_ENABLED):\n",
         "long-only promotion guard",
     )
+
+    # PostgreSQL cannot infer the type of a bind parameter used only in
+    # `WHEN ? IS NOT NULL`.  The manager's fixed-48h timestamp guard therefore
+    # failed before it could reach stop-candidate / broker-stop reconciliation.
+    # CAST is valid in both PostgreSQL and SQLite and changes no decision logic.
+    src = _replace_once(
+        src,
+        "WHEN ? IS NOT NULL",
+        "WHEN CAST(? AS TEXT) IS NOT NULL",
+        "Postgres fixed-48h nullable timestamp guard",
+    )
+
     exec(compile(src, "<xau-live-basket-both-sides>", "exec"), ns, ns)
     patched_tick = ns.get("_metals_xau_live_manager_tick_both_sides")
     if not callable(patched_tick):
@@ -76,6 +88,7 @@ def install(core: Any) -> Dict[str, Any]:
         d["live_basket_uses_live_oanda_account"] = core.METALS_XAU_LIVE_OANDA_ENV == "live"
         d["demo_basket_manager_separate"] = True
         d["live_basket_manager_version"] = VERSION
+        d["postgres_fixed_48h_guard_typed"] = True
         return d
     core.metals_xau_live_config_status = cfg_status
     core.METALS_XAU_LIVE_BASKET_MANAGER_VERSION = VERSION
@@ -87,5 +100,6 @@ def install(core: Any) -> Dict[str, Any]:
         "manager_enabled": bool(core.METALS_XAU_LIVE_MANAGER_ENABLED),
         "harvest_execution_enabled": bool(core.METALS_XAU_LIVE_HARVEST_EXECUTION_ENABLED),
         "demo_isolated": True,
+        "postgres_fixed_48h_guard_typed": True,
         "fail_closed_source_assertions": True,
     }
