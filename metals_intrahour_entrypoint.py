@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 # The dashboard-v2 presentation layer still contains the one-shot reset call that
-# was used during the live/demo separation migration.  That migration is complete;
-# repeated process starts must never rebase the live XAU HWM.  Suppress only that
+# was used during the live/demo separation migration. That migration is complete;
+# repeated process starts must never rebase the live XAU HWM. Suppress only that
 # import-time call, then restore the real reset function for explicit/manual use.
 import metals_live_basket_entrypoint as basket_base
 
@@ -24,6 +24,8 @@ finally:
     basket_base._reset_live_xau_protection_cycle = _real_reset
 
 import metals_intrahour_exit_override as intrahour
+import metals_intrahour_force_diag as force_diag
 
 INTRAHOUR_EXIT_STATUS = intrahour.install(base.core, base.app)
+force_diag.run(base.core)
 app = base.app
