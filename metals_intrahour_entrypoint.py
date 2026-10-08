@@ -28,6 +28,80 @@ try:
 finally:
     basket_base._reset_live_xau_protection_cycle = _real_reset
 
+
+# Presentation-only repair: dashboard-v2's demo-protection cleanup matches the
+# words "basket manager / profit protection" and can therefore re-parent the
+# genuine LIVE XAU panel into the DEMO accounting container. Keep the live panel
+# as a standard top-level accordion, matching BCO's dashboard order:
+# Broker / OANDA / Accounting -> Basket Manager / Profit Protection -> Research.
+# This wrapper changes HTML placement only; it has no execution/broker authority.
+_dashboard_rewrite_base = base.analysis._rewrite_dashboard_version
+
+_BASKET_PROTECTION_LINE_FIX = r'''
+<script id="pep-metals-top-level-protection-fix">
+(function(){
+  function place(){
+    var live=document.getElementById('pep-live-basket-manager');
+    var broker=document.getElementById('pep-broker-accounting-combined');
+    if(!live || !broker || !broker.parentNode) return false;
+
+    var summary=live.querySelector(':scope > summary') || live.querySelector('summary');
+    if(summary) summary.textContent='Basket Manager / Profit Protection';
+
+    // Always keep LIVE protection immediately after the top-level broker panel.
+    // insertBefore also removes it automatically from any nested DEMO container.
+    if(broker.nextSibling!==live){
+      broker.parentNode.insertBefore(live, broker.nextSibling);
+    }
+    live.open=false;
+
+    // v2 already has a full live protection panel; avoid showing the same state
+    // a second time inside the LIVE broker/accounting subsection.
+    var duplicate=document.getElementById('pep-live-xau-protection-v2-ui');
+    if(duplicate) duplicate.style.display='none';
+    return true;
+  }
+
+  // The older cleanup script runs briefly after page load. Re-assert the intended
+  // top-level placement after each DOM move, then stop once the page settles.
+  var busy=false;
+  var observer=new MutationObserver(function(){
+    if(busy) return;
+    busy=true;
+    try{ place(); }finally{ busy=false; }
+  });
+  observer.observe(document.documentElement,{childList:true,subtree:true});
+
+  var n=0;
+  var timer=setInterval(function(){
+    n++;
+    place();
+    if(n>=45){ clearInterval(timer); observer.disconnect(); place(); }
+  },300);
+  place();
+})();
+</script>
+'''
+
+
+def _rewrite_dashboard_with_top_level_protection(body: bytes, content_type: str) -> bytes:
+    body = _dashboard_rewrite_base(body, content_type)
+    if "text/html" not in (content_type or "").lower():
+        return body
+    try:
+        text = body.decode("utf-8")
+        if "pep-metals-top-level-protection-fix" not in text:
+            if "</body>" in text:
+                text = text.replace("</body>", _BASKET_PROTECTION_LINE_FIX + "\n</body>", 1)
+            else:
+                text += _BASKET_PROTECTION_LINE_FIX
+        return text.encode("utf-8")
+    except Exception:
+        return body
+
+
+base.analysis._rewrite_dashboard_version = _rewrite_dashboard_with_top_level_protection
+
 import metals_intrahour_exit_override as intrahour
 
 INTRAHOUR_EXIT_STATUS = intrahour.install(base.core, base.app)
