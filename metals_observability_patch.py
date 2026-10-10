@@ -6,11 +6,10 @@ manager overrides are in place.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-VERSION = "metals_observability_v1_2026_10_10"
+VERSION = "metals_observability_v1.1_2026_10_10"
 
 
 def _f(core: Any, v: Any, default: float = 0.0) -> float:
@@ -68,10 +67,10 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 if tid:
                     by_id[tid] = bt
         rows = []
+        now = datetime.now(timezone.utc)
         for link in open_links():
             tid = _s(core, link.get("broker_trade_id"))
             bt = by_id.get(tid, {})
-            metrics = {}
             try:
                 metrics = dict(core._metals_xau_live_trade_metrics(dict(link)) or {})
             except Exception as exc:
@@ -86,7 +85,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             if opened:
                 if opened.tzinfo is None:
                     opened = opened.replace(tzinfo=timezone.utc)
-                age_h = max(0.0, (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0)
+                age_h = max(0.0, (now - opened).total_seconds() / 3600.0)
             rows.append({
                 "broker_trade_id": tid,
                 "side": side,
@@ -114,7 +113,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             "age_48h_plus_count": sum(1 for r in rows if r["age_48h_plus"]),
             "maturity_mismatch_count": sum(1 for r in rows if r["maturity_mismatch"]),
             "trades": rows,
-            "time_utc": datetime.now(timezone.utc).isoformat(),
+            "time_utc": now.isoformat(),
         }
 
     def lane_accounting() -> Dict[str, Any]:
@@ -165,6 +164,25 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     @app.get("/analysis/live-xau-lane-accounting")
     def _lane_accounting_route():
         return lane_accounting()
+
+    # Make the exact same read-only snapshots available to the existing health
+    # loop and weekly exporter without duplicating maturity/accounting logic.
+    core._METALS_XAU_MANAGER_AUDIT_SNAPSHOT = manager_audit
+    core._METALS_XAU_LANE_ACCOUNTING_SNAPSHOT = lane_accounting
+
+    # One startup reconciliation line makes the 48h dashboard-vs-manager mismatch
+    # visible in Railway logs without changing manager eligibility or protection.
+    try:
+        audit = manager_audit()
+        print(
+            "METALS_XAU_MATURITY_AUDIT "
+            f"open={audit.get('open_count')} long={audit.get('long_count')} short={audit.get('short_count')} "
+            f"age48={audit.get('age_48h_plus_count')} manager48={audit.get('manager_mature_count')} "
+            f"mismatch={audit.get('maturity_mismatch_count')}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"METALS_XAU_MATURITY_AUDIT unavailable={type(exc).__name__}:{exc}", flush=True)
 
     status = {"installed": True, "version": VERSION, "read_only": True, "execution_authority": False}
     core._METALS_OBSERVABILITY_INSTALLED = True
