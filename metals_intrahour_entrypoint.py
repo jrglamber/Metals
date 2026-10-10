@@ -47,9 +47,6 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
     core = base.core
     route_path = "/api/live-xau-harvest-ladder-view"
 
-    # The stability layer registered the first version of this read-only route.
-    # Replace it before application startup so the existing front-end fetch keeps
-    # the same URL but receives the real live-XAU policy/stage state.
     router = core.app.router
     old_routes = [r for r in list(router.routes) if getattr(r, "path", None) == route_path]
     for route in old_routes:
@@ -92,7 +89,6 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
                     "SELECT * FROM metals_xau_live_harvest_stages ORDER BY id DESC LIMIT 300"
                 ).fetchall()]
 
-            # Never mix a previous basket cycle into the current live ladder.
             current = [r for r in rows if active_cycle and str(r.get("cycle_id") or "") == active_cycle]
             by_level: Dict[float, Dict[str, Any]] = {}
             for row in current:
@@ -100,9 +96,6 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
                 if lvl >= 0 and lvl not in by_level:
                     by_level[lvl] = row
 
-            # The authoritative policy is 50R spacing. Keep the first six stages
-            # visible at all times (50..300R, matching the BCO-style dashboard),
-            # then include any higher stages that have actually been persisted.
             visible_levels: List[float] = []
             level = first
             for _ in range(6):
@@ -118,42 +111,30 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
                 fraction = _sf(fraction_fn(lvl) if callable(fraction_fn) else stage.get("bank_fraction"), 0.0)
                 if stage.get("bank_fraction") not in (None, ""):
                     fraction = _sf(stage.get("bank_fraction"), fraction)
-
                 status = str(stage.get("status") or "NOT_ARMED")
                 target = stage.get("target_bank_gbp") if stage else None
                 executed = stage.get("executed_bank_gbp") if stage else None
                 pool = _sf(stage.get("trigger_profitable_pool_gbp"), 0.0) if stage else 0.0
                 executed_num = _sf(executed, 0.0) if executed not in (None, "") else None
-
                 actual_pct = None
                 if executed_num is not None and pool > 0:
                     actual_pct = 100.0 * executed_num / pool
                 elif status.upper() == "EXECUTED":
                     actual_pct = 100.0 * fraction
-
                 ladder.append({
-                    "serial": serial,
-                    "level_r": lvl,
-                    "status": status,
+                    "serial": serial, "level_r": lvl, "status": status,
                     "bank_pct": 100.0 * fraction,
                     "target_at_trigger_gbp": _sf(target) if target not in (None, "") else None,
-                    "actually_banked_pct": actual_pct,
-                    "actual_gbp_banked": executed_num,
+                    "actually_banked_pct": actual_pct, "actual_gbp_banked": executed_num,
                     "executed_at": stage.get("executed_at_utc") if stage else None,
                     "trade_ids": _ids(stage.get("selected_broker_trade_ids")) if stage else [],
                 })
 
             return {
-                "ok": True,
-                "scope": "LIVE_XAU_ONLY",
-                "active_cycle_id": active_cycle,
-                "high_water_r": hwm_r,
-                "policy_version": policy_version,
-                "ladder": ladder,
+                "ok": True, "scope": "LIVE_XAU_ONLY", "active_cycle_id": active_cycle,
+                "high_water_r": hwm_r, "policy_version": policy_version, "ladder": ladder,
                 "configured": {
-                    "first_level_r": first,
-                    "step_r": step,
-                    "max_level_r": max_level,
+                    "first_level_r": first, "step_r": step, "max_level_r": max_level,
                     "50r_fraction": _sf(getattr(core, "METALS_HARVEST_50_FRACTION", 0.20), 0.20),
                     "100r_fraction": _sf(getattr(core, "METALS_HARVEST_100_FRACTION", 0.20), 0.20),
                     "150r_plus_fraction": _sf(getattr(core, "METALS_HARVEST_150_PLUS_FRACTION", 0.25), 0.25),
@@ -161,21 +142,9 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
                 },
             }
         except Exception as exc:
-            return {
-                "ok": False,
-                "scope": "LIVE_XAU_ONLY",
-                "ladder": [],
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            return {"ok": False, "scope": "LIVE_XAU_ONLY", "ladder": [], "error": f"{type(exc).__name__}: {exc}"}
 
-    status = {
-        "installed": True,
-        "route": route_path,
-        "replaced_old_routes": len(old_routes),
-        "authoritative_policy": True,
-        "visible_base_levels": 6,
-        "execution_logic_changed": False,
-    }
+    status = {"installed": True, "route": route_path, "replaced_old_routes": len(old_routes), "authoritative_policy": True, "visible_base_levels": 6, "execution_logic_changed": False}
     print("METALS_XAU_AUTHORITATIVE_LADDER", status, flush=True)
     return status
 
@@ -183,12 +152,17 @@ def _install_authoritative_xau_ladder() -> Dict[str, Any]:
 XAU_AUTHORITATIVE_LADDER_STATUS = _install_authoritative_xau_ladder()
 
 import metals_intrahour_exit_override as intrahour
-
 INTRAHOUR_EXIT_STATUS = intrahour.install(base.core, base.app)
+
+# Add read-only lane accounting and maturity diagnostics only after the live
+# manager override is installed, so the audit observes exactly the metrics the
+# production manager uses. It has no execution authority.
+import metals_observability_patch as observability
+OBSERVABILITY_STATUS = observability.install(base.core, base.app)
+print("METALS_OBSERVABILITY", OBSERVABILITY_STATUS, flush=True)
+
 app = base.app
 
-# Permanent low-volume heartbeat. This is deliberately read-only: it makes the
-# protective execution path fail-loud without changing trading decisions.
 _health_stop = threading.Event()
 
 
