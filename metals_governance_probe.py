@@ -33,6 +33,35 @@ def _fn_info(fn: Any) -> Dict[str, Any]:
     }
 
 
+def _source_probe(core: Any) -> Dict[str, Any]:
+    path = getattr(core, "__file__", None)
+    if not path:
+        return {"ok": False, "reason": "core_file_missing"}
+    try:
+        lines = open(path, "r", encoding="utf-8").read().splitlines()
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+    needles = (
+        "def execute_metals_demo_candidate",
+        "METALS_DIRECTION_FLIP_FLATTEN",
+        "metals_family_direction_flip_flat",
+        "direction_flip_flatten",
+        "family_mixed_direction",
+    )
+    hits = []
+    used = set()
+    for i, line in enumerate(lines):
+        if any(n.lower() in line.lower() for n in needles):
+            lo = max(0, i - 10)
+            hi = min(len(lines), i + 31)
+            key = (lo, hi)
+            if key in used:
+                continue
+            used.add(key)
+            hits.append({"line": i + 1, "excerpt": "\n".join(f"{j+1}:{lines[j]}" for j in range(lo, hi))})
+    return {"ok": True, "path": path, "hits": hits[:12]}
+
+
 def install(core: Any) -> Dict[str, Any]:
     targets = (
         "execute_metals_demo_candidate",
@@ -45,5 +74,6 @@ def install(core: Any) -> Dict[str, Any]:
         fn = getattr(core, name, None)
         if callable(fn):
             out["targets"][name] = _fn_info(fn)
+    out["source_probe"] = _source_probe(core)
     print("METALS_GOVERNANCE_PROBE", out, flush=True)
     return out
