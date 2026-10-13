@@ -1,14 +1,9 @@
-"""Project Exit Plan Metals governance wrapper.
-
-Phase 1 is deliberately read-only: load the existing production stack unchanged,
-then emit execution call signatures before the approved strategy-governance
-patch is installed in a follow-up commit.
-"""
+"""Project Exit Plan Metals production governance entrypoint."""
 from __future__ import annotations
 
 import metals_intrahour_entrypoint as base
-import metals_governance_probe
+import metals_strategy_governance_override as governance
 
-GOVERNANCE_PROBE_STATUS = metals_governance_probe.install(base.base.core)
-print("METALS_GOVERNANCE_WRAPPER", {"phase": "probe", "execution_mutated": False}, flush=True)
+GOVERNANCE_STATUS = governance.install(base.base.core, base.app)
+print("METALS_STRATEGY_GOVERNANCE", GOVERNANCE_STATUS, flush=True)
 app = base.app
