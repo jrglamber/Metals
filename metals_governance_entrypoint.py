@@ -10,4 +10,5 @@ import metals_intrahour_entrypoint as base
 import metals_governance_probe
 
 GOVERNANCE_PROBE_STATUS = metals_governance_probe.install(base.base.core)
+print("METALS_GOVERNANCE_WRAPPER", {"phase": "probe", "execution_mutated": False}, flush=True)
 app = base.app
