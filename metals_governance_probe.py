@@ -54,8 +54,29 @@ def _source_probe(core: Any) -> Dict[str, Any]:
         "path": path,
         "prepare_direction_flip": _source_window(lines, "def _metals_demo_prepare_direction_flip", 8, 150),
         "demo_router": _source_window(lines, "def execute_metals_demo_candidate", 3, 190),
-        "xau_live_candidate": _source_window(lines, "def execute_metals_xau_live_candidate", 3, 180),
+        "xau_live_candidate": _source_window(lines, "def execute_metals_xau_live_candidate", 3, 220),
+        "direction_status": _source_window(lines, '"direction_flip_policy": {', 75, 45),
     }
+
+
+def _inventory(core: Any) -> Dict[str, Any]:
+    out = {}
+    for name in dir(core):
+        low = name.lower()
+        wanted = (
+            ("xau" in low and "close" in low)
+            or ("config" in low and "status" in low and "metal" in low)
+            or ("runtime" in low and ("get" in low or "set" in low))
+        )
+        if not wanted:
+            continue
+        obj = getattr(core, name, None)
+        if callable(obj):
+            try:
+                out[name] = str(inspect.signature(obj))
+            except Exception:
+                out[name] = "<unknown>"
+    return out
 
 
 def install(core: Any) -> Dict[str, Any]:
@@ -72,6 +93,7 @@ def install(core: Any) -> Dict[str, Any]:
         fn = getattr(core, name, None)
         if callable(fn):
             out["targets"][name] = _fn_info(fn)
+    out["inventory"] = _inventory(core)
     out["source_probe"] = _source_probe(core)
     print("METALS_GOVERNANCE_PROBE", out, flush=True)
     return out
