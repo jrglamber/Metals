@@ -168,6 +168,74 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     if not all(checks.values()):
         raise RuntimeError(f"Metals short side-classification startup self-test failed: {checks}")
 
+    def latest_xau_runtime_diagnostic() -> Dict[str, Any]:
+        """Read-only proof of how the latest persisted XAU row evaluates now."""
+        try:
+            core.init_db()
+            with core.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM raw_signals WHERE UPPER(REPLACE(REPLACE(REPLACE(COALESCE(pair,''),'_',''),'-',''),' ','')) IN ('XAUUSD','XAU','GOLD') ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return {"ok": True, "found": False}
+                raw_signal_id = int(row["id"])
+                raw = core._raw_signal_json(row)
+                candidate = dict(core.metals_demo_candidate_for_row(raw, row) or {})
+                audit_row = conn.execute(
+                    "SELECT * FROM metals_demo_execution_audit WHERE raw_signal_id=? ORDER BY id DESC LIMIT 1",
+                    (raw_signal_id,),
+                ).fetchone()
+                link_row = conn.execute(
+                    "SELECT * FROM metals_demo_trade_links WHERE raw_signal_id=? ORDER BY id DESC LIMIT 1",
+                    (raw_signal_id,),
+                ).fetchone()
+            audit = dict(audit_row) if audit_row else None
+            link = dict(link_row) if link_row else None
+            return {
+                "ok": True,
+                "found": True,
+                "raw_signal_id": raw_signal_id,
+                "pair": row["pair"],
+                "received_at_utc": row["received_at_utc"] if "received_at_utc" in row.keys() else None,
+                "payload": {
+                    "signal_side": raw.get("signal_side"),
+                    "root_candidate_side": raw.get("root_candidate_side"),
+                    "metal_short_candidate": raw.get("metal_short_candidate"),
+                    "metal_long_candidate": raw.get("metal_long_candidate"),
+                    "signal_quality": raw.get("signal_quality"),
+                    "forward_test_candidate": raw.get("forward_test_candidate"),
+                    "forward_rule_name": raw.get("forward_rule_name"),
+                },
+                "candidate": {
+                    "demo_candidate": candidate.get("demo_candidate"),
+                    "demo_side": candidate.get("demo_side"),
+                    "demo_state": candidate.get("demo_state"),
+                    "demo_reason": candidate.get("demo_reason"),
+                    "demo_blockers": candidate.get("demo_blockers"),
+                    "explicit_payload_short": candidate.get("explicit_payload_short"),
+                    "legacy_side_blockers_removed": candidate.get("legacy_side_blockers_removed"),
+                    "model_version": candidate.get("model_version"),
+                },
+                "latest_audit": None if not audit else {
+                    "id": audit.get("id"),
+                    "created_at_utc": audit.get("created_at_utc"),
+                    "action": audit.get("action"),
+                    "status": audit.get("status"),
+                    "candidate_state": audit.get("candidate_state"),
+                    "message": audit.get("message"),
+                    "broker_trade_id": audit.get("broker_trade_id"),
+                    "response_status_code": audit.get("response_status_code"),
+                },
+                "trade_link": None if not link else {
+                    "id": link.get("id"),
+                    "status": link.get("status"),
+                    "side": link.get("side"),
+                    "broker_trade_id": link.get("broker_trade_id"),
+                },
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     def status() -> Dict[str, Any]:
         return {
             "ok": True,
@@ -178,6 +246,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             "preserved_filters": "all_other_cleaned_v2_RSI_context_bounce_filters",
             "watch_candidate_execution": False,
             "startup_self_test": checks,
+            "latest_xau_runtime_diagnostic": latest_xau_runtime_diagnostic(),
         }
 
     try:
