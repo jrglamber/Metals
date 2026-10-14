@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List
 
-VERSION = "metals_recent_closed_dom_v1_2026_10_14"
+VERSION = "metals_recent_closed_dom_v2_served_core_route_2026_10_14"
 ROUTE = "/api/live-xau-recently-closed"
 
 
@@ -61,7 +61,16 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
     def endpoint(limit: int = 30):
         try: return {"ok":True,"scope":"LIVE_XAU_ONLY","demo_research_excluded":True,"rows":_rows(core,limit)}
         except Exception as exc: return {"ok":False,"scope":"LIVE_XAU_ONLY","demo_research_excluded":True,"rows":[],"error":f"{type(exc).__name__}: {exc}"}
-    app.add_api_route(ROUTE, endpoint, methods=["GET"])
+
+    # Public /api/* traffic is served by the core FastAPI app. The dashboard HTML
+    # is rewritten through the analysis wrapper, but registering the JSON route on
+    # that wrapper produces a 404 at the public service boundary.
+    served_app = core.app
+    old_routes = [r for r in list(served_app.router.routes) if getattr(r, "path", None) == ROUTE]
+    for route in old_routes:
+        served_app.router.routes.remove(route)
+    served_app.add_api_route(ROUTE, endpoint, methods=["GET"])
+
     base=analysis._rewrite_dashboard_version
     def rewrite(body: bytes, content_type: str) -> bytes:
         body=base(body,content_type)
@@ -73,7 +82,7 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
             return text.encode("utf-8")
         except Exception: return body
     analysis._rewrite_dashboard_version=rewrite
-    status={"installed":True,"version":VERSION,"route":ROUTE,"scope":"LIVE_XAU_ONLY","demo_research_excluded":True,"execution_logic_changed":False}
+    status={"installed":True,"version":VERSION,"route":ROUTE,"route_target":"core.app","replaced_old_routes":len(old_routes),"scope":"LIVE_XAU_ONLY","demo_research_excluded":True,"execution_logic_changed":False}
     try: status["sample_count"]=len(_rows(core,30))
     except Exception as exc: status["sample_error"]=f"{type(exc).__name__}: {exc}"
     return status
