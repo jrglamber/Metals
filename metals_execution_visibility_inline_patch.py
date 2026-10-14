@@ -1,19 +1,21 @@
 """Inline final XAU execution state in Latest 30 Metals Signals.
 
-Presentation-only overlay.  The existing candidate columns describe pre-execution
-eligibility.  This patch adds the actual live XAU outcome beside that eligibility
+Presentation-only overlay. The existing candidate columns describe pre-execution
+eligibility. This patch adds the actual live XAU outcome beside that eligibility
 state so an approved candidate can visibly read OPENED, INTENTIONAL SKIP, or the
-real execution blocker on the same row.
+real execution blocker on the same row. Non-executable watch candidates are
+shown explicitly as WATCH ONLY rather than leaking legacy cleaner blocker text.
 """
 from __future__ import annotations
 
 import html
+import json
 import re
 from typing import Any, Dict
 
 import metals_execution_visibility_patch as visibility
 
-VERSION = "metals_xau_execution_visibility_inline_v1_2026_10_14"
+VERSION = "metals_xau_execution_visibility_inline_v2_2026_10_14"
 
 
 def _label(state: str) -> tuple[str, str]:
@@ -25,6 +27,52 @@ def _label(state: str) -> tuple[str, str]:
     if s.startswith("BLOCKED") or s in {"NOT_OPENED", "NO_EXECUTION_RECORD"}:
         return "BLOCKED", "neg"
     return s or "—", "flat"
+
+
+def _display_for(row: Dict[str, Any], signal_quality: str) -> tuple[str, str, str]:
+    quality = str(signal_quality or "").strip().lower()
+    if quality in {"watch_candidate", "watch", "watch_only"}:
+        return "WATCH ONLY", "warn", "watch_candidate — not executable"
+    label, cls = _label(str(row.get("execution_state") or ""))
+    reason = str(row.get("reason") or "") or "—"
+    return label, cls, reason
+
+
+def _recent_xau_signal_qualities(core: Any, limit: int) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        with core.get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, raw_json
+                FROM raw_signals
+                WHERE UPPER(pair) IN ('XAUUSD','XAU')
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
+        for raw_row in rows:
+            try:
+                d = dict(raw_row)
+            except Exception:
+                continue
+            rid = str(d.get("id") or "")
+            raw = d.get("raw_json")
+            payload: Dict[str, Any] = {}
+            if isinstance(raw, dict):
+                payload = raw
+            else:
+                try:
+                    parsed = json.loads(str(raw or "{}"))
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = {}
+            out[rid] = str(payload.get("signal_quality") or "").strip().lower()
+    except Exception:
+        return {}
+    return out
 
 
 def install(core: Any, app: Any) -> Dict[str, Any]:
@@ -44,6 +92,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             }
         except Exception:
             outcomes = {}
+        qualities = _recent_xau_signal_qualities(core, max(30, int(limit or 30)))
 
         # Keep the two final-execution columns directly beside Production Eligible.
         header = "<th>Production Eligible</th>"
@@ -68,11 +117,10 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             rid = first.group(1)
             row = outcomes.get(rid)
             if row:
-                label, cls = _label(str(row.get("execution_state") or ""))
-                reason = str(row.get("reason") or "")
+                label, cls, reason = _display_for(row, qualities.get(rid, ""))
                 cells = (
                     f'<td class="{cls}"><strong>{html.escape(label)}</strong></td>'
-                    f'<td>{html.escape(reason or "—")}</td>'
+                    f'<td>{html.escape(reason)}</td>'
                 )
             else:
                 # XAG and non-live historical rows do not have a live-XAU broker outcome.
@@ -94,6 +142,10 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     core._METALS_XAU_EXECUTION_VISIBILITY_INLINE_INSTALLED = True
 
     probe = patched(8)
+    watch_unit = _display_for(
+        {"execution_state": "BLOCKED", "reason": "legacy blocker text"},
+        "watch_candidate",
+    )
     checks = {
         "final_execution_header_present": "Final XAU Execution" in probe,
         "execution_reason_header_present": "Execution Reason" in probe,
@@ -101,6 +153,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             "SKIPPED — 0.5× THROTTLE" in probe
             or "SKIPPED — 0.5&amp;times; THROTTLE" in probe
             or "post-32 broker-safe alternating overflow policy" in probe
+        ),
+        "watch_candidate_semantic_label": watch_unit == (
+            "WATCH ONLY",
+            "warn",
+            "watch_candidate — not executable",
         ),
     }
     if not all(checks.values()):
