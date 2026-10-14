@@ -83,9 +83,10 @@ def _install_live_tick(core: Any) -> Dict[str, Any]:
         "def _metals_xau_live_harvest_maintenance_tick_v2(",
         "live harvest function header",
     )
+    # The live maintenance path delegates threshold construction and fractions
+    # to shared helpers; it does not directly reference the shared first/step
+    # constants. Replace only those helper lookups so practice remains untouched.
     replacements = {
-        "METALS_HARVEST_FIRST_LEVEL_R": "METALS_XAU_HARVEST_V2_FIRST_LEVEL_R",
-        "METALS_HARVEST_STEP_R": "METALS_XAU_HARVEST_V2_STEP_R",
         "_metals_harvest_level_sequence": "_metals_xau_harvest_v2_level_sequence",
         "_metals_harvest_fraction_for_level": "_metals_xau_harvest_v2_fraction_for_level",
     }
