@@ -13,7 +13,7 @@ import html
 import json
 from typing import Any, Dict, List, Optional
 
-VERSION = "metals_recent_closed_live_v1_2026_10_14"
+VERSION = "metals_recent_closed_live_v2_2026_10_14"
 
 
 def _d(row: Any) -> Dict[str, Any]:
@@ -40,6 +40,13 @@ def _f(value: Any) -> Optional[float]:
         return None
 
 
+def _first(row: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
 def _fmt_money(value: Any) -> str:
     v = _f(value)
     return "—" if v is None else f"£{v:,.2f}"
@@ -51,25 +58,16 @@ def _fmt_price(value: Any) -> str:
 
 
 def _recent_live_closed(core: Any, limit: int = 30) -> List[Dict[str, Any]]:
+    """Read schema-tolerantly: the live table predates several dashboard fields."""
     core.init_db()
     lim = max(1, min(int(limit or 30), 100))
     with core.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, raw_signal_id, signal_id, candidate_reason, side, status,
-                   broker_trade_id, linked_txn_id, units, entry_price,
-                   risk_amount, risk_distance, risk_pct_nav,
-                   created_at_utc, updated_at_utc, closed_at_utc,
-                   closed_price, realized_pl, error
+            SELECT *
             FROM metals_xau_live_trade_links
             WHERE UPPER(COALESCE(status,'')) <> 'OPEN'
-              AND (
-                    closed_at_utc IS NOT NULL
-                 OR closed_price IS NOT NULL
-                 OR realized_pl IS NOT NULL
-                 OR UPPER(COALESCE(status,'')) LIKE 'CLOSED%'
-              )
-            ORDER BY COALESCE(closed_at_utc, updated_at_utc, created_at_utc) DESC, id DESC
+            ORDER BY id DESC
             LIMIT ?
             """,
             (lim,),
@@ -77,10 +75,9 @@ def _recent_live_closed(core: Any, limit: int = 30) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in rows:
         d = _d(row)
-        risk = _f(d.get("risk_amount"))
-        pl = _f(d.get("realized_pl"))
-        approx_r = (pl / risk) if (pl is not None and risk not in (None, 0.0)) else None
-        d["approx_r"] = approx_r
+        risk = _f(_first(d, "risk_amount", "risk_cash", "risk_gbp"))
+        pl = _f(_first(d, "realized_pl", "realised_pl", "realized_pnl", "realised_pnl"))
+        d["approx_r"] = (pl / risk) if (pl is not None and risk not in (None, 0.0)) else None
         out.append(d)
     return out
 
@@ -155,21 +152,26 @@ def _live_closed_html(core: Any, limit: int = 30) -> str:
         return '<div class="section-note small">No recently closed LIVE XAU trades recorded.</div>'
     body: List[str] = []
     for r in rows:
-        pl = _f(r.get("realized_pl"))
+        pl_value = _first(r, "realized_pl", "realised_pl", "realized_pnl", "realised_pnl")
+        pl = _f(pl_value)
         r_mult = _f(r.get("approx_r"))
         pl_cls = "pos" if (pl or 0.0) > 0 else "neg" if (pl or 0.0) < 0 else "flat"
-        reason = _s(r.get("error")) or _s(r.get("status")) or "closed"
+        reason = _s(_first(r, "close_reason", "exit_reason", "error", "status")) or "closed"
+        closed_time = _first(r, "closed_at_utc", "closed_at", "close_time", "updated_at_utc", "updated_at")
+        entry = _first(r, "entry_price", "open_price", "price")
+        exit_price = _first(r, "closed_price", "close_price", "exit_price")
+        broker_id = _first(r, "broker_trade_id", "oanda_trade_id", "trade_id")
         body.append(
             "<tr>"
-            f"<td>{html.escape(_s(r.get('closed_at_utc')) or '—')}</td>"
+            f"<td>{html.escape(_s(closed_time) or '—')}</td>"
             f"<td><strong>{html.escape((_s(r.get('side')) or '—').upper())}</strong></td>"
-            f"<td>{html.escape(_fmt_price(r.get('entry_price')))}</td>"
-            f"<td>{html.escape(_fmt_price(r.get('closed_price')))}</td>"
+            f"<td>{html.escape(_fmt_price(entry))}</td>"
+            f"<td>{html.escape(_fmt_price(exit_price))}</td>"
             f"<td>{html.escape(_s(r.get('units')) or '—')}</td>"
-            f"<td class=\"{pl_cls}\"><strong>{html.escape(_fmt_money(r.get('realized_pl')))}</strong></td>"
+            f"<td class=\"{pl_cls}\"><strong>{html.escape(_fmt_money(pl_value))}</strong></td>"
             f"<td>{'—' if r_mult is None else f'{r_mult:+.2f}R'}</td>"
             f"<td>{html.escape(reason)}</td>"
-            f"<td>{html.escape(_s(r.get('broker_trade_id')) or '—')}</td>"
+            f"<td>{html.escape(_s(broker_id) or '—')}</td>"
             "</tr>"
         )
     return (
@@ -212,14 +214,21 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     core._METALS_RECENT_CLOSED_LIVE_PATCH_INSTALLED = True
 
     def status() -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "installed": True,
             "version": VERSION,
             "presentation_only": True,
             "strategy_changed": False,
-            "recent_live_closed": _recent_live_closed(core, 12),
-            "recent_xau_candidate_probe": _candidate_probe(core, 8),
         }
+        try:
+            out["recent_live_closed"] = _recent_live_closed(core, 12)
+        except Exception as exc:
+            out["recent_live_closed_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            out["recent_xau_candidate_probe"] = _candidate_probe(core, 8)
+        except Exception as exc:
+            out["recent_xau_candidate_probe_error"] = f"{type(exc).__name__}: {exc}"
+        return out
 
     try:
         app.add_api_route("/analysis/metals-dashboard-reconciliation", status, methods=["GET"])
