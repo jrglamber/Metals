@@ -1,8 +1,9 @@
 """Metals dashboard reconciliation patch.
 
 Presentation/read-only diagnostics only:
-1. Include LIVE XAU closed broker-linked trades in Recently Closed Metals Trades.
-2. Expose a current-classifier probe for the latest XAU raw signals so stale
+1. Show LIVE XAU closed broker-linked trades in the live Recently Closed section.
+2. Keep DEMO / RESEARCH closed trades completely separate from the live renderer.
+3. Expose a current-classifier probe for the latest XAU raw signals so stale
    historical audit wording cannot be mistaken for the current candidate reason.
 
 No trading, entry, exit, sizing, harvest, stacking or risk logic is changed.
@@ -13,7 +14,7 @@ import html
 import json
 from typing import Any, Dict, List, Optional
 
-VERSION = "metals_recent_closed_live_v2_2026_10_14"
+VERSION = "metals_recent_closed_live_v3_strict_separation_2026_10_14"
 
 
 def _d(row: Any) -> Dict[str, Any]:
@@ -58,7 +59,7 @@ def _fmt_price(value: Any) -> str:
 
 
 def _recent_live_closed(core: Any, limit: int = 30) -> List[Dict[str, Any]]:
-    """Read schema-tolerantly: the live table predates several dashboard fields."""
+    """Return only broker-linked rows from the dedicated LIVE XAU ledger."""
     core.init_db()
     lim = max(1, min(int(limit or 30), 100))
     with core.get_conn() as conn:
@@ -67,6 +68,7 @@ def _recent_live_closed(core: Any, limit: int = 30) -> List[Dict[str, Any]]:
             SELECT *
             FROM metals_xau_live_trade_links
             WHERE UPPER(COALESCE(status,'')) <> 'OPEN'
+              AND COALESCE(CAST(broker_trade_id AS TEXT),'') <> ''
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -75,9 +77,10 @@ def _recent_live_closed(core: Any, limit: int = 30) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in rows:
         d = _d(row)
-        risk = _f(_first(d, "risk_amount", "risk_cash", "risk_gbp"))
+        risk = _f(_first(d, "risk_amount", "risk_cash", "risk_gbp", "estimated_risk_amount", "requested_risk_amount"))
         pl = _f(_first(d, "realized_pl", "realised_pl", "realized_pnl", "realised_pnl"))
         d["approx_r"] = (pl / risk) if (pl is not None and risk not in (None, 0.0)) else None
+        d["account_lane"] = "LIVE"
         out.append(d)
     return out
 
@@ -149,7 +152,10 @@ def _candidate_probe(core: Any, limit: int = 8) -> List[Dict[str, Any]]:
 def _live_closed_html(core: Any, limit: int = 30) -> str:
     rows = _recent_live_closed(core, limit)
     if not rows:
-        return '<div class="section-note small">No recently closed LIVE XAU trades recorded.</div>'
+        return (
+            '<div class="section-note small"><strong>LIVE ONLY.</strong> '
+            'No recently closed broker-linked XAU trades recorded. Demo/research trades are excluded.</div>'
+        )
     body: List[str] = []
     for r in rows:
         pl_value = _first(r, "realized_pl", "realised_pl", "realized_pnl", "realised_pnl")
@@ -159,7 +165,8 @@ def _live_closed_html(core: Any, limit: int = 30) -> str:
         reason = _s(_first(r, "close_reason", "exit_reason", "error", "status")) or "closed"
         closed_time = _first(r, "closed_at_utc", "closed_at", "close_time", "updated_at_utc", "updated_at")
         entry = _first(r, "entry_price", "open_price", "price")
-        exit_price = _first(r, "closed_price", "close_price", "exit_price")
+        exit_price = _first(r, "closed_price", "close_price", "exit_price", "last_known_price")
+        units = _first(r, "filled_units", "requested_units", "units")
         broker_id = _first(r, "broker_trade_id", "oanda_trade_id", "trade_id")
         body.append(
             "<tr>"
@@ -167,7 +174,7 @@ def _live_closed_html(core: Any, limit: int = 30) -> str:
             f"<td><strong>{html.escape((_s(r.get('side')) or '—').upper())}</strong></td>"
             f"<td>{html.escape(_fmt_price(entry))}</td>"
             f"<td>{html.escape(_fmt_price(exit_price))}</td>"
-            f"<td>{html.escape(_s(r.get('units')) or '—')}</td>"
+            f"<td>{html.escape(_s(units) or '—')}</td>"
             f"<td class=\"{pl_cls}\"><strong>{html.escape(_fmt_money(pl_value))}</strong></td>"
             f"<td>{'—' if r_mult is None else f'{r_mult:+.2f}R'}</td>"
             f"<td>{html.escape(reason)}</td>"
@@ -175,8 +182,8 @@ def _live_closed_html(core: Any, limit: int = 30) -> str:
             "</tr>"
         )
     return (
-        '<div class="section-note small"><strong>LIVE XAU recently closed.</strong> '
-        'These rows come from the live XAU broker-link ledger and were previously omitted from this dashboard section.</div>'
+        '<div class="section-note small"><strong>LIVE XAU ONLY.</strong> '
+        'Source: dedicated live broker-link ledger. Demo/research trades are excluded by construction.</div>'
         '<div class="table-scroll"><table><thead><tr>'
         '<th>Closed UTC</th><th>Side</th><th>Entry</th><th>Exit</th><th>Units</th>'
         '<th>Realised</th><th>Approx R</th><th>Status / Reason</th><th>Broker Trade</th>'
@@ -192,22 +199,20 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     if not callable(original):
         raise RuntimeError("Recent-closed live patch refused: renderer missing")
 
+    # Preserve the old DEMO/RESEARCH renderer under an explicit research-only name,
+    # but never append it to the live dashboard renderer.
+    core._metals_demo_recently_closed_trades_html = original
+
     def patched(limit: int = 30) -> str:
         try:
-            live = _live_closed_html(core, limit)
+            return _live_closed_html(core, limit)
         except Exception as exc:
-            live = (
-                '<div class="section-note small">LIVE XAU recently closed view unavailable: '
+            return (
+                '<div class="section-note small"><strong>LIVE ONLY.</strong> '
+                'Live XAU recently closed view unavailable: '
                 + html.escape(f"{type(exc).__name__}: {exc}")
-                + '</div>'
+                + '. Demo/research data has not been substituted.</div>'
             )
-        legacy = str(original(limit) or "")
-        if legacy:
-            legacy = (
-                '<details><summary>DEMO / RESEARCH recently closed</summary>'
-                '<div class="research-inner-body">' + legacy + '</div></details>'
-            )
-        return live + legacy
 
     core._metals_recently_closed_trades_html = patched
     core.METALS_RECENT_CLOSED_LIVE_PATCH_VERSION = VERSION
@@ -219,6 +224,10 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
             "version": VERSION,
             "presentation_only": True,
             "strategy_changed": False,
+            "live_demo_strict_separation": True,
+            "live_source_table": "metals_xau_live_trade_links",
+            "live_requires_broker_trade_id": True,
+            "demo_renderer_excluded_from_live_section": True,
         }
         try:
             out["recent_live_closed"] = _recent_live_closed(core, 12)
