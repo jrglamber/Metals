@@ -33,4 +33,12 @@ print("METALS_XAU_BROKER_SAFE_OVERFLOW", BROKER_SAFE_OVERFLOW_STATUS, flush=True
 print("METALS_XAU_HARVEST_V3", HARVEST_LADDER_STATUS, flush=True)
 print("METALS_XAU_RISK_TARGET", RISK_TARGET_STATUS, flush=True)
 print("METALS_SHORT_CANDIDATE_SIDE_FIX", SHORT_SIDE_FIX_STATUS, flush=True)
+try:
+    with base.base.core.get_conn() as _diag_conn:
+        _diag_row = _diag_conn.execute(
+            "SELECT id, created_at_utc, raw_signal_id, action, status, message, raw_json FROM metals_demo_execution_audit WHERE asset='XAUUSD' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    print("METALS_LATEST_XAU_EXECUTION_AUDIT", dict(_diag_row) if _diag_row else None, flush=True)
+except Exception as _diag_exc:
+    print("METALS_LATEST_XAU_EXECUTION_AUDIT", {"ok": False, "error": f"{type(_diag_exc).__name__}: {_diag_exc}"}, flush=True)
 app = base.app
