@@ -12,7 +12,7 @@ import metals_execution_visibility_patch as execution_visibility
 import metals_execution_visibility_inline_patch as execution_visibility_inline
 import metals_recent_closed_live_patch as recent_closed_live
 import metals_recent_closed_dom_override as recent_closed_dom
-import metals_signal_age_research as signal_age_research
+import metals_signal_age_research_v2 as signal_age_research
 
 GOVERNANCE_STATUS = governance.install(base.base.core, base.app)
 ADAPTIVE_STACKING_STATUS = adaptive_stacking.install(base.base.core, base.app)
