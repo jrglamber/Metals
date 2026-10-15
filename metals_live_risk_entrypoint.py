@@ -2,10 +2,40 @@
 from __future__ import annotations
 import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
+
 app = base.app
-LIVE_RISK_INSTALL = live_risk.install(app, "metals")
-try:
-    print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
-except Exception:
-    pass
-# Fresh-build marker: Railway start-command sync 2026-10-15.
+
+
+def _portfolio_risk_endpoint():
+    return live_risk._read("metals")
+
+
+def _install_route():
+    before = list(getattr(getattr(app, "router", None), "routes", []) or [])
+    app.add_api_route("/api/portfolio-risk", _portfolio_risk_endpoint, methods=["GET"], include_in_schema=False)
+    routes = getattr(getattr(app, "router", None), "routes", None)
+    if routes is not None:
+        matches = [r for r in routes if str(getattr(r, "path", "")) == "/api/portfolio-risk"]
+        if matches:
+            newest = matches[-1]
+            try:
+                routes.remove(newest)
+                routes.insert(0, newest)
+            except Exception:
+                pass
+    registered = any(str(getattr(r, "path", "")) == "/api/portfolio-risk" for r in (routes or []))
+    if not registered:
+        raise RuntimeError("Metals /api/portfolio-risk route failed to register")
+    return {
+        "installed": True,
+        "version": live_risk.VERSION,
+        "mode": "metals",
+        "execution_authority": False,
+        "route_registered": registered,
+        "routes_before": len(before),
+        "routes_after": len(routes or []),
+    }
+
+
+LIVE_RISK_INSTALL = _install_route()
+print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
