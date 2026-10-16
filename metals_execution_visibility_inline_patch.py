@@ -15,7 +15,7 @@ from typing import Any, Dict
 
 import metals_execution_visibility_patch as visibility
 
-VERSION = "metals_xau_execution_visibility_inline_v2_2026_10_14"
+VERSION = "metals_xau_execution_visibility_inline_v3_2026_10_16"
 
 
 def _label(state: str) -> tuple[str, str]:
@@ -146,13 +146,23 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         {"execution_state": "BLOCKED", "reason": "legacy blocker text"},
         "watch_candidate",
     )
+    # This self-test must be independent of current live history. A prior version
+    # required a recent real half-frequency skip to remain within the probe rows,
+    # which could make a healthy service fail startup simply as that event aged out.
+    skip_unit = _display_for(
+        {
+            "execution_state": "INTENTIONAL_HALF_FREQUENCY_SKIP",
+            "reason": "post-32 broker-safe alternating overflow policy",
+        },
+        "",
+    )
     checks = {
         "final_execution_header_present": "Final XAU Execution" in probe,
         "execution_reason_header_present": "Execution Reason" in probe,
-        "known_half_frequency_skip_visible": (
-            "SKIPPED — 0.5× THROTTLE" in probe
-            or "SKIPPED — 0.5&amp;times; THROTTLE" in probe
-            or "post-32 broker-safe alternating overflow policy" in probe
+        "half_frequency_skip_renderer": skip_unit == (
+            "SKIPPED — 0.5× THROTTLE",
+            "warn",
+            "post-32 broker-safe alternating overflow policy",
         ),
         "watch_candidate_semantic_label": watch_unit == (
             "WATCH ONLY",
