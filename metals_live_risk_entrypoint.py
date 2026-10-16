@@ -11,8 +11,8 @@ import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
 
 app = base.app
-core = base.base.core
-VERSION = "metals_live_risk_entrypoint_v2_2026_10_16"
+core = base.base.base.core
+VERSION = "metals_live_risk_entrypoint_v3_2026_10_16"
 
 
 def _portfolio_risk_endpoint():
@@ -40,8 +40,6 @@ def _ensure_front_route(path: str, endpoint: Any, name: str) -> dict:
 
     matches = [r for r in list(routes) if _route_matches(r, path)]
     if matches:
-        # Prefer the newest exact route because overlay installers append their
-        # authoritative implementation later in the chain.
         route = matches[-1]
     else:
         app.add_api_route(path, endpoint, methods=["GET"], include_in_schema=False, name=name)
@@ -50,19 +48,13 @@ def _ensure_front_route(path: str, endpoint: Any, name: str) -> dict:
             raise RuntimeError(f"Metals {path} route failed to register")
         route = matches[-1]
 
-    # Starlette resolves in route order. Put the exact telemetry route ahead of
-    # any earlier broad route/mount that could otherwise intercept it.
     try:
         routes.remove(route)
         routes.insert(0, route)
     except Exception as exc:
         raise RuntimeError(f"Metals {path} route precedence failed: {type(exc).__name__}: {exc}")
 
-    return {
-        "registered": True,
-        "route_index": 0,
-        "duplicates": len(matches),
-    }
+    return {"registered": True, "route_index": 0, "duplicates": len(matches)}
 
 
 RISK_ROUTE = _ensure_front_route(
@@ -100,9 +92,6 @@ try:
         flush=True,
     )
 except Exception as exc:
-    print(
-        f"METALS_LIVE_XAU_TILE_PROBE ok=False error={type(exc).__name__}: {exc}",
-        flush=True,
-    )
+    print(f"METALS_LIVE_XAU_TILE_PROBE ok=False error={type(exc).__name__}: {exc}", flush=True)
 
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
