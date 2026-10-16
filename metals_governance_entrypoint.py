@@ -13,6 +13,7 @@ import metals_execution_visibility_inline_patch as execution_visibility_inline
 import metals_recent_closed_live_patch as recent_closed_live
 import metals_recent_closed_dom_override as recent_closed_dom
 import metals_signal_age_research_v2 as signal_age_research
+import metals_live_candidate_support_patch as live_candidate_support
 
 GOVERNANCE_STATUS = governance.install(base.base.core, base.app)
 ADAPTIVE_STACKING_STATUS = adaptive_stacking.install(base.base.core, base.app)
@@ -25,6 +26,7 @@ EXECUTION_VISIBILITY_INLINE_STATUS = execution_visibility_inline.install(base.ba
 RECENT_CLOSED_LIVE_STATUS = recent_closed_live.install(base.base.core, base.app)
 RECENT_CLOSED_DOM_STATUS = recent_closed_dom.install(base.base.core, base.app, base.base.analysis)
 SIGNAL_AGE_RESEARCH_STATUS = signal_age_research.install(base.base.core, base.app)
+LIVE_CANDIDATE_SUPPORT_STATUS = live_candidate_support.install(base.base.core, base.app, base.base.analysis)
 GOVERNANCE_STATUS = dict(GOVERNANCE_STATUS or {})
 GOVERNANCE_STATUS["live_xau_effective_stacking_policy"] = "ADAPTIVE_20_PLUS_2R_HALF_EXPOSURE_AFTER_32_NO_STRATEGIC_CAP"
 GOVERNANCE_STATUS["live_xau_cap_24_superseded"] = True
@@ -43,6 +45,7 @@ GOVERNANCE_STATUS["recent_closed_live_version"] = RECENT_CLOSED_LIVE_STATUS.get(
 GOVERNANCE_STATUS["recent_closed_dom_version"] = RECENT_CLOSED_DOM_STATUS.get("version")
 GOVERNANCE_STATUS["signal_age_research_version"] = SIGNAL_AGE_RESEARCH_STATUS.get("version")
 GOVERNANCE_STATUS["signal_age_research_only"] = True
+GOVERNANCE_STATUS["live_candidate_support_version"] = LIVE_CANDIDATE_SUPPORT_STATUS.get("version")
 print("METALS_STRATEGY_GOVERNANCE", GOVERNANCE_STATUS, flush=True)
 print("METALS_XAU_ADAPTIVE_STACKING", ADAPTIVE_STACKING_STATUS, flush=True)
 print("METALS_XAU_BROKER_SAFE_OVERFLOW", BROKER_SAFE_OVERFLOW_STATUS, flush=True)
@@ -54,6 +57,7 @@ print("METALS_XAU_EXECUTION_VISIBILITY_INLINE", EXECUTION_VISIBILITY_INLINE_STAT
 print("METALS_RECENT_CLOSED_LIVE", RECENT_CLOSED_LIVE_STATUS, flush=True)
 print("METALS_RECENT_CLOSED_DOM", RECENT_CLOSED_DOM_STATUS, flush=True)
 print("METALS_SIGNAL_AGE_RESEARCH", SIGNAL_AGE_RESEARCH_STATUS, flush=True)
+print("METALS_LIVE_CANDIDATE_SUPPORT", LIVE_CANDIDATE_SUPPORT_STATUS, flush=True)
 try:
     with base.base.core.get_conn() as _diag_conn:
         _diag_row = _diag_conn.execute(
