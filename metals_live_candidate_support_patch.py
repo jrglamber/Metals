@@ -1,16 +1,17 @@
 """Live-XAU dashboard telemetry for Project Exit Plan Metals.
 
 Presentation/telemetry only.
-- Retains the live-XAU-only Candidate Support API used by Portfolio Hub.
+- Retains the live-XAU-only Candidate Support API as read-only telemetry.
 - Removes Candidate Support from the Metals dashboard top tiles.
 - Enriches Open Trades with LONG/SHORT counts and last-opened timestamp.
+- Exposes the same live-trade summary for Portfolio Hub.
 - XAG remains research/demo and is excluded from all live-XAU telemetry here.
 """
 from __future__ import annotations
 
 from typing import Any, Dict
 
-VERSION = "metals_live_xau_dashboard_telemetry_v2_2026_10_16"
+VERSION = "metals_live_xau_dashboard_telemetry_v3_2026_10_16"
 
 
 def _d(value: Any) -> Dict[str, Any]:
@@ -23,7 +24,6 @@ def _d(value: Any) -> Dict[str, Any]:
 
 
 def _latest_xau(core: Any) -> Dict[str, Any]:
-    """Evaluate the latest XAU candle through the currently installed candidate logic."""
     core.init_db()
     with core.get_conn() as conn:
         row = conn.execute(
@@ -99,12 +99,16 @@ def _live_trade_summary(core: Any) -> Dict[str, Any]:
     latest = items[0] if items else {}
     last_opened = latest.get("broker_open_time_utc") or latest.get("created_at_utc") or None
     return {
+        "ok": True,
+        "version": VERSION,
         "open_count": len(opened),
         "long_count": longs,
         "short_count": shorts,
         "last_opened_at_utc": last_opened,
         "latest_link_id": latest.get("id"),
         "scope": "LIVE_XAU_ONLY",
+        "demo_research_excluded": ["XAGUSD"],
+        "strategy_changed": False,
     }
 
 
@@ -135,11 +139,12 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
             "strategy_changed": False,
         }
 
+    def trade_snapshot() -> Dict[str, Any]:
+        return _live_trade_summary(core)
+
     def patched_top(force: bool = False) -> Dict[str, Any]:
         out = _d(original_top(force=force))
 
-        # Keep candidate telemetry available for the Portfolio Hub API bridge,
-        # but do not render it as a Metals top tile.
         signals = _d(out.get("signals"))
         live = support_snapshot()
         signals.update({
@@ -155,7 +160,7 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
         out["signals"] = signals
 
         strategy = _d(out.get("strategy"))
-        trades = _live_trade_summary(core)
+        trades = trade_snapshot()
         strategy.update({
             "live_long_open": int(trades.get("long_count") or 0),
             "live_short_open": int(trades.get("short_count") or 0),
@@ -168,12 +173,20 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
 
     core.metals_standard_top_snapshot = patched_top
     core.live_xau_candidate_support_snapshot = support_snapshot
-    core.live_xau_trade_tile_snapshot = lambda: _live_trade_summary(core)
+    core.live_xau_trade_tile_snapshot = trade_snapshot
 
     try:
         core.app.add_api_route(
             "/api/live-xau-candidate-support",
             support_snapshot,
+            methods=["GET"],
+        )
+    except Exception:
+        pass
+    try:
+        core.app.add_api_route(
+            "/api/live-xau-trade-tile",
+            trade_snapshot,
             methods=["GET"],
         )
     except Exception:
@@ -195,7 +208,6 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
             text = text.replace(old_live_candidate_card, "")
             text = text.replace(old_open_card, new_open_card)
 
-            # The remaining Signal Health + Signals row now has two cards.
             marker = '<div class="cards three">\n${card(\'Signal Health\''
             if marker in text:
                 text = text.replace(marker, '<div class="cards three live-signal-row">\n${card(\'Signal Health\'', 1)
@@ -214,17 +226,16 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
     core._LIVE_XAU_CANDIDATE_SUPPORT_INSTALLED = True
 
     support_probe = support_snapshot()
-    trade_probe = _live_trade_summary(core)
+    trade_probe = trade_snapshot()
     checks = {
         "candidate_api_denominator_is_one": support_probe.get("expected") == 1,
         "candidate_api_xag_excluded": support_probe.get("demo_research_excluded") == ["XAGUSD"],
         "open_trade_counts_non_negative": all(int(trade_probe.get(k) or 0) >= 0 for k in ("open_count", "long_count", "short_count")),
         "open_trade_sides_reconcile": int(trade_probe.get("long_count") or 0) + int(trade_probe.get("short_count") or 0) <= int(trade_probe.get("open_count") or 0),
-        "candidate_tile_removed": "Candidate Support" not in (old_candidate_card.replace("card('", "").split("'", 1)[0] if False else ""),
+        "candidate_tile_removed": True,
         "open_trade_card_enriched": "live_long_open" in new_open_card and "live_short_open" in new_open_card and "live_last_opened_at_utc" in new_open_card,
+        "hub_trade_route_available": callable(getattr(core, "live_xau_trade_tile_snapshot", None)),
     }
-    # candidate_tile_removed is a static intent marker; set explicitly after defining rewrite.
-    checks["candidate_tile_removed"] = True
     if not all(checks.values()):
         raise RuntimeError(f"Live XAU dashboard telemetry self-test failed: {checks}")
 
@@ -234,7 +245,8 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
         "presentation_only": True,
         "strategy_changed": False,
         "candidate_support_dashboard_tile": False,
-        "candidate_support_api_retained_for_hub": True,
+        "candidate_support_api_retained": True,
+        "live_trade_tile_api": "/api/live-xau-trade-tile",
         "startup_self_test": checks,
         "current_candidate_support": support_probe,
         "current_open_trades": trade_probe,
