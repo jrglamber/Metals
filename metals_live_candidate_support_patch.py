@@ -1,17 +1,16 @@
 """Live-XAU dashboard telemetry for Project Exit Plan Metals.
 
 Presentation/telemetry only.
-- Candidate Support remains available as read-only API telemetry for compatibility.
-- Candidate Support is removed from the Metals dashboard UI.
+- Candidate Support is shown on the Metals dashboard as live-XAU-only 0/1 telemetry.
 - Open Trades shows live XAU total / LONG / SHORT / last-opened time.
-- XAG research/demo is excluded.
+- XAG research/demo is excluded from Candidate Support.
 - No execution, sizing, entry, exit, harvest or broker logic is changed.
 """
 from __future__ import annotations
 
 from typing import Any, Dict
 
-VERSION = "metals_live_xau_dashboard_telemetry_v4_2026_10_16"
+VERSION = "metals_live_xau_dashboard_telemetry_v5_2026_10_19"
 
 
 def _d(value: Any) -> Dict[str, Any]:
@@ -94,8 +93,8 @@ def _live_trade_summary(core: Any) -> Dict[str, Any]:
     }
 
 
-_WIDGET = r'''
-<script id="metals-live-open-trades-detail-v4">
+_WIDGET = r"""
+<script id="metals-live-open-trades-detail-v5">
 (function(){
   function cards(){ return Array.from(document.querySelectorAll('.card')); }
   function byLabel(name){
@@ -105,11 +104,18 @@ _WIDGET = r'''
       return l && String(l.textContent||'').trim().toLowerCase()===target;
     }) || null;
   }
-  function removeCandidate(){
-    cards().forEach(function(c){
-      var l=c.querySelector('.label');
-      if(l && String(l.textContent||'').trim().toLowerCase()==='candidate support') c.remove();
-    });
+  function ensureCandidate(){
+    var existing=byLabel('Candidate Support');
+    if(existing) return existing;
+    var signal=byLabel('Signals');
+    var grid=signal && signal.parentElement;
+    if(!grid) return null;
+    var c=document.createElement('div');
+    c.className='card';
+    c.setAttribute('data-pep-live-xau-candidate-support','1');
+    c.innerHTML='<div class="label">Candidate Support</div><div class="value">0/1 · NONE</div><div class="small">LIVE XAU only · loading current candle…</div>';
+    grid.appendChild(c);
+    return c;
   }
   function fmt(v){
     if(!v) return '-';
@@ -117,8 +123,7 @@ _WIDGET = r'''
       return new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(v));
     }catch(e){ return String(v); }
   }
-  function paint(x){
-    removeCandidate();
+  function paintTrades(x){
     var c=byLabel('Open Trades');
     if(!c || !x || !x.ok) return;
     var v=c.querySelector('.value') || c.querySelector('.v');
@@ -128,19 +133,46 @@ _WIDGET = r'''
     if(v && v.textContent!==value) v.textContent=value;
     if(s && s.textContent!==note) s.textContent=note;
   }
+  function paintCandidate(x){
+    var c=ensureCandidate();
+    if(!c || !x || !x.ok) return;
+    var v=c.querySelector('.value') || c.querySelector('.v');
+    var s=c.querySelector('.small') || c.querySelector('.sub');
+    var supported=Number(x.supported||0);
+    var side=String(x.side||'NONE').toUpperCase();
+    var value=String(x.display || (supported+'/1 · '+side));
+    var latest=x.latest||{};
+    var state=String(latest.candidate_state||'');
+    var reason=String(latest.reason||'').replace(/\s+/g,' ').trim();
+    var note='LIVE XAU only · current candle';
+    if(state) note+=' · '+state;
+    if(reason) note+=' · '+reason;
+    if(note.length>180) note=note.slice(0,177)+'…';
+    if(v){
+      if(v.textContent!==value) v.textContent=value;
+      try{
+        v.classList.remove('pos','neg');
+        v.classList.add(supported>0?'pos':'neg');
+      }catch(e){}
+    }
+    if(s && s.textContent!==note) s.textContent=note;
+  }
   async function refresh(){
-    removeCandidate();
+    ensureCandidate();
     try{
       var r=await fetch('/api/live-xau-trade-tile',{cache:'no-store'});
-      if(!r.ok) return;
-      paint(await r.json());
+      if(r.ok) paintTrades(await r.json());
+    }catch(e){}
+    try{
+      var c=await fetch('/api/live-xau-candidate-support',{cache:'no-store'});
+      if(c.ok) paintCandidate(await c.json());
     }catch(e){}
   }
-  function start(){ refresh(); setTimeout(refresh,750); setInterval(refresh,10000); }
+  function start(){ ensureCandidate(); refresh(); setTimeout(refresh,750); setInterval(refresh,10000); }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',start); else start();
 })();
 </script>
-'''
+"""
 
 
 def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
@@ -161,6 +193,7 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
             "expected": 1,
             "side": side,
             "display": f"{supported}/1 · {side}",
+            "semantics": "CURRENT_XAU_LIVE_CANDIDATE_LONG_OR_SHORT",
             "latest": latest,
             "strategy_changed": False,
         }
@@ -186,7 +219,7 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
             return body
         try:
             text = body.decode('utf-8')
-            if 'metals-live-open-trades-detail-v4' not in text:
+            if 'metals-live-open-trades-detail-v5' not in text:
                 text = text.replace('</body>', _WIDGET + '\n</body>', 1) if '</body>' in text else text + _WIDGET
             return text.encode('utf-8')
         except Exception:
@@ -194,10 +227,15 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
 
     analysis._rewrite_dashboard_version = rewrite
     core._LIVE_XAU_CANDIDATE_SUPPORT_INSTALLED = True
-    probe = trade_snapshot()
+    trade_probe = trade_snapshot()
+    support_probe = support_snapshot()
     checks = {
         'trade_route_callable': callable(getattr(core, 'live_xau_trade_tile_snapshot', None)),
-        'counts_reconcile': int(probe.get('long_count') or 0) + int(probe.get('short_count') or 0) <= int(probe.get('open_count') or 0),
+        'candidate_route_callable': callable(getattr(core, 'live_xau_candidate_support_snapshot', None)),
+        'counts_reconcile': int(trade_probe.get('long_count') or 0) + int(trade_probe.get('short_count') or 0) <= int(trade_probe.get('open_count') or 0),
+        'candidate_denominator_is_one': int(support_probe.get('expected') or 0) == 1,
+        'candidate_side_explicit': str(support_probe.get('side') or '') in {'LONG', 'SHORT', 'NONE'},
+        'xag_excluded': support_probe.get('demo_research_excluded') == ['XAGUSD'],
         'presentation_only': True,
     }
     if not all(checks.values()):
@@ -208,10 +246,12 @@ def install(core: Any, app: Any, analysis: Any) -> Dict[str, Any]:
         'version': VERSION,
         'presentation_only': True,
         'strategy_changed': False,
-        'candidate_support_dashboard_tile': False,
+        'candidate_support_dashboard_tile': True,
+        'candidate_support_api': '/api/live-xau-candidate-support',
         'live_trade_tile_api': '/api/live-xau-trade-tile',
         'startup_self_test': checks,
-        'current_open_trades': probe,
+        'current_candidate_support': support_probe,
+        'current_open_trades': trade_probe,
     }
     core._LIVE_XAU_CANDIDATE_SUPPORT_STATUS = status
     return status
