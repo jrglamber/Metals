@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -e
-uvicorn analysis_entrypoint:app --host 0.0.0.0 --port "${PORT:-8000}"
+uvicorn metals_daily_summary_entrypoint:app --host 0.0.0.0 --port "${PORT:-8000}"
