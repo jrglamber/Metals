@@ -11,8 +11,12 @@ places/closes orders, moves stops, changes sizing, or changes the live manager.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
+import zipfile
 from typing import Any, Dict, List
+from fastapi.responses import Response
 
 VERSION = "metals_monetisation_research_v1_2026_10_24"
 
@@ -164,19 +168,50 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         return out
     core.process_signal = wrapped
 
-    @app.get("/analysis/metals-monetisation-research")
-    def status_endpoint() -> Dict[str, Any]:
+    def research_payload() -> Dict[str, Any]:
         with core.get_conn() as conn:
             ensure(conn)
-            econ = rows(conn.execute("SELECT * FROM metals_economic_campaign_research ORDER BY id DESC LIMIT 250"))
-            runner = rows(conn.execute("SELECT * FROM metals_xau_runner_cohort_research ORDER BY id DESC LIMIT 1000"))
+            econ = rows(conn.execute("SELECT * FROM metals_economic_campaign_research ORDER BY id DESC LIMIT 5000"))
+            runner = rows(conn.execute("SELECT * FROM metals_xau_runner_cohort_research ORDER BY id DESC LIMIT 20000"))
         return {"ok":True,"version":VERSION,"execution_authority":False,
                 "runner_selection":"every 4th live XAU SHORT trade (25% deterministic cohort)",
                 "runner_policy":"MFE_GIVEBACK_50","actual_policy":"MFE_GIVEBACK_25",
                 "economic_campaign":econ,"runner_cohort":runner}
 
+    @app.get("/analysis/metals-monetisation-research")
+    def status_endpoint() -> Dict[str, Any]:
+        return research_payload()
+
+    def csv_text(data: List[Dict[str, Any]]) -> str:
+        out = io.StringIO()
+        if not data:
+            return "note\nNo rows yet\n"
+        fields: List[str] = []
+        for row in data:
+            for key in row:
+                if key not in fields: fields.append(key)
+        writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(data)
+        return out.getvalue()
+
+    @app.get("/analysis/metals-monetisation-research.zip")
+    def export_endpoint() -> Response:
+        payload = research_payload()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("economic-campaign-research.csv", csv_text(payload.get("economic_campaign") or []))
+            zf.writestr("xau-runner-cohort-research.csv", csv_text(payload.get("runner_cohort") or []))
+            zf.writestr("manifest.json", json.dumps({
+                "version":VERSION,"execution_authority":False,
+                "runner_selection":payload.get("runner_selection"),
+                "runner_policy":payload.get("runner_policy"),"actual_policy":payload.get("actual_policy"),
+            },separators=(",",":")))
+        return Response(content=buf.getvalue(), media_type="application/zip",
+                        headers={"Content-Disposition":'attachment; filename="metals-monetisation-research.zip"'})
+
     status = {"installed":True,"version":VERSION,"execution_authority":False,
-              "economic_campaign_hwm":True,"runner_cohort":"EVERY_4TH_XAU_SHORT_MFE50"}
+              "economic_campaign_hwm":True,"runner_cohort":"EVERY_4TH_XAU_SHORT_MFE50",
+              "export":"/analysis/metals-monetisation-research.zip"}
     core._METALS_MONETISATION_RESEARCH_V1_INSTALLED = True
     core._METALS_MONETISATION_RESEARCH_V1_STATUS = status
     return status
