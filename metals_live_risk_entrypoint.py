@@ -10,10 +10,11 @@ from typing import Any
 import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
 import metals_execution_contract_20261031 as execution_contract
+import xag_short_live_probe as xag_live_probe
 
 app = base.app
 core = base.base.base.core
-VERSION = "metals_live_risk_entrypoint_v4_2026_10_31"
+VERSION = "metals_live_risk_entrypoint_v5_2026_10_31"
 
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
@@ -27,6 +28,10 @@ def _live_xau_trade_tile_endpoint():
     if not callable(snapshot):
         raise RuntimeError("live_xau_trade_tile_snapshot unavailable")
     return snapshot()
+
+
+def _xag_short_live_sizing_endpoint():
+    return xag_live_probe.snapshot(core)
 
 
 def _route_matches(route: Any, path: str) -> bool:
@@ -70,6 +75,11 @@ TRADE_TILE_ROUTE = _ensure_front_route(
     _live_xau_trade_tile_endpoint,
     "live_xau_trade_tile_guard",
 )
+XAG_SIZING_PROBE_ROUTE = _ensure_front_route(
+    "/api/xag-short-live-sizing-probe",
+    _xag_short_live_sizing_endpoint,
+    "xag_short_live_sizing_probe_guard",
+)
 
 LIVE_RISK_INSTALL = {
     "installed": True,
@@ -81,6 +91,9 @@ LIVE_RISK_INSTALL = {
     "route_index": RISK_ROUTE.get("route_index"),
     "live_xau_trade_tile_registered": bool(TRADE_TILE_ROUTE.get("registered")),
     "live_xau_trade_tile_route_index": TRADE_TILE_ROUTE.get("route_index"),
+    "xag_short_live_sizing_probe_registered": bool(XAG_SIZING_PROBE_ROUTE.get("registered")),
+    "xag_short_live_sizing_probe_route_index": XAG_SIZING_PROBE_ROUTE.get("route_index"),
+    "xag_short_live_sizing_probe_execution_authority": False,
     "execution_contract_version": EXECUTION_CONTRACT_STATUS.get("version"),
     "xau_short_reporting_explicit": True,
     "xag_short_promotion_staged_not_armed": True,
