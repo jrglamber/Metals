@@ -11,14 +11,16 @@ from typing import Any
 import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
 import metals_execution_contract_20261031 as execution_contract
+import metals_xag_execution_reporting_patch as xag_reporting
 import xag_short_live_probe as xag_live_probe
 import xag_short_live_override as xag_live_execution
 
 app = base.app
 core = base.base.base.core
-VERSION = "metals_live_risk_entrypoint_v7_2026_10_31"
+VERSION = "metals_live_risk_entrypoint_v8_2026_10_31"
 
 XAG_SHORT_LIVE_INSTALL = xag_live_execution.install(core, app)
+XAG_REPORTING_INSTALL = xag_reporting.install(execution_contract, core)
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
 
@@ -101,6 +103,8 @@ LIVE_RISK_INSTALL = {
     "xag_short_live_executor_version": XAG_SHORT_LIVE_INSTALL.get("version"),
     "xag_short_live_executor_fail_closed": bool(XAG_SHORT_LIVE_INSTALL.get("fail_closed")),
     "xag_short_live_executor_execution_authority": bool(XAG_SHORT_LIVE_INSTALL.get("execution_authority")),
+    "xag_reporting_overlay_installed": bool(XAG_REPORTING_INSTALL.get("installed")),
+    "xag_reporting_overlay_version": XAG_REPORTING_INSTALL.get("version"),
     "execution_contract_version": EXECUTION_CONTRACT_STATUS.get("version"),
     "xau_short_reporting_explicit": True,
 }
@@ -164,5 +168,6 @@ try:
 except Exception as exc:
     print(f"METALS_XAG_SHORT_LIVE_EXECUTOR installed=False error={type(exc).__name__}: {exc}", flush=True)
 
+print("METALS_XAG_REPORTING", XAG_REPORTING_INSTALL, flush=True)
 print("METALS_EXECUTION_CONTRACT", EXECUTION_CONTRACT_STATUS, flush=True)
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
