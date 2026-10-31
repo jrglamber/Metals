@@ -1,7 +1,8 @@
-"""Metals production entrypoint + read-only broker-backed risk telemetry.
+"""Metals production entrypoint + broker-backed live execution telemetry.
 
-Final-route guards are presentation/telemetry only. They do not alter entry,
-exit, sizing, harvest, broker execution or strategy state.
+The XAG SHORT executor is installed fail-closed. New XAG entries require its
+separate promotion/ready/armed gates; management of already-open XAG trades is
+kept separate from the new-entry arm so disarming entries cannot strand risk.
 """
 from __future__ import annotations
 
@@ -11,11 +12,13 @@ import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
 import metals_execution_contract_20261031 as execution_contract
 import xag_short_live_probe as xag_live_probe
+import xag_short_live_override as xag_live_execution
 
 app = base.app
 core = base.base.base.core
-VERSION = "metals_live_risk_entrypoint_v6_2026_10_31"
+VERSION = "metals_live_risk_entrypoint_v7_2026_10_31"
 
+XAG_SHORT_LIVE_INSTALL = xag_live_execution.install(core, app)
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
 
@@ -86,7 +89,7 @@ LIVE_RISK_INSTALL = {
     "version": live_risk.VERSION,
     "entrypoint_version": VERSION,
     "mode": "metals",
-    "execution_authority": False,
+    "risk_telemetry_execution_authority": False,
     "route_registered": bool(RISK_ROUTE.get("registered")),
     "route_index": RISK_ROUTE.get("route_index"),
     "live_xau_trade_tile_registered": bool(TRADE_TILE_ROUTE.get("registered")),
@@ -94,9 +97,12 @@ LIVE_RISK_INSTALL = {
     "xag_short_live_sizing_probe_registered": bool(XAG_SIZING_PROBE_ROUTE.get("registered")),
     "xag_short_live_sizing_probe_route_index": XAG_SIZING_PROBE_ROUTE.get("route_index"),
     "xag_short_live_sizing_probe_execution_authority": False,
+    "xag_short_live_executor_installed": bool(XAG_SHORT_LIVE_INSTALL.get("installed")),
+    "xag_short_live_executor_version": XAG_SHORT_LIVE_INSTALL.get("version"),
+    "xag_short_live_executor_fail_closed": bool(XAG_SHORT_LIVE_INSTALL.get("fail_closed")),
+    "xag_short_live_executor_execution_authority": bool(XAG_SHORT_LIVE_INSTALL.get("execution_authority")),
     "execution_contract_version": EXECUTION_CONTRACT_STATUS.get("version"),
     "xau_short_reporting_explicit": True,
-    "xag_short_promotion_staged_not_armed": True,
 }
 
 try:
@@ -135,6 +141,28 @@ try:
     )
 except Exception as exc:
     print(f"METALS_XAG_SHORT_LIVE_SIZING_PROBE ok=False error={type(exc).__name__}: {exc}", flush=True)
+
+try:
+    _xag_runtime = core.xag_short_live_runtime_status()
+    print(
+        "METALS_XAG_SHORT_LIVE_EXECUTOR "
+        f"installed={bool(_xag_runtime.get('installed'))} "
+        f"tables_ok={bool(_xag_runtime.get('tables_ok'))} "
+        f"promotion_enabled={bool(_xag_runtime.get('promotion_enabled'))} "
+        f"executor_ready={bool(_xag_runtime.get('executor_ready'))} "
+        f"execution_armed={bool(_xag_runtime.get('execution_armed'))} "
+        f"orders_allowed={bool(_xag_runtime.get('orders_allowed'))} "
+        f"management_writes_allowed={bool(_xag_runtime.get('management_writes_allowed'))} "
+        f"pilot_units={_xag_runtime.get('pilot_units')} "
+        f"target_risk_gbp={_xag_runtime.get('target_risk_gbp')} "
+        f"sl_pct={_xag_runtime.get('sl_pct')} "
+        f"active_exit_policy={_xag_runtime.get('active_exit_policy')} "
+        f"open_count={_xag_runtime.get('open_live_xag_short_count')} "
+        f"safe_to_mark_executor_ready={bool(_xag_runtime.get('safe_to_mark_executor_ready'))}",
+        flush=True,
+    )
+except Exception as exc:
+    print(f"METALS_XAG_SHORT_LIVE_EXECUTOR installed=False error={type(exc).__name__}: {exc}", flush=True)
 
 print("METALS_EXECUTION_CONTRACT", EXECUTION_CONTRACT_STATUS, flush=True)
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
