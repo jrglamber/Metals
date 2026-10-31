@@ -9,10 +9,13 @@ from typing import Any
 
 import metals_governance_entrypoint as base
 import portfolio_live_risk as live_risk
+import metals_execution_contract_20261031 as execution_contract
 
 app = base.app
 core = base.base.base.core
-VERSION = "metals_live_risk_entrypoint_v3_2026_10_16"
+VERSION = "metals_live_risk_entrypoint_v4_2026_10_31"
+
+EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
 
 def _portfolio_risk_endpoint():
@@ -78,6 +81,9 @@ LIVE_RISK_INSTALL = {
     "route_index": RISK_ROUTE.get("route_index"),
     "live_xau_trade_tile_registered": bool(TRADE_TILE_ROUTE.get("registered")),
     "live_xau_trade_tile_route_index": TRADE_TILE_ROUTE.get("route_index"),
+    "execution_contract_version": EXECUTION_CONTRACT_STATUS.get("version"),
+    "xau_short_reporting_explicit": True,
+    "xag_short_promotion_staged_not_armed": True,
 }
 
 try:
@@ -94,4 +100,5 @@ try:
 except Exception as exc:
     print(f"METALS_LIVE_XAU_TILE_PROBE ok=False error={type(exc).__name__}: {exc}", flush=True)
 
+print("METALS_EXECUTION_CONTRACT", EXECUTION_CONTRACT_STATUS, flush=True)
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
