@@ -14,7 +14,7 @@ import xag_short_live_probe as xag_live_probe
 
 app = base.app
 core = base.base.base.core
-VERSION = "metals_live_risk_entrypoint_v5_2026_10_31"
+VERSION = "metals_live_risk_entrypoint_v6_2026_10_31"
 
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
@@ -112,6 +112,29 @@ try:
     )
 except Exception as exc:
     print(f"METALS_LIVE_XAU_TILE_PROBE ok=False error={type(exc).__name__}: {exc}", flush=True)
+
+try:
+    _xag = _xag_short_live_sizing_endpoint()
+    print(
+        "METALS_XAG_SHORT_LIVE_SIZING_PROBE "
+        f"ok={bool(_xag.get('ok'))} "
+        f"currency={_xag.get('oanda_account_currency')} "
+        f"price_status={_xag.get('price_status')} "
+        f"target_risk_gbp={_xag.get('target_risk_gbp')} "
+        f"sl_pct={_xag.get('sl_pct')} "
+        f"minimum_trade_size={_xag.get('minimum_trade_size')} "
+        f"trade_units_precision={_xag.get('trade_units_precision')} "
+        f"raw_target_units={_xag.get('raw_target_units')} "
+        f"recommended_units={_xag.get('recommended_units')} "
+        f"minimum_size_effective_risk_gbp={_xag.get('minimum_size_effective_risk_gbp')} "
+        f"recommended_effective_risk_gbp={_xag.get('recommended_effective_risk_gbp')} "
+        f"risk_overage_pct={_xag.get('risk_overage_pct')} "
+        f"estimated_margin_gbp={_xag.get('estimated_margin_gbp')} "
+        f"blocking_reasons={_xag.get('blocking_reasons')}",
+        flush=True,
+    )
+except Exception as exc:
+    print(f"METALS_XAG_SHORT_LIVE_SIZING_PROBE ok=False error={type(exc).__name__}: {exc}", flush=True)
 
 print("METALS_EXECUTION_CONTRACT", EXECUTION_CONTRACT_STATUS, flush=True)
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
