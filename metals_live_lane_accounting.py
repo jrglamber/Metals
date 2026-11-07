@@ -4,6 +4,7 @@ Never infer a trade direction from the sign of P&L. Unknown ownership remains
 unattributed rather than silently allocating money to a lane.
 """
 import json
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -30,7 +31,8 @@ def _lane(record):
 
 def _money(value):
     try:
-        return float(value) if value is not None and value != '' else None
+        amount = float(value) if value is not None and value != '' else None
+        return amount if amount is not None and math.isfinite(amount) else None
     except (ValueError, TypeError):
         return None
 
@@ -132,7 +134,7 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             continue
         amount = _money(tx.get('net_realized_gbp'))
         dt = _date(tx.get('transaction_time') or tx.get('time'))
-        if lane not in LANES or amount is None or dt is None:
+        if lane not in LANES or amount is None or dt is None or dt > now:
             unattributed.append(tx_id)
             continue
         totals[lane]['realised_all_time_gbp'] += amount
