@@ -37,6 +37,20 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertEqual(result['unattributed_count'],1)
         self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
 
+    def test_duplicate_open_trade_fails_closed(self):
+        open_trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='3')
+        result = live_lane_financials([], [], [open_trade, open_trade],
+                                      now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertIsNone(result['live_lanes']['xau_long']['unrealised_gbp'])
+
+    def test_open_trade_lane_mismatch_fails_closed(self):
+        links = [dict(broker_trade_id='42', instrument='XAU_USD', side='short')]
+        trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='3')
+        result = live_lane_financials([], links, [trade], now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertIsNone(result['live_lanes']['xau_short']['unrealised_gbp'])
+
     def test_missing_coverage_never_claims_reconciliation(self):
         result = live_lane_financials([], [], now=NOW)
         self.assertFalse(result['reconciled'])
