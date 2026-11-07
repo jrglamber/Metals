@@ -50,6 +50,20 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertFalse(result['reconciled'])
         self.assertIsNone(result['live_lanes']['xag_short']['unrealised_gbp'])
 
+    def test_raw_oanda_unrealized_pl_is_not_assumed_gbp(self):
+        links = [dict(broker_trade_id='42', instrument='XAU_USD', side='long')]
+        trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='10.25')
+        result = live_lane_financials([], links, [trade], now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertIsNone(result['live_lanes']['xau_long']['unrealised_gbp'])
+
+    def test_explicit_gbp_normalised_open_pl_is_accepted(self):
+        links = [dict(broker_trade_id='42', instrument='XAU_USD', side='long')]
+        trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='999', unrealised_gbp='10.25')
+        result = live_lane_financials([], links, [trade], now=NOW, coverage_verified=True)
+        self.assertTrue(result['reconciled'])
+        self.assertEqual(result['live_lanes']['xau_long']['unrealised_gbp'], 10.25)
+
     def test_duplicate_open_trade_fails_closed(self):
         open_trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='3')
         result = live_lane_financials([], [], [open_trade, open_trade],
