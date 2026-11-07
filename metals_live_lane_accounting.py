@@ -74,7 +74,7 @@ def _broker_trade_id(tx):
                 if isinstance(item, dict):
                     value = item.get('tradeID') or item.get('tradeId')
                     if value is not None: ids.add(str(value).strip())
-    return next(iter(ids)) if len(ids) == 1 else None
+    return next(iter(ids)) if len(ids) == 1 else ('__AMBIGUOUS__' if len(ids) > 1 else None)
 
 def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=None, coverage_verified=False):
     """Only attribute uniquely linked broker rows; report incomplete coverage.
@@ -114,7 +114,7 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             continue
         seen.add(tx_id)
         trade_id = _broker_trade_id(tx)
-        if trade_id is not None and str(trade_id) in conflicting_trade_ids:
+        if trade_id == '__AMBIGUOUS__' or (trade_id is not None and str(trade_id) in conflicting_trade_ids):
             unattributed.append(tx_id)
             continue
         lane = links.get(str(trade_id)) if trade_id is not None else None
