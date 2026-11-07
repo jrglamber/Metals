@@ -135,10 +135,22 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             totals[lane]['realised_month_gbp'] += amount
         if dt.isocalendar()[:2] == now.isocalendar()[:2]:
             totals[lane]['realised_week_gbp'] += amount
+    open_seen = set()
     for trade in broker_open_trades:
         trade_id = trade.get('id') or trade.get('broker_trade_id')
-        lane = links.get(str(trade_id)) if trade_id is not None else None
-        lane = lane or _lane(trade)
+        if trade_id is None or not str(trade_id).strip() or str(trade_id) in open_seen:
+            unattributed.append('open_duplicate_or_missing_id:' + str(trade_id))
+            continue
+        open_seen.add(str(trade_id))
+        if str(trade_id) in conflicting_trade_ids:
+            unattributed.append('open_conflicting_id:' + str(trade_id))
+            continue
+        lane = links.get(str(trade_id))
+        explicit_lane = _lane(trade)
+        if lane and explicit_lane and lane != explicit_lane:
+            unattributed.append('open_lane_mismatch:' + str(trade_id))
+            continue
+        lane = lane or explicit_lane
         upl = _money(trade.get('unrealizedPL') if 'unrealizedPL' in trade else trade.get('unrealised_gbp'))
         if lane not in LANES or upl is None:
             unattributed.append('open:' + str(trade_id))
