@@ -54,6 +54,7 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
     """
     now = now or datetime.now(timezone.utc)
     links = {}
+    conflicting_trade_ids = set()
     for link in trade_links:
         lane = _lane(link)
         if lane not in LANES:
@@ -61,7 +62,10 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
         for key in ('broker_trade_id', 'oanda_trade_id', 'trade_id'):
             trade_id = link.get(key)
             if trade_id is not None and str(trade_id).strip():
-                links[str(trade_id)] = lane
+                key = str(trade_id)
+                if key in links and links[key] != lane:
+                    conflicting_trade_ids.add(key)
+                links[key] = lane
     totals = {lane: dict(realised_week_gbp=0., realised_month_gbp=0.,
                          realised_all_time_gbp=0., unrealised_gbp=0., open_trades=0)
               for lane in LANES}
@@ -79,8 +83,17 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             continue
         seen.add(tx_id)
         trade_id = tx.get('broker_trade_id') or tx.get('trade_id') or tx.get('oanda_trade_id')
+        if trade_id is not None and str(trade_id) in conflicting_trade_ids:
+            unattributed.append(tx_id)
+            continue
         lane = links.get(str(trade_id)) if trade_id is not None else None
-        lane = lane or _lane(tx)
+        # A broker-linked trade cannot be reassigned using an untrusted
+        # transaction-level label if the two sources disagree.
+        explicit_lane = _lane(tx)
+        if lane and explicit_lane and lane != explicit_lane:
+            unattributed.append(tx_id)
+            continue
+        lane = lane or explicit_lane
         amount = _money(tx.get('net_realized_gbp'))
         dt = _date(tx.get('transaction_time') or tx.get('time'))
         if lane not in LANES or amount is None or dt is None:
@@ -101,12 +114,12 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             continue
         totals[lane]['unrealised_gbp'] += upl
         totals[lane]['open_trades'] += 1
-    complete = not unattributed and not duplicate
+    complete = not unattributed and not duplicate and not conflicting_trade_ids
     for lane, row in totals.items():
         row['reporting_status'] = 'available' if complete else 'awaiting_reconciliation'
         if not complete:
             for key in ('realised_week_gbp', 'realised_month_gbp', 'realised_all_time_gbp', 'unrealised_gbp'):
                 row[key] = None
     return {'live_lanes': totals, 'reconciled': complete,
-            'unattributed_count': len(unattributed), 'duplicate_count': len(duplicate),
+            'unattributed_count': len(unattributed), 'duplicate_count': len(duplicate), 'conflicting_trade_id_count': len(conflicting_trade_ids),
             'transaction_count': len(seen), 'time_utc': now.isoformat()}
