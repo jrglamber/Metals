@@ -124,7 +124,12 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
         if lane and explicit_lane and lane != explicit_lane:
             unattributed.append(tx_id)
             continue
-        lane = lane or explicit_lane
+        # Instrument/side labels alone do not establish ownership of a broker
+        # transaction: another strategy could trade the same instrument.
+        # Require a unique, previously linked broker trade ID.
+        if lane is None:
+            unattributed.append(tx_id)
+            continue
         amount = _money(tx.get('net_realized_gbp'))
         dt = _date(tx.get('transaction_time') or tx.get('time'))
         if lane not in LANES or amount is None or dt is None:
@@ -150,7 +155,10 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
         if lane and explicit_lane and lane != explicit_lane:
             unattributed.append('open_lane_mismatch:' + str(trade_id))
             continue
-        lane = lane or explicit_lane
+        # The open-position broker snapshot is not an ownership ledger.
+        if lane is None:
+            unattributed.append('open_unlinked:' + str(trade_id))
+            continue
         upl = _money(trade.get('unrealizedPL') if 'unrealizedPL' in trade else trade.get('unrealised_gbp'))
         if lane not in LANES or upl is None:
             unattributed.append('open:' + str(trade_id))
