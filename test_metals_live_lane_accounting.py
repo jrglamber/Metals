@@ -18,6 +18,25 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertEqual(result['live_lanes']['xau_short']['realised_week_gbp'], -1)
         self.assertEqual(result['live_lanes']['xag_short']['realised_week_gbp'], 4)
 
+    def test_oanda_raw_single_closed_trade_is_attributed(self):
+        links = [dict(broker_trade_id='11', instrument='XAU_USD', side='long')]
+        tx = dict(transaction_id='t1', transaction_time='2026-11-06T10:00:00Z',
+                  net_realized_gbp=4, raw_json='{"tradesClosed":[{"tradeID":"11"}]}')
+        result = live_lane_financials([tx], links, now=NOW, coverage_verified=True)
+        self.assertTrue(result['reconciled'])
+        self.assertEqual(result['live_lanes']['xau_long']['realised_week_gbp'],4)
+
+    def test_multi_trade_fill_cannot_be_attributed_by_instrument(self):
+        links = [dict(broker_trade_id='11', instrument='XAU_USD', side='long'),
+                 dict(broker_trade_id='12', instrument='XAU_USD', side='short')]
+        tx = dict(transaction_id='t1', instrument='XAU_USD', side='long',
+                  transaction_time='2026-11-06T10:00:00Z', net_realized_gbp=4,
+                  raw_json='{"tradesClosed":[{"tradeID":"11"},{"tradeID":"12"}]}')
+        result = live_lane_financials([tx], links, now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertEqual(result['unattributed_count'],1)
+        self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
+
     def test_missing_coverage_never_claims_reconciliation(self):
         result = live_lane_financials([], [], now=NOW)
         self.assertFalse(result['reconciled'])
