@@ -146,11 +146,29 @@ def live_metals_lane_accounting():
         # Require an independently verified XAG ledger before declaring success.
         result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
         result["reconciled"] = False
+        # Counts are diagnostics, not proof of complete broker coverage.
+        # Include an observation timestamp and the missing reconciliation
+        # dependencies so the Hub can distinguish stale and incomplete data.
+        from datetime import datetime, timezone
+        result["time_utc"] = datetime.now(timezone.utc).isoformat()
+        result["xau_ledger_audit"] = {
+            "broker_transaction_rows": len(txs),
+            "trade_link_rows": len(links),
+            "unattributed_transaction_rows": result.get("unattributed_count"),
+            "duplicate_transaction_rows": result.get("duplicate_count"),
+            "conflicting_trade_ids": result.get("conflicting_trade_id_count"),
+            "authoritative_broker_history_verified": False,
+        }
         result["xag_short_ledger_audit"] = {
             "trade_links": len(xag_links), "closed_links": len(xag_closed),
             "closed_without_realized_pl": xag_missing,
             "net_gbp_broker_transactions_verified": False,
         }
+        result["missing_reconciliation_requirements"] = [
+            "authoritative_broker_transaction_history_coverage",
+            "xag_short_net_gbp_transaction_attribution",
+            "broker_account_currency_and_open_pnl_conversion",
+        ]
         result["coverage_warning"] = "XAG SHORT has a separate trade-links ledger; net GBP broker transactions not verified"
         for lane in result["live_lanes"].values():
             lane["reporting_status"] = "awaiting_reconciliation"
