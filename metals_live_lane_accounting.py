@@ -159,7 +159,10 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
         if lane is None:
             unattributed.append('open_unlinked:' + str(trade_id))
             continue
-        upl = _money(trade.get('unrealizedPL') if 'unrealizedPL' in trade else trade.get('unrealised_gbp'))
+        # OANDA's unrealizedPL is denominated in account home currency, which
+        # is not necessarily GBP. Only an explicitly GBP-normalised field is
+        # safe for this report; do not silently relabel raw broker P&L.
+        upl = _money(trade.get('unrealised_gbp'))
         if lane not in LANES or upl is None:
             unattributed.append('open:' + str(trade_id))
             continue
