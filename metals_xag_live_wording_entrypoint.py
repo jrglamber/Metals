@@ -120,6 +120,29 @@ class XagLiveWordingMiddleware:
         await self.inner(scope, receive, capture)
 
 
+# Read-only lane-accounting probe. Do not expose partial totals as authoritative.
+@app.get("/api/live-metals-lane-accounting")
+def live_metals_lane_accounting():
+    from metals_live_lane_accounting import live_lane_financials
+    from metals_live_risk_entrypoint import core
+    try:
+        with core.get_conn() as conn:
+            txs = [dict(r) for r in conn.execute(
+                "SELECT * FROM metals_xau_live_broker_transactions ORDER BY transaction_time").fetchall()]
+            links = [dict(r) for r in conn.execute(
+                "SELECT * FROM metals_xau_live_trade_links").fetchall()]
+        broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
+        if broker.get("ok") is not True:
+            return {"ok": False, "reporting_status": "broker_unavailable"}
+        result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
+        result["ok"] = result["reconciled"]
+        result["reporting_status"] = "available" if result["reconciled"] else "awaiting_reconciliation"
+        return result
+    except Exception as exc:
+        return {"ok": False, "reporting_status": "schema_or_broker_error",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 app.add_middleware(XagLiveWordingMiddleware)
 
 print(
