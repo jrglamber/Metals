@@ -37,6 +37,19 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertEqual(result['unattributed_count'],1)
         self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
 
+    def test_instrument_label_without_trade_link_is_not_ownership(self):
+        tx = dict(transaction_id='t9', broker_trade_id='999', instrument='XAU_USD',
+                  side='long', transaction_time='2026-11-06T10:00:00Z', net_realized_gbp=5)
+        result = live_lane_financials([tx], [], now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
+
+    def test_unlinked_open_position_is_not_attributed(self):
+        trade = dict(id='999', instrument='XAG_USD', side='short', unrealizedPL='5')
+        result = live_lane_financials([], [], [trade], now=NOW, coverage_verified=True)
+        self.assertFalse(result['reconciled'])
+        self.assertIsNone(result['live_lanes']['xag_short']['unrealised_gbp'])
+
     def test_duplicate_open_trade_fails_closed(self):
         open_trade = dict(id='42', instrument='XAU_USD', side='long', unrealizedPL='3')
         result = live_lane_financials([], [], [open_trade, open_trade],
