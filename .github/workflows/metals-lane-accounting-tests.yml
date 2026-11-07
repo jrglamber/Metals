@@ -1,0 +1,19 @@
+name: Metals lane accounting tests
+on:
+  pull_request:
+    paths:
+      - 'metals_live_lane_accounting.py'
+      - 'test_metals_live_lane_accounting.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/metals-lane-accounting-tests.yml'
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test read-only lane accounting
+        run: python -m unittest -v test_metals_live_lane_accounting
