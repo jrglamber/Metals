@@ -120,6 +120,68 @@ class XagLiveWordingMiddleware:
         await self.inner(scope, receive, capture)
 
 
+# Read-only lane-accounting probe. Do not expose partial totals as authoritative.
+@app.get("/api/live-metals-lane-accounting")
+def live_metals_lane_accounting():
+    from metals_live_lane_accounting import live_lane_financials
+    from metals_live_risk_entrypoint import core
+    try:
+        with core.get_conn() as conn:
+            txs = [dict(r) for r in conn.execute(
+                "SELECT * FROM metals_xau_live_broker_transactions ORDER BY transaction_time").fetchall()]
+            links = [dict(r) for r in conn.execute(
+                "SELECT * FROM metals_xau_live_trade_links").fetchall()]
+        broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
+        if broker.get("ok") is not True:
+            return {"ok": False, "reporting_status": "broker_unavailable"}
+        # XAG SHORT uses a separate trade-links table. Audit its coverage
+        # independently; realized_pl there is not a verified GBP net ledger.
+        with core.get_conn() as conn:
+            xag_links = [dict(r) for r in conn.execute(
+                "SELECT broker_trade_id, status, realized_pl, closed_at_utc "
+                "FROM metals_xag_live_trade_links").fetchall()]
+        xag_closed = [r for r in xag_links if str(r.get("status") or "").upper().startswith("CLOSED")]
+        xag_missing = sum(1 for r in xag_closed if r.get("realized_pl") is None)
+        # The legacy XAU ledger does not prove XAG SHORT completeness.
+        # Require an independently verified XAG ledger before declaring success.
+        result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
+        result["reconciled"] = False
+        # Counts are diagnostics, not proof of complete broker coverage.
+        # Include an observation timestamp and the missing reconciliation
+        # dependencies so the Hub can distinguish stale and incomplete data.
+        from datetime import datetime, timezone
+        result["time_utc"] = datetime.now(timezone.utc).isoformat()
+        result["xau_ledger_audit"] = {
+            "broker_transaction_rows": len(txs),
+            "trade_link_rows": len(links),
+            "unattributed_transaction_rows": result.get("unattributed_count"),
+            "duplicate_transaction_rows": result.get("duplicate_count"),
+            "conflicting_trade_ids": result.get("conflicting_trade_id_count"),
+            "authoritative_broker_history_verified": False,
+        }
+        result["xag_short_ledger_audit"] = {
+            "trade_links": len(xag_links), "closed_links": len(xag_closed),
+            "closed_without_realized_pl": xag_missing,
+            "net_gbp_broker_transactions_verified": False,
+        }
+        result["missing_reconciliation_requirements"] = [
+            "authoritative_broker_transaction_history_coverage",
+            "xag_short_net_gbp_transaction_attribution",
+            "broker_account_currency_and_open_pnl_conversion",
+        ]
+        result["coverage_warning"] = "XAG SHORT has a separate trade-links ledger; net GBP broker transactions not verified"
+        for lane in result["live_lanes"].values():
+            lane["reporting_status"] = "awaiting_reconciliation"
+            for key in ("realised_week_gbp", "realised_month_gbp", "realised_all_time_gbp", "unrealised_gbp"):
+                lane[key] = None
+        result["ok"] = result["reconciled"]
+        result["reporting_status"] = "available" if result["reconciled"] else "awaiting_reconciliation"
+        return result
+    except Exception as exc:
+        return {"ok": False, "reporting_status": "schema_or_broker_error",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 app.add_middleware(XagLiveWordingMiddleware)
 
 print(
