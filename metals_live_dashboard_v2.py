@@ -102,6 +102,29 @@ def _live_trade_observability() -> Dict[str, Any]:
     return {"ok":bool(broker.get("ok",True)),"scope":"READ_ONLY_LIVE_XAU_MANAGER_AUDIT","execution_mutated":False,"open_count":len(rows),"short_count":len(shorts),"mature_short_count":len(mature),"mature_short_with_positive_mfe":sum(1 for r in mature if r["mfe_r"]>0),"trades":rows,"time_utc":now.isoformat()}
 
 
+@core.app.get("/api/live-metals-lane-accounting")
+def live_metals_lane_accounting():
+    """Read-only candidate ledger. Incomplete attribution must not be reported as P&L."""
+    from metals_live_lane_accounting import live_lane_financials
+    try:
+        with core.get_conn() as conn:
+            txs = [dict(row) for row in conn.execute(
+                "SELECT * FROM metals_xau_live_broker_transactions ORDER BY transaction_time").fetchall()]
+            links = [dict(row) for row in conn.execute(
+                "SELECT * FROM metals_xau_live_trade_links").fetchall()]
+        broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
+        if not broker.get("ok", False):
+            return {"ok": False, "reporting_status": "broker_unavailable",
+                    "error": "Broker read-only snapshot unavailable"}
+        result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
+        result["ok"] = bool(result["reconciled"])
+        result["reporting_status"] = "available" if result["reconciled"] else "awaiting_reconciliation"
+        return result
+    except Exception as exc:
+        return {"ok": False, "reporting_status": "schema_or_broker_error",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 @core.app.get("/api/live-xau-accounting-full")
 def live_xau_accounting_full():
     try: return _aggregate_live_accounting()
