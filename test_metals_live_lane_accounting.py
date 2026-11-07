@@ -24,6 +24,16 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertFalse(result['reconciled'])
         self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
 
+    def test_conflicting_broker_ownership_fails_closed(self):
+        links = [dict(broker_trade_id='11', instrument='XAU_USD', side='long'),
+                 dict(broker_trade_id='11', instrument='XAU_USD', side='short')]
+        tx = dict(transaction_id='1', broker_trade_id='11', net_realized_gbp=5,
+                  transaction_time='2026-11-06T10:00:00Z')
+        result = live_lane_financials([tx], links, now=NOW)
+        self.assertFalse(result['reconciled'])
+        self.assertEqual(result['conflicting_trade_id_count'], 1)
+        self.assertIsNone(result['live_lanes']['xau_short']['realised_week_gbp'])
+
     def test_duplicate_transactions_flagged(self):
         tx = dict(transaction_id='1', instrument='XAU_USD', side='long',
                   net_realized_gbp=5, transaction_time='2026-11-06T10:00:00Z')
