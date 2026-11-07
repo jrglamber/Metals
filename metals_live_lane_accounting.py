@@ -45,7 +45,7 @@ def _date(value):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=None):
+def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=None, coverage_verified=False):
     """Only attribute uniquely linked broker rows; report incomplete coverage.
 
     Transactions must be net GBP values from the broker ledger. Trade-link rows
@@ -114,7 +114,9 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             continue
         totals[lane]['unrealised_gbp'] += upl
         totals[lane]['open_trades'] += 1
-    complete = not unattributed and not duplicate and not conflicting_trade_ids
+    # An empty or partial ledger is not evidence of complete broker coverage.
+    # Only a separate authoritative broker reconciliation can assert this flag.
+    complete = bool(coverage_verified) and not unattributed and not duplicate and not conflicting_trade_ids
     for lane, row in totals.items():
         row['reporting_status'] = 'available' if complete else 'awaiting_reconciliation'
         if not complete:
@@ -122,4 +124,4 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
                 row[key] = None
     return {'live_lanes': totals, 'reconciled': complete,
             'unattributed_count': len(unattributed), 'duplicate_count': len(duplicate), 'conflicting_trade_id_count': len(conflicting_trade_ids),
-            'transaction_count': len(seen), 'time_utc': now.isoformat()}
+            'transaction_count': len(seen), 'coverage_verified': bool(coverage_verified), 'time_utc': now.isoformat()}
