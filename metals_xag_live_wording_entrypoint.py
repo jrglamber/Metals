@@ -134,11 +134,24 @@ def live_metals_lane_accounting():
         broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
         if broker.get("ok") is not True:
             return {"ok": False, "reporting_status": "broker_unavailable"}
+        # XAG SHORT uses a separate trade-links table. Audit its coverage
+        # independently; realized_pl there is not a verified GBP net ledger.
+        with core.get_conn() as conn:
+            xag_links = [dict(r) for r in conn.execute(
+                "SELECT broker_trade_id, status, realized_pl, closed_at_utc "
+                "FROM metals_xag_live_trade_links").fetchall()]
+        xag_closed = [r for r in xag_links if str(r.get("status") or "").upper().startswith("CLOSED")]
+        xag_missing = sum(1 for r in xag_closed if r.get("realized_pl") is None)
         # The legacy XAU ledger does not prove XAG SHORT completeness.
         # Require an independently verified XAG ledger before declaring success.
         result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
         result["reconciled"] = False
-        result["coverage_warning"] = "XAG SHORT broker transaction coverage not yet verified"
+        result["xag_short_ledger_audit"] = {
+            "trade_links": len(xag_links), "closed_links": len(xag_closed),
+            "closed_without_realized_pl": xag_missing,
+            "net_gbp_broker_transactions_verified": False,
+        }
+        result["coverage_warning"] = "XAG SHORT has a separate trade-links ledger; net GBP broker transactions not verified"
         for lane in result["live_lanes"].values():
             lane["reporting_status"] = "awaiting_reconciliation"
             for key in ("realised_week_gbp", "realised_month_gbp", "realised_all_time_gbp", "unrealised_gbp"):
