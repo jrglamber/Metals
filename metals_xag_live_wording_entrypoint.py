@@ -134,7 +134,15 @@ def live_metals_lane_accounting():
         broker = core.metals_xau_live_broker_snapshot(include_account_summary=False) or {}
         if broker.get("ok") is not True:
             return {"ok": False, "reporting_status": "broker_unavailable"}
+        # The legacy XAU ledger does not prove XAG SHORT completeness.
+        # Require an independently verified XAG ledger before declaring success.
         result = live_lane_financials(txs, links, broker.get("owned_open_trades") or [])
+        result["reconciled"] = False
+        result["coverage_warning"] = "XAG SHORT broker transaction coverage not yet verified"
+        for lane in result["live_lanes"].values():
+            lane["reporting_status"] = "awaiting_reconciliation"
+            for key in ("realised_week_gbp", "realised_month_gbp", "realised_all_time_gbp", "unrealised_gbp"):
+                lane[key] = None
         result["ok"] = result["reconciled"]
         result["reporting_status"] = "available" if result["reconciled"] else "awaiting_reconciliation"
         return result
