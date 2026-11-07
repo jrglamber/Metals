@@ -12,11 +12,17 @@ class TestLaneAccounting(unittest.TestCase):
         txs = [dict(transaction_id=str(i), broker_trade_id=tid,
                     transaction_time='2026-11-06T10:00:00Z', net_realized_gbp=amount)
                for i, tid, amount in [(1,'11',3), (2,'11',2), (3,'12',-1), (4,'13',4)]]
-        result = live_lane_financials(txs, links, now=NOW)
+        result = live_lane_financials(txs, links, now=NOW, coverage_verified=True)
         self.assertTrue(result['reconciled'])
         self.assertEqual(result['live_lanes']['xau_long']['realised_week_gbp'], 5)
         self.assertEqual(result['live_lanes']['xau_short']['realised_week_gbp'], -1)
         self.assertEqual(result['live_lanes']['xag_short']['realised_week_gbp'], 4)
+
+    def test_missing_coverage_never_claims_reconciliation(self):
+        result = live_lane_financials([], [], now=NOW)
+        self.assertFalse(result['reconciled'])
+        self.assertFalse(result['coverage_verified'])
+        self.assertIsNone(result['live_lanes']['xag_short']['realised_all_time_gbp'])
 
     def test_missing_attribution_does_not_claim_zero(self):
         result = live_lane_financials([dict(transaction_id='1', net_realized_gbp=5,
