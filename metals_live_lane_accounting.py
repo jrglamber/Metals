@@ -3,6 +3,7 @@
 Never infer a trade direction from the sign of P&L. Unknown ownership remains
 unattributed rather than silently allocating money to a lane.
 """
+import json
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -45,6 +46,36 @@ def _date(value):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
+
+def _broker_trade_id(tx):
+    """Extract a single unambiguous OANDA trade ID from a broker transaction.
+
+    A fill may close several trades; its aggregate net P&L must not be
+    allocated to any one trade unless separately itemised by the broker.
+    """
+    direct = tx.get('broker_trade_id') or tx.get('trade_id') or tx.get('oanda_trade_id')
+    raw = tx.get('raw_json')
+    try:
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        raw = None
+    ids = set()
+    if direct is not None and str(direct).strip():
+        ids.add(str(direct).strip())
+    if isinstance(raw, dict):
+        for field in ('tradeID', 'tradeId'):
+            if raw.get(field) is not None:
+                ids.add(str(raw[field]).strip())
+        for field in ('tradesClosed', 'tradeReduced', 'tradeOpened'):
+            records = raw.get(field) or []
+            if isinstance(records, dict): records = [records]
+            if not isinstance(records, list): return None
+            for item in records:
+                if isinstance(item, dict):
+                    value = item.get('tradeID') or item.get('tradeId')
+                    if value is not None: ids.add(str(value).strip())
+    return next(iter(ids)) if len(ids) == 1 else None
+
 def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=None, coverage_verified=False):
     """Only attribute uniquely linked broker rows; report incomplete coverage.
 
@@ -82,7 +113,7 @@ def live_lane_financials(transactions, trade_links, broker_open_trades=(), now=N
             duplicate.append(tx_id)
             continue
         seen.add(tx_id)
-        trade_id = tx.get('broker_trade_id') or tx.get('trade_id') or tx.get('oanda_trade_id')
+        trade_id = _broker_trade_id(tx)
         if trade_id is not None and str(trade_id) in conflicting_trade_ids:
             unattributed.append(tx_id)
             continue
