@@ -16,4 +16,6 @@ jobs:
         with:
           python-version: '3.11'
       - name: Test read-only lane accounting
-        run: python -m unittest -v test_metals_live_lane_accounting
+        run: |
+          python -m py_compile metals_live_lane_accounting.py metals_xag_live_wording_entrypoint.py
+          python -m unittest -v test_metals_live_lane_accounting
