@@ -78,6 +78,18 @@ class TestLaneAccounting(unittest.TestCase):
         self.assertFalse(result['reconciled'])
         self.assertIsNone(result['live_lanes']['xau_short']['unrealised_gbp'])
 
+    def test_nonfinite_or_future_broker_money_fails_closed(self):
+        links = [dict(broker_trade_id='42', instrument='XAU_USD', side='long')]
+        for amount, when in [('nan', '2026-11-06T10:00:00Z'),
+                             ('inf', '2026-11-06T10:00:00Z'),
+                             (5, '2026-11-08T10:00:00Z')]:
+            with self.subTest(amount=amount, when=when):
+                tx = dict(transaction_id='t1', broker_trade_id='42',
+                          transaction_time=when, net_realized_gbp=amount)
+                result = live_lane_financials([tx], links, now=NOW, coverage_verified=True)
+                self.assertFalse(result['reconciled'])
+                self.assertIsNone(result['live_lanes']['xau_long']['realised_week_gbp'])
+
     def test_missing_coverage_never_claims_reconciliation(self):
         result = live_lane_financials([], [], now=NOW)
         self.assertFalse(result['reconciled'])
