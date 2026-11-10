@@ -199,6 +199,29 @@ def _repair_zip(body: bytes, status: Dict[str, Any]) -> bytes:
                         pass
                 zout.writestr(info, data)
 
+            # Make live execution scope explicit at the ZIP root, independent of
+            # legacy demo-named research CSVs and historical practice records.
+            # This is metadata only: it does not reclassify P&L as broker-verified.
+            lane_scope = {
+                "source": "runtime_execution_status",
+                "lanes": {
+                    key: {
+                        "state": (status.get("lanes") or {}).get(key, {}).get("state"),
+                        "capital": (status.get("lanes") or {}).get(key, {}).get("capital"),
+                        "execution_lane": (status.get("lanes") or {}).get(key, {}).get("execution_lane"),
+                    }
+                    for key in ("XAUUSD_LONG", "XAUUSD_SHORT", "XAGUSD_SHORT", "XAGUSD_LONG")
+                },
+                "accounting_note": (
+                    "LIVE indicates execution status, not that every row in a legacy "
+                    "demo/research CSV was broker-executed. Use broker transaction "
+                    "reconciliation for verified live realised GBP P&L."
+                ),
+            }
+            if "live-lane-scope.json" not in names:
+                zout.writestr("live-lane-scope.json", json.dumps(lane_scope, indent=2, sort_keys=True))
+                changed = True
+
             if "execution-status.json" not in names:
                 zout.writestr(
                     "execution-status.json",
