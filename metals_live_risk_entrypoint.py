@@ -171,3 +171,9 @@ except Exception as exc:
 print("METALS_XAG_REPORTING", XAG_REPORTING_INSTALL, flush=True)
 print("METALS_EXECUTION_CONTRACT", EXECUTION_CONTRACT_STATUS, flush=True)
 print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
+
+# Read-only AI observer effectiveness and health; no execution authority.
+@app.get("/api/ai-observer/status")
+def observer_health_status():
+    from observer_outcome_health import audit
+    return audit(core, "ai_regime_observer")
