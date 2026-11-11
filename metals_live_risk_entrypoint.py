@@ -177,3 +177,10 @@ print("METALS_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
 def observer_health_status():
     from observer_outcome_health import audit
     return audit(core, "ai_regime_observer")
+
+# The production router has a legacy catch-all route. Prioritize the
+# read-only observer endpoint so it is not swallowed and returned as 404.
+_observer_route = next((r for r in app.router.routes if getattr(r, "path", None) == "/api/ai-observer/status" and getattr(r, "endpoint", None) is observer_health_status), None)
+if _observer_route is not None:
+    app.router.routes.remove(_observer_route)
+    app.router.routes.insert(0, _observer_route)
