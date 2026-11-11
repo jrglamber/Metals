@@ -9,9 +9,15 @@ def _date(value):
 
 def audit(core, table):
     now=datetime.now(timezone.utc)
-    with core.get_conn() as conn:
-        rows=[dict(x) for x in conn.execute(
-            "SELECT * FROM "+table+" ORDER BY id DESC LIMIT 3000").fetchall()]
+    try:
+        with core.get_conn() as conn:
+            rows=[dict(x) for x in conn.execute(
+                "SELECT * FROM "+table+" ORDER BY id DESC LIMIT 500").fetchall()]
+    except Exception as exc:
+        return {"ok":False,"research_only":True,
+                "alerts":["OBSERVER_AUDIT_QUERY_FAILED"],
+                "reason":type(exc).__name__+": "+str(exc)[:200],
+                "table":table}
     latest=rows[0] if rows else None
     complete=next((r for r in rows if str(r.get("status")).upper()=="COMPLETE"),None)
     eligible=next((r for r in rows if int(r.get("api_eligible") or 0)),None)
