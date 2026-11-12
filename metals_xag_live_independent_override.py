@@ -165,6 +165,14 @@ def health(core: Any) -> Dict[str, Any]:
             "WHERE status IN ('SUBMITTING','UNKNOWN_NEEDS_RECONCILIATION','OPEN_UNVERIFIED_STOP')"
         ).fetchone()["n"]
     broker = list(snapshot.get("xag") or []) if snapshot.get("ok") else []
+    # OANDA unrealizedPL is in the live account home currency (GBP). Missing
+    # values are explicitly incomplete, never silently treated as zero.
+    upl_complete = bool(snapshot.get("ok")) and all(
+        t.get("unrealizedPL") is not None and
+        live._num(core, t.get("unrealizedPL")) is not None for t in broker
+    )
+    upl_gbp = (round(sum(float(live._num(core, t.get("unrealizedPL"))) for t in broker), 2)
+               if upl_complete else None)
     bids = {str(t.get("id")) for t in broker}
     lids = {str(t.get("broker_trade_id")) for t in links if t.get("broker_trade_id")}
     safe = bool(snapshot.get("ok") and bids == lids and len(bids) == len(links) and not intents)
@@ -176,6 +184,10 @@ def health(core: Any) -> Dict[str, Any]:
         "broker_open_short_count": sum(float(t.get("currentUnits") or 0) < 0 for t in broker),
         "broker_open_long_count": sum(float(t.get("currentUnits") or 0) > 0 for t in broker),
         "tracked_open_count": len(links),
+        "broker_open_unrealized_gbp": upl_gbp,
+        "broker_open_unrealized_complete": upl_complete,
+        "realised_xag_ledger_verified": False,
+        "open_pl_source": "LIVE_OANDA_TRADE_UNREALIZED_PL_GBP",
         "untracked_broker_count": len(bids-lids),
         "orphan_local_count": len(lids-bids),
         "unresolved_entry_intent_count": int(intents),
@@ -260,7 +272,7 @@ DASHBOARD_SNIPPET = r"""
 <details id="pep-xag-live-health" class="dashboard-group" style="margin:10px 0">
  <summary>LIVE XAG Short — broker &amp; execution health</summary>
  <div id="pep-xag-live-health-info" class="section-note">Checking live XAG positions…</div>
- <div class="section-note">Independent live one-unit pilot · XAU Short +2R does not block XAG · practice basket not used for new XAG Short orders.</div>
+ <div class="section-note">Independent live one-unit pilot · XAU Short +2R does not block XAG · practice basket not used for new XAG Short orders. Open P&L uses live OANDA trade data; historical realised XAG accounting is not yet broker-ledger reconciled.</div>
 </details>
 <script>
 (function(){
@@ -273,6 +285,7 @@ DASHBOARD_SNIPPET = r"""
  const last=x.recent_execution||{};
  b.textContent='Execution: '+x.execution_health+' | Broker shorts: '+x.broker_open_short_count+
   ' | Tracked: '+x.tracked_open_count+' | Unlinked: '+x.untracked_broker_count+
+  ' | OANDA open P&L: '+(x.broker_open_unrealized_complete?'£'+Number(x.broker_open_unrealized_gbp).toFixed(2):'unavailable')+
   ' | Unresolved orders: '+x.unresolved_entry_intent_count+
   '. Last audit: '+(last.action||'—')+' / '+(last.status||'—')+' / '+(last.reason||'—');
  }catch(e){b.textContent='XAG health unavailable: '+(e.message||e);}
