@@ -10,7 +10,11 @@ from __future__ import annotations
 from typing import Any, Dict
 
 import metals_execution_contract_20261031 as execution_contract
+import metals_xau_manual_campaign_reset as manual_campaign_reset
 from metals_live_risk_entrypoint import app as app
+from metals_live_risk_entrypoint import core as core
+
+MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
 
 VERSION = "metals_xag_live_wording_v1_2026_10_31"
 
@@ -106,6 +110,12 @@ class XagLiveWordingMiddleware:
                     text = body.decode("utf-8")
                     for old, new in _HTML_REPLACEMENTS:
                         text = text.replace(old, new)
+                    if scope.get("path") in {"/", "/dashboard"} and "pep-xau-campaign-reset" not in text:
+                        anchor = "<h2>Details</h2>"
+                        if anchor in text:
+                            text = text.replace(anchor, anchor + manual_campaign_reset.DASHBOARD_SNIPPET, 1)
+                        else:
+                            text = text.replace("</body>", manual_campaign_reset.DASHBOARD_SNIPPET + "</body>", 1)
                     body = text.encode("utf-8")
                 except Exception:
                     pass
@@ -187,6 +197,8 @@ app.add_middleware(XagLiveWordingMiddleware)
 print(
     "METALS_XAG_LIVE_WORDING "
     f"version={VERSION} xag_short=LIVE xag_long=RESEARCH_ONLY "
-    "legacy_top_tiles=XAU_ONLY presentation_only=True",
+    "legacy_top_tiles=XAU_ONLY presentation_only=True "
+    f"manual_xau_campaign_reset={MANUAL_XAU_RESET_INSTALL.get('version')} "
+    f"reset_routes={MANUAL_XAU_RESET_INSTALL.get('route_count')}",
     flush=True,
 )
