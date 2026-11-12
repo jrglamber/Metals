@@ -193,5 +193,71 @@ class IndependentRouteTests(unittest.TestCase):
         self.assertEqual(out["reason"],"xag_live_not_armed")
 
 
+class LiveOrderAttemptTests(unittest.TestCase):
+    def setUp(self):
+        self.core = Core()
+        self.addCleanup(self.core.db.close)
+
+    def test_governed_live_approval_submits_once_without_practice_link(self):
+        approval = {
+            "approved_for_live": True, "asset": "XAGUSD", "side": "short",
+            "active_exit_policy": {"policy": live.POLICY, "version": live.POLICY_VERSION},
+            "practice_order_placed": False,
+        }
+        probe = {
+            "ok": True, "oanda_account_currency": "GBP", "price_status": "tradeable",
+            "recommended_units": 1.0, "minimum_trade_size": 1.0,
+            "recommended_effective_risk_gbp": 2.0, "target_risk_gbp": 2.0,
+            "entry_price": 39.0, "emergency_stop_price": 41.0, "display_precision": 3,
+        }
+        writes = []
+        def request(_core, path, method="GET", body=None):
+            if method == "POST":
+                writes.append(body)
+                return {"ok": False, "error": "SIMULATED_BROKER_REJECTION"}
+            raise AssertionError("Unexpected OANDA method " + method)
+        with patch.object(live, "config_status", return_value={"orders_allowed": True}), \
+             patch.object(live, "_reconcile", return_value={
+                 "ok": True, "exact_live_ownership": True,
+                 "unlinked_broker_xag_count": 0, "local_xag_open_count": 0,
+                 "has_broker_long": False
+             }), \
+             patch.object(live.sizing_probe, "snapshot", return_value=probe), \
+             patch.object(live, "_request", side_effect=request):
+            first = live._execute_live(self.core, 5, approval)
+            second = live._execute_live(self.core, 5, approval)
+        self.assertFalse(first["ok"])
+        self.assertEqual(second["reason"], "xag_live_entry_intent_already_exists")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["order"]["units"], "-1")
+        self.assertEqual(writes[0]["order"]["instrument"], "XAG_USD")
+        self.assertEqual(self.core.db.execute(
+            "SELECT status FROM metals_xag_live_entry_intents WHERE raw_signal_id=5"
+        ).fetchone()[0], "BROKER_REJECTED")
+
+    def test_http_200_close_must_not_mark_closed_until_broker_confirms(self):
+        insert_link(self.core, 123, status="OPEN")
+        responses = []
+        def request(_core,path,method="GET",body=None):
+            responses.append(method)
+            if method == "GET":
+                return {"ok": True, "data": {"trade": {
+                    "id": "123", "state": "OPEN", "currentUnits": "-1", "instrument": "XAG_USD"
+                }}}
+            if method == "PUT":
+                return {"ok": True, "data": {"orderFillTransaction": {"pl": "0.5"}}}
+            raise AssertionError(method)
+        with patch.object(live, "config_status", return_value={"management_writes_allowed": True}), \
+             patch.object(live, "_request", side_effect=request):
+            result=live._close_link(self.core, {"id": 123, "raw_signal_id":123,
+                         "broker_trade_id":"123"},"TEST_CLOSE")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["retry"])
+        self.assertEqual(responses, ["GET","PUT","GET"])
+        self.assertEqual(self.core.db.execute(
+            "SELECT status FROM metals_xag_live_trade_links WHERE id=123"
+        ).fetchone()[0],"CLOSE_RETRY")
+
+
 if __name__=="__main__":
     unittest.main()
