@@ -448,26 +448,18 @@ def _reconcile(core: Any) -> Dict[str, Any]:
     }
 
 def _verify_stop(core: Any, broker_trade_id: str, fill_price: float) -> Dict[str, Any]:
-    resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{broker_trade_id}", "GET")
-    if not resp.get("ok"):
-        return {"ok": False, "reason": "trade_detail_read_failed", "response": resp}
-    trade = _d((resp.get("data") or {}).get("trade"))
-    sl = _d(trade.get("stopLossOrder"))
-    price = _num(core, sl.get("price"))
-    units = _num(core, trade.get("currentUnits"))
-    valid = bool(
-        str(trade.get("instrument") or "").upper() == INSTRUMENT
-        and units is not None and units < 0
-        and price is not None and price > float(fill_price)
-    )
+    verified = _verified_broker_open_short(core, broker_trade_id)
+    if not verified.get("ok"):
+        return {"ok": False, "reason": verified.get("reason") or "broker_stop_not_verified"}
+    # Preserve the live fill-price safety invariant even when the broker reports
+    # a slightly different average entry after execution.
+    if float(verified["stop_price"]) <= float(fill_price):
+        return {"ok": False, "reason": "attached_short_stop_below_fill_price"}
     return {
-        "ok": valid,
-        "reason": "verified" if valid else "missing_or_invalid_short_stop",
-        "stop_price": price,
-        "current_units": units,
-        "state": trade.get("state"),
+        "ok": True, "reason": "verified_broker_open_with_attached_short_stop",
+        "stop_price": verified["stop_price"],
+        "current_units": verified["units"], "state": "OPEN",
     }
-
 
 def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
     cfg = config_status(core)
@@ -476,14 +468,43 @@ def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
     bid = str(link.get("broker_trade_id") or "")
     if not bid:
         return {"ok": False, "reason": "broker_trade_id_missing"}
+    # A prior successful CLOSE request can have been recorded locally before
+    # OANDA actually confirmed CLOSED. Never issue another close unless GET
+    # confirms the position is still OPEN.
+    pre = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}", "GET")
+    pre_trade = _d((pre.get("data") or {}).get("trade")) if pre.get("ok") else {}
+    broker_state = str(pre_trade.get("state") or "").upper()
+    if broker_state not in {"OPEN", "CLOSED"}:
+        return {"ok": False, "blocked": True, "reason": "broker_close_state_unverified"}
+    if broker_state == "CLOSED":
+        realized = _num(core, pre_trade.get("realizedPL"))
+        with core.get_conn() as conn:
+            conn.execute(
+                "UPDATE metals_xag_live_trade_links SET updated_at_utc=?,status='CLOSED_RECONCILED',"
+                "realized_pl=?,closed_at_utc=COALESCE(NULLIF(closed_at_utc,''),?),"
+                "last_reconciled_at_utc=? WHERE id=?",
+                (_now(), realized, _now(), _now(), int(link["id"])),
+            )
+            conn.commit()
+        _audit(core, link.get("raw_signal_id"), "close", "CLOSED_RECONCILED",
+               "broker_confirmed_preexisting_close", int(link["id"]), bid)
+        return {"ok": True, "already_closed": True, "realized_pl": realized}
     last: Dict[str, Any] = {}
     for attempt in range(1, 4):
         resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}/close", "PUT", {"units": "ALL"})
         last = resp
         if resp.get("ok"):
+            # HTTP 200 is not sufficient evidence that the broker trade is flat.
+            # Reconciliation is broker-authoritative, as with the open entry.
+            after = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}", "GET")
+            bt = _d((after.get("data") or {}).get("trade")) if after.get("ok") else {}
+            if str(bt.get("state") or "").upper() != "CLOSED":
+                _audit(core, link.get("raw_signal_id"), "close", "PENDING_VERIFICATION",
+                       "OANDA close request accepted but CLOSED state not verified",
+                       int(link["id"]), bid)
+                break
             data = resp.get("data") or {}
-            fill = data.get("orderFillTransaction") or {}
-            realized = _num(core, fill.get("pl"))
+            realized = _num(core, bt.get("realizedPL"))
             with core.get_conn() as conn:
                 conn.execute(
                     """UPDATE metals_xag_live_trade_links
@@ -493,8 +514,8 @@ def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
                     (_now(), realized, _now(), str(reason), _now(), int(link["id"])),
                 )
                 conn.commit()
-            _audit(core, link.get("raw_signal_id"), "close", "CLOSED", reason, int(link["id"]), bid,
-                   {"attempt": attempt, "response": data})
+            _audit(core, link.get("raw_signal_id"), "close", "CLOSED_VERIFIED", reason, int(link["id"]), bid,
+                   {"attempt": attempt, "broker_state": "CLOSED"})
             return {"ok": True, "attempt": attempt, "realized_pl": realized}
         try:
             if bool(core.is_oanda_timeout_or_unknown_response(resp)):
