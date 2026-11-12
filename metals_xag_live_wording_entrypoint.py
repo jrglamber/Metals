@@ -13,6 +13,7 @@ import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
 import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
+import metals_xag_live_signal_status_panel as live_xag_signal_panel
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
@@ -80,7 +81,7 @@ class XagLiveWordingMiddleware:
         self.inner = inner
 
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or str(scope.get("path") or "") not in {"/", "/dashboard", "/dashboard/top"}:
+        if scope.get("type") != "http" or str(scope.get("path") or "") not in {"/", "/dashboard", "/dashboard/top", "/dashboard/section/latest-signals"}:
             await self.inner(scope, receive, send)
             return
 
@@ -113,6 +114,11 @@ class XagLiveWordingMiddleware:
                     text = body.decode("utf-8")
                     for old, new in _HTML_REPLACEMENTS:
                         text = text.replace(old, new)
+                    if scope.get("path") == "/dashboard/section/latest-signals" and 'pep-xag-live-signal-status' not in text:
+                        # Read-only authoritative LIVE XAG Short status. Keep
+                        # existing practice guard table for research, but make
+                        # its lack of live-execution authority explicit.
+                        text = live_xag_signal_panel.render(core) + text
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
                         if "pep-xau-campaign-reset" not in text:
