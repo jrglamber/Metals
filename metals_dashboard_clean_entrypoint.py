@@ -2,7 +2,7 @@
 
 Presentation-only layer on top of metals_unified_entrypoint. Trading/execution
 logic is unchanged. The dashboard follows the standard portfolio layout:
-- Open Trades / Positions = LIVE XAU only
+- Open Trades / Positions = LIVE XAU and broker-verified LIVE XAG SHORT; no practice positions
 - Broker / OANDA / Accounting = one section containing LIVE XAU and DEMO / RESEARCH subsections
 - all expandable sections collapsed by default
 """
@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 import metals_unified_entrypoint as base
+import metals_xag_live_open_positions_panel as xag_open
+from metals_live_positions_combined import combine as combine_live_open
 
 analysis = base.analysis
 core = analysis.core
@@ -41,6 +43,18 @@ def live_xau_open_positions() -> Dict[str, Any]:
         return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "count": len(trades), "trades": trades}
     except Exception as exc:
         return {"ok": False, "scope": "LIVE_XAU_ONLY", "count": 0, "trades": [], "error": f"{type(exc).__name__}: {exc}"}
+
+
+
+@core.app.get("/api/live-metals-open-positions")
+def live_metals_open_positions() -> Dict[str, Any]:
+    """Actual dashboard data source: both LIVE XAU and LIVE XAG SHORT."""
+    xau = live_xau_open_positions()
+    try:
+        xag = xag_open.snapshot(core)
+    except Exception as exc:
+        xag = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return combine_live_open(xau, xag)
 
 
 @core.app.get("/api/live-xau-broker-accounting")
@@ -124,14 +138,74 @@ _STANDARD_LAYOUT = r'''
     if(d) return d;
     d=document.createElement('details');
     d.id='pep-live-open-positions';
-    d.innerHTML='<summary>Open Trades / Positions</summary><div class="pep-body"><div class="pep-empty">Loading live XAU positions…</div></div>';
-    fetch('/api/live-xau-open-positions',{cache:'no-store'}).then(function(r){return r.json();}).then(function(data){
-      var body=d.querySelector('.pep-body'), rows=(data&&data.trades)||[];
-      if(!rows.length){ body.innerHTML='<div class="pep-empty">No live XAU positions open.</div>'; return; }
-      var html='<table><thead><tr><th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L</th><th>Opened</th></tr></thead><tbody>';
-      rows.forEach(function(x){ html+='<tr><td>'+(x.instrument||'XAU_USD')+'</td><td>'+String(x.side||'').toUpperCase()+'</td><td>'+x.units+'</td><td>'+(x.price||'')+'</td><td>'+(x.unrealized_pl==null?'':x.unrealized_pl)+'</td><td>'+(x.open_time||'')+'</td></tr>'; });
-      body.innerHTML=html+'</tbody></table>';
-    }).catch(function(){ var body=d.querySelector('.pep-body'); if(body) body.innerHTML='<div class="pep-empty">Live XAU position view unavailable.</div>'; });
+    d.innerHTML='<summary>Open Trades / Positions</summary>'+
+      '<div class="pep-body"><div class="pep-empty">Loading LIVE XAU and XAG SHORT positions…</div></div>';
+    var loading=false;
+    function e(v){
+      return String(v==null?'':v).replace(/[&<>"']/g,function(ch){
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+      });
+    }
+    function fmt(v,n){
+      var num=Number(v);
+      if(v==null||v===''||!isFinite(num))return '—';
+      return num.toFixed(n==null?2:n);
+    }
+    function render(data){
+      var body=d.querySelector('.pep-body');
+      if(!body)return;
+      var xauCount=data.xau_ok?String(data.xau_count):'UNAVAILABLE';
+      var xagCount=data.xag_ok?String(data.xag_short_count):'UNAVAILABLE';
+      var total=data.count==null?'INCOMPLETE':String(data.count);
+      var recon=(data.xag_ok?(data.xag_broker_link_reconciled?'EXACT':'MISMATCH — CHECK'):'UNAVAILABLE');
+      var headline='<div class="pep-empty"><strong>LIVE Metals open: '+e(total)+
+        '</strong> · XAU '+e(xauCount)+' · XAG SHORT '+e(xagCount)+
+        ' · XAG broker links '+e(recon)+'</div>';
+      var alerts='';
+      if(!data.xau_ok)alerts+='<div class="lazy-error">LIVE XAU broker snapshot unavailable. Existing XAG rows shown; total not confirmed.</div>';
+      if(!data.xag_ok)alerts+='<div class="lazy-error">LIVE XAG Short broker snapshot unavailable. Existing XAU rows shown; this is NOT zero XAG positions.</div>';
+      if(data.xag_ok&&!data.xag_broker_link_reconciled)alerts+='<div class="lazy-error">LIVE XAG Short broker/database ownership mismatch — check execution health before new orders.</div>';
+      var rows=(data.trades||[]);
+      if(!rows.length){
+        body.innerHTML=headline+alerts+(data.ok?'<div class="pep-empty">No LIVE XAU or XAG positions open in OANDA.</div>':'');
+        return;
+      }
+      var html='<div class="table-scroll"><table><thead><tr>'+
+        '<th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L (GBP)</th>'+
+        '<th>Opened</th><th>OANDA ID</th><th>Recorded SL</th><th>Manager</th><th>Tracking</th>'+
+        '</tr></thead><tbody>';
+      rows.forEach(function(x){
+        var track=String(x.tracking||'—');
+        var warn=track.indexOf('UNLINKED')>=0?' class="warn"':'';
+        html+='<tr><td><strong>'+e(x.instrument)+'</strong></td><td>'+e(x.side)+
+          '</td><td>'+e(fmt(x.units,1))+'</td><td>'+e(fmt(x.entry_price,3))+
+          '</td><td>'+e(x.unrealized_gbp==null?'—':'£'+fmt(x.unrealized_gbp,2))+
+          '</td><td>'+e(x.opened_at_utc)+'</td><td>'+e(x.broker_trade_id)+
+          '</td><td>'+e(fmt(x.stop_price,3))+'</td><td>'+e(x.manager||'—')+
+          '</td><td'+warn+'>'+e(track)+'</td></tr>';
+      });
+      body.innerHTML=headline+alerts+html+'</tbody></table></div>'+
+        '<div class="pep-empty">LIVE XAU and LIVE XAG SHORT only; practice XAG excluded. '+
+        'XAG recorded stops and manager data come from its own live ledger. '+
+        'Realised P/L and XAU HWM tiles remain separately reported.</div>';
+    }
+    async function refreshLive(){
+      if(loading)return;
+      loading=true;
+      try{
+        var r=await fetch('/api/live-metals-open-positions',{cache:'no-store'});
+        if(!r.ok)throw Error('HTTP '+r.status);
+        var data=await r.json();
+        render(data);
+      }catch(err){
+        var body=d.querySelector('.pep-body');
+        if(body)body.innerHTML='<div class="lazy-error">LIVE Metals positions unavailable: '+
+          e(err.message||err)+'. Do not interpret this as zero open positions.</div>';
+      }finally{loading=false;}
+    }
+    d.addEventListener('toggle',function(){if(d.open)refreshLive();});
+    setInterval(function(){if(d.open&&d.isConnected)refreshLive();},30000);
+    refreshLive();
     d.open=false;
     return d;
   }

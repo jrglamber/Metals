@@ -2,7 +2,7 @@
 
 Presentation/telemetry only.
 - Candidate Support is shown on the Metals dashboard as live-XAU-only 0/1 telemetry.
-- Open Trades shows live XAU total / LONG / SHORT / last-opened time.
+- Open Trades tile reports both LIVE XAU and broker-verified LIVE XAG SHORT; practice excluded.
 - XAG research/demo is excluded from Candidate Support.
 - No execution, sizing, entry, exit, harvest or broker logic is changed.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-VERSION = "metals_live_xau_dashboard_telemetry_v5_2026_10_19"
+VERSION = "metals_live_open_positions_aggregate_v6_2026_11_12"
 
 
 def _d(value: Any) -> Dict[str, Any]:
@@ -125,12 +125,17 @@ _WIDGET = r"""
   }
   function paintTrades(x){
     var c=byLabel('Open Trades');
-    if(!c || !x || !x.ok) return;
+    if(!c || !x) return;
     var v=c.querySelector('.value') || c.querySelector('.v');
     var s=c.querySelector('.small') || c.querySelector('.sub');
-    var value=String(x.open_count||0);
-    var note=String(x.long_count||0)+' LONG · '+String(x.short_count||0)+' SHORT · Last opened '+fmt(x.last_opened_at_utc);
-    if(v && v.textContent!==value) v.textContent=value;
+    var total=x.count==null?'—':String(x.count);
+    var xau=x.xau_ok?String(x.xau_count):'UNAVAILABLE';
+    var xag=x.xag_ok?String(x.xag_short_count):'UNAVAILABLE';
+    var note='LIVE XAU '+xau+' · LIVE XAG SHORT '+xag;
+    if(x.last_opened_at_utc)note+=' · Last opened '+fmt(x.last_opened_at_utc);
+    if(x.xag_ok&&!x.xag_broker_link_reconciled)note+=' · XAG LINK MISMATCH';
+    if(x.count==null)note+=' · Combined count incomplete';
+    if(v && v.textContent!==total) v.textContent=total;
     if(s && s.textContent!==note) s.textContent=note;
   }
   function paintCandidate(x){
@@ -160,7 +165,7 @@ _WIDGET = r"""
   async function refresh(){
     ensureCandidate();
     try{
-      var r=await fetch('/api/live-xau-trade-tile',{cache:'no-store'});
+      var r=await fetch('/api/live-metals-open-positions',{cache:'no-store'});
       if(r.ok) paintTrades(await r.json());
     }catch(e){}
     try{

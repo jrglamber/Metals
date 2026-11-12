@@ -64,7 +64,7 @@ _HTML_REPLACEMENTS = (
     ),
     (
         "Top tiles are LIVE XAU only: XAU LONG + XAU SHORT. XAG is demo/research and are shown lower in Broker / OANDA / Accounting.",
-        "Top tiles remain LIVE XAU only: XAU LONG + XAU SHORT. XAG SHORT is LIVE and reported separately until aggregate accounting includes it; XAG LONG remains research-only.",
+        "Financial top tiles (P&L, HWM, realised and risk) remain LIVE XAU only. Open Trades includes LIVE XAU plus LIVE XAG SHORT; XAG LONG remains research-only.",
     ),
     (
         "XAG is demo/research",
@@ -228,7 +228,7 @@ except Exception as _xag_chain_exc:
 print(
     "METALS_XAG_LIVE_WORDING "
     f"version={VERSION} xag_short=LIVE xag_long=RESEARCH_ONLY "
-    "legacy_top_tiles=XAU_ONLY presentation_only=True "
+    "financial_top_tiles=XAU_ONLY open_trades=XAU_PLUS_XAG_SHORT presentation_only=True "
     f"manual_xau_campaign_reset={MANUAL_XAU_RESET_INSTALL.get('version')} "
     f"reset_routes={MANUAL_XAU_RESET_INSTALL.get('route_count')}",
     flush=True,

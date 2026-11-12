@@ -7,6 +7,10 @@ on:
       - 'metals_xag_live_wording_entrypoint.py'
       - 'metals_xag_live_signal_status_panel.py'
       - 'metals_xag_live_open_positions_panel.py'
+      - 'metals_dashboard_clean_entrypoint.py'
+      - 'metals_live_candidate_support_patch.py'
+      - 'metals_live_positions_combined.py'
+      - 'test_metals_live_positions_combined.py'
       - 'test_xag_live_open_positions_panel.py'
       - 'test_xag_live_signal_status_panel.py'
       - 'metals_xau_manual_highwater_reset.py'
@@ -27,6 +31,10 @@ on:
       - 'metals_xag_live_wording_entrypoint.py'
       - 'metals_xag_live_signal_status_panel.py'
       - 'metals_xag_live_open_positions_panel.py'
+      - 'metals_dashboard_clean_entrypoint.py'
+      - 'metals_live_candidate_support_patch.py'
+      - 'metals_live_positions_combined.py'
+      - 'test_metals_live_positions_combined.py'
       - 'test_xag_live_open_positions_panel.py'
       - 'test_xag_live_signal_status_panel.py'
       - 'metals_xau_manual_highwater_reset.py'
@@ -49,5 +57,5 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Test lane accounting and XAU manual campaign safety
         run: |
-          python -m py_compile metals_live_lane_accounting.py metals_xag_live_wording_entrypoint.py metals_xau_manual_campaign_reset.py test_xau_manual_campaign_reset.py xag_short_live_override.py metals_xag_live_independent_override.py metals_live_risk_entrypoint.py test_xag_live_independent.py metals_xau_manual_highwater_reset.py metals_xau_manual_campaign_hwm_sync.py test_xau_manual_hwm_sync.py metals_xag_live_signal_status_panel.py test_xag_live_signal_status_panel.py metals_xag_live_open_positions_panel.py test_xag_live_open_positions_panel.py
-          python -m unittest -v test_metals_live_lane_accounting test_xau_manual_campaign_reset test_xag_live_independent test_xau_manual_hwm_sync test_xag_live_signal_status_panel test_xag_live_open_positions_panel
+          python -m py_compile metals_live_lane_accounting.py metals_xag_live_wording_entrypoint.py metals_xau_manual_campaign_reset.py test_xau_manual_campaign_reset.py xag_short_live_override.py metals_xag_live_independent_override.py metals_live_risk_entrypoint.py test_xag_live_independent.py metals_xau_manual_highwater_reset.py metals_xau_manual_campaign_hwm_sync.py test_xau_manual_hwm_sync.py metals_xag_live_signal_status_panel.py test_xag_live_signal_status_panel.py metals_xag_live_open_positions_panel.py test_xag_live_open_positions_panel.py metals_live_positions_combined.py metals_dashboard_clean_entrypoint.py metals_live_candidate_support_patch.py test_metals_live_positions_combined.py
+          python -m unittest -v test_metals_live_lane_accounting test_xau_manual_campaign_reset test_xag_live_independent test_xau_manual_hwm_sync test_xag_live_signal_status_panel test_xag_live_open_positions_panel test_metals_live_positions_combined
