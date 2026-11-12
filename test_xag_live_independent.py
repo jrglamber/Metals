@@ -259,5 +259,32 @@ class LiveOrderAttemptTests(unittest.TestCase):
         ).fetchone()[0],"CLOSE_RETRY")
 
 
+    def test_live_health_uses_oanda_gbp_unrealized_not_local_closed_pl(self):
+        insert_link(self.core,123,status="OPEN")
+        insert_link(self.core,124,status="OPEN")
+        trades=[
+            {"id":"123","instrument":"XAG_USD","currentUnits":"-1","unrealizedPL":"1.2500"},
+            {"id":"124","instrument":"XAG_USD","currentUnits":"-1","unrealizedPL":"1.7500"},
+        ]
+        with patch.object(live,"runtime_status",return_value={"orders_allowed":True}), \
+             patch.object(live,"_open_trades",return_value={"ok":True,"xag":trades}):
+            x=independent.health(self.core)
+        self.assertEqual(x["execution_health"],"READY")
+        self.assertEqual(x["tracked_open_count"],2)
+        self.assertEqual(x["broker_open_unrealized_gbp"],3.0)
+        self.assertTrue(x["broker_open_unrealized_complete"])
+        self.assertFalse(x["realised_xag_ledger_verified"])
+
+    def test_missing_oanda_unrealized_is_not_zero_filled(self):
+        insert_link(self.core,123,status="OPEN")
+        with patch.object(live,"runtime_status",return_value={"orders_allowed":True}), \
+             patch.object(live,"_open_trades",return_value={
+                 "ok":True,"xag":[{"id":"123","currentUnits":"-1"}]
+             }):
+            x=independent.health(self.core)
+        self.assertIsNone(x["broker_open_unrealized_gbp"])
+        self.assertFalse(x["broker_open_unrealized_complete"])
+
+
 if __name__=="__main__":
     unittest.main()
