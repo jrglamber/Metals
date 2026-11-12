@@ -85,13 +85,39 @@ def ownership_snapshot(core: Any) -> Dict[str, Any]:
                 "SELECT broker_trade_id, side FROM metals_xag_live_trade_links "
                 "WHERE status IN ('OPEN','OPEN_UNVERIFIED_STOP','CLOSE_RETRY')"
             ).fetchall()]
+            all_historical = [dict(r) for r in conn.execute(
+                "SELECT broker_trade_id, status FROM metals_xag_live_trade_links "
+                "WHERE broker_trade_id IS NOT NULL"
+            ).fetchall()]
         pids = {str(r.get("broker_trade_id")) for r in practice_rows if r.get("broker_trade_id")}
         lids = {str(r.get("broker_trade_id")) for r in live_rows if r.get("broker_trade_id")}
         snap = live._open_trades(core)  # GET OANDA only
         broker = list(snap.get("xag") or []) if snap.get("ok") else []
         bids = {str(t.get("id")) for t in broker if t.get("id")}
         shorts = sum(float(t.get("currentUnits") or 0) < 0 for t in broker)
+        historical_by_id = {str(r.get("broker_trade_id")): r.get("status")
+                            for r in all_historical if r.get("broker_trade_id")}
+        trade_safety = []
+        for t in broker:
+            bid = str(t.get("id") or "")
+            # Authoritative trade detail, GET only.
+            detail = live._request(core, f"/v3/accounts/{live._account_id(core)}/trades/{bid}", "GET")
+            td = ((detail.get("data") or {}).get("trade") or {}) if detail.get("ok") else {}
+            stop = td.get("stopLossOrder") or t.get("stopLossOrder")
+            stop_id = td.get("stopLossOrderID") or t.get("stopLossOrderID")
+            has_stop = bool(stop or stop_id) if detail.get("ok") else None
+            trade_safety.append({
+                "side": "short" if float(t.get("currentUnits") or 0) < 0 else "long",
+                "units_abs": abs(float(t.get("currentUnits") or 0)),
+                "opened_at_utc": t.get("openTime"),
+                "stop_detail_read_ok": bool(detail.get("ok")),
+                "protective_stop_present": has_stop,
+                "historical_live_link_status": historical_by_id.get(bid),
+                "unrealized_pl_broker": t.get("unrealizedPL"),
+            })
         out.update({
+            "live_trade_safety": trade_safety,
+            "historical_links_matched_to_live_broker": sum(bid in historical_by_id for bid in bids),
             "ok": bool(snap.get("ok")),
             "live_broker_xag_open_count": len(bids),
             "live_broker_xag_short_count": shorts,
