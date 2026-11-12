@@ -38,7 +38,10 @@ def preview(core: Any, side: str) -> Dict[str, Any]:
         old_check.get("broker_links_exact") and proof.get("ok") and harvest.get("ok")
         and cycle and last_cycle == cycle and reset_epoch is not None
         and timedelta(0) <= datetime.now(timezone.utc)-reset_epoch <= timedelta(hours=24)
-        and not aligned_at and count == 0
+        # A few new entries can occur between the operator's original
+        # stacking reset and this HWM alignment. Preserve those entries in
+        # the adaptive counter rather than granting a second free allowance.
+        and not aligned_at and count <= 2
     )
     if not proof.get("ok"):
         extra = [proof.get("reason") or "xau_highwater_not_reconcilable"]
@@ -64,6 +67,31 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     if _INSTALLED:
         return {"installed":True,"version":VERSION}
     hwm.install_hwm_lock(core)
+
+    # The harvest cycle changes at a combined HWM reset. The count must stay
+    # anchored to the OPERATOR's prior stacking reset time, even for a
+    # later one-time HWM alignment. Otherwise new entries since that reset
+    # are accidentally forgotten and the free 20-entry allowance expands.
+    previous_count = adaptive._campaign_entry_count
+    def campaign_count_with_aligned_epoch(c: Any, side: str, open_rows: list) -> Dict[str, Any]:
+        value = dict(previous_count(c, side, open_rows))
+        cycle = str(value.get("cycle_id") or "")
+        if not cycle or side not in ("short", "long"):
+            return value
+        with c.get_conn() as conn:
+            aligned_cycle = str(c._metals_xau_live_runtime_get(
+                conn, old._key(side, "hwm_aligned_cycle_id"), "") or "")
+            reset_at = str(c._metals_xau_live_runtime_get(
+                conn, old._key(side, "reset_at"), "") or "")
+        start = adaptive._parse_dt(reset_at)
+        if aligned_cycle == cycle and start is not None:
+            value["count"] = old._count_after_epoch(c,side,cycle,start)
+            value["manual_reset_active"] = True
+            value["manual_reset_at"] = reset_at
+            value["effective_campaign_start"] = reset_at
+            value["aligned_hwm_cycle_id"] = cycle
+        return value
+    adaptive._campaign_entry_count = campaign_count_with_aligned_epoch
 
     def get_preview(side: str = "short") -> Dict[str, Any]:
         side = side.strip().lower()
