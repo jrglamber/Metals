@@ -11,6 +11,7 @@ from typing import Any, Dict
 
 import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
+import metals_xag_live_independent_override as live_xag_health
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
@@ -110,12 +111,18 @@ class XagLiveWordingMiddleware:
                     text = body.decode("utf-8")
                     for old, new in _HTML_REPLACEMENTS:
                         text = text.replace(old, new)
-                    if scope.get("path") in {"/", "/dashboard"} and "pep-xau-campaign-reset" not in text:
-                        anchor = "<h2>Details</h2>"
-                        if anchor in text:
-                            text = text.replace(anchor, anchor + manual_campaign_reset.DASHBOARD_SNIPPET, 1)
-                        else:
-                            text = text.replace("</body>", manual_campaign_reset.DASHBOARD_SNIPPET + "</body>", 1)
+                    if scope.get("path") in {"/", "/dashboard"}:
+                        add = ""
+                        if "pep-xau-campaign-reset" not in text:
+                            add += manual_campaign_reset.DASHBOARD_SNIPPET
+                        if "pep-xag-live-health" not in text:
+                            add += live_xag_health.DASHBOARD_SNIPPET
+                        if add:
+                            anchor = "<h2>Details</h2>"
+                            if anchor in text:
+                                text = text.replace(anchor, anchor + add, 1)
+                            else:
+                                text = text.replace("</body>", add + "</body>", 1)
                     body = text.encode("utf-8")
                 except Exception:
                     pass
