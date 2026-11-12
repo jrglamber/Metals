@@ -7,6 +7,14 @@ on:
       - 'metals_xag_live_wording_entrypoint.py'
       - '.github/workflows/metals-lane-accounting-tests.yml'
   workflow_dispatch:
+  push:
+    branches:
+      - recovery-pre-analysis-contract-20261010
+    paths:
+      - 'metals_xau_manual_campaign_reset.py'
+      - 'test_xau_manual_campaign_reset.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/metals-lane-accounting-tests.yml'
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,7 +23,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Test read-only lane accounting
+      - name: Install runtime dependencies for test import
+        run: python -m pip install -r requirements.txt
+      - name: Test lane accounting and XAU manual campaign safety
         run: |
-          python -m py_compile metals_live_lane_accounting.py metals_xag_live_wording_entrypoint.py
-          python -m unittest -v test_metals_live_lane_accounting
+          python -m py_compile metals_live_lane_accounting.py metals_xag_live_wording_entrypoint.py metals_xau_manual_campaign_reset.py test_xau_manual_campaign_reset.py
+          python -m unittest -v test_metals_live_lane_accounting test_xau_manual_campaign_reset
