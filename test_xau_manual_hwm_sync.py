@@ -160,5 +160,53 @@ class ManualHwmTests(unittest.TestCase):
         self.assertEqual(r["reason"],"xau_positions_changed_since_preview")
 
 
+class PreservePreviousResetCountTests(unittest.TestCase):
+    def test_alignment_does_not_erase_entries_since_original_reset(self):
+        from fastapi import FastAPI
+        import metals_xau_manual_campaign_hwm_sync as combined
+        import metals_adaptive_stacking_override as adaptive
+        core=FakeCore()
+        self.addCleanup(core.db.close)
+        # The operator reset at 14:00, two new trades were subsequently
+        # opened before HWM alignment and before the new harvest-cycle epoch.
+        original_reset="2026-11-12T14:00:00+00:00"
+        new_cycle="XAU_LIVE_20261112T145000000000Z"
+        core._metals_xau_live_runtime_set(core.db,"active_harvest_cycle_id",new_cycle)
+        core._metals_xau_live_runtime_set(core.db,
+            "xau_adaptive_manual_campaign_short_reset_at",original_reset)
+        core._metals_xau_live_runtime_set(core.db,
+            "xau_adaptive_manual_campaign_short_hwm_aligned_cycle_id",new_cycle)
+        core.db.execute(
+            "INSERT INTO metals_xau_live_trade_links "
+            "(id,broker_trade_id,side,status,created_at_utc,estimated_risk_amount) "
+            "VALUES(2,'124','short','OPEN','2026-11-12T14:20:00+00:00',4.0)")
+        core.db.execute(
+            "INSERT INTO metals_xau_live_trade_links "
+            "(id,broker_trade_id,side,status,created_at_utc,estimated_risk_amount) "
+            "VALUES(3,'125','short','CLOSED','2026-11-12T14:35:00+00:00',4.0)")
+        core.db.commit()
+        core._metals_xau_live_highwater_state=lambda *a,**kw:{"ok":True}
+        app=FastAPI()
+        before=adaptive._campaign_entry_count
+        installed_before=combined._INSTALLED
+        lock_before=hwm._INSTALLED_HWM
+        try:
+            combined._INSTALLED=False
+            hwm._INSTALLED_HWM=False
+            status=combined.install(core,app)
+            self.assertTrue(status["installed"])
+            counted=adaptive._campaign_entry_count(core,"short",[])
+            self.assertEqual(counted["count"],2)
+            self.assertEqual(counted["effective_campaign_start"],original_reset)
+            self.assertTrue(counted["manual_reset_active"])
+            paths=[x.path for x in app.router.routes]
+            self.assertEqual(paths[0],"/api/xau/adaptive-campaign-reset/v2/preview")
+            self.assertEqual(paths[1],"/api/xau/adaptive-campaign-reset/reset")
+        finally:
+            adaptive._campaign_entry_count=before
+            combined._INSTALLED=installed_before
+            hwm._INSTALLED_HWM=lock_before
+
+
 if __name__ == "__main__":
     unittest.main()
