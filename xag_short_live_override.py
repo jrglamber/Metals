@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -26,7 +27,8 @@ from typing import Any, Dict, List, Optional
 
 import xag_short_live_probe as sizing_probe
 
-VERSION = "xag_short_live_pilot_v1_2026_10_31"
+VERSION = "xag_short_live_pilot_v2_independent_recovery_2026_11_12"
+_ENTRY_LOCK = threading.Lock()
 INSTRUMENT = "XAG_USD"
 ASSET = "XAGUSD"
 SIDE = "short"
@@ -175,6 +177,16 @@ def _ensure_tables(core: Any) -> None:
                 raw_json TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metals_xag_live_entry_intents (
+                raw_signal_id INTEGER PRIMARY KEY,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                status TEXT NOT NULL,
+                broker_trade_id TEXT,
+                reason TEXT
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_xag_live_links_status ON metals_xag_live_trade_links(status, created_at_utc)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_xag_live_audit_raw_signal ON metals_xag_live_execution_audit(raw_signal_id, created_at_utc)")
         conn.commit()
@@ -286,38 +298,144 @@ def _local_open(core: Any) -> List[Dict[str, Any]]:
     return [_d(r) for r in rows]
 
 
+def _verified_broker_open_short(core: Any, broker_trade_id: str) -> Dict[str, Any]:
+    """Prove broker-open identity, unit size and attached short stop before recovery."""
+    detail = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{broker_trade_id}", "GET")
+    if not detail.get("ok"):
+        return {"ok": False, "reason": "broker_trade_detail_unavailable"}
+    trade = _d((detail.get("data") or {}).get("trade"))
+    units = _num(core, trade.get("currentUnits"))
+    entry = _num(core, trade.get("price"))
+    if (str(trade.get("id") or "") != broker_trade_id
+        or str(trade.get("state") or "").upper() != "OPEN"
+        or str(trade.get("instrument") or "").upper() != INSTRUMENT
+        or units is None or abs(units + PILOT_UNITS) > 1e-8
+        or entry is None or entry <= 0):
+        return {"ok": False, "reason": "broker_trade_identity_direction_or_units_not_verified"}
+    stop = _d(trade.get("stopLossOrder"))
+    stop_id = str(trade.get("stopLossOrderID") or "")
+    if not stop.get("price") and stop_id:
+        order = _request(core, f"/v3/accounts/{_account_id(core)}/orders/{stop_id}", "GET")
+        if order.get("ok"):
+            stop = _d((order.get("data") or {}).get("order"))
+        else:
+            return {"ok": False, "reason": "broker_attached_stop_order_detail_unavailable"}
+    stop_price = _num(core, stop.get("price"))
+    # A pending attached stop and a price ABOVE a short's entry are mandatory.
+    if (stop_price is None or stop_price <= entry
+        or (stop.get("state") and str(stop.get("state")).upper() != "PENDING")
+        or (stop.get("tradeID") and str(stop.get("tradeID")) != broker_trade_id)):
+        return {"ok": False, "reason": "broker_short_protective_stop_invalid"}
+    return {
+        "ok": True, "broker_trade_id": broker_trade_id, "entry_price": entry,
+        "stop_price": stop_price, "units": units,
+        "broker_open_time_utc": str(trade.get("openTime") or ""),
+        "broker_realized_pl": _num(core, trade.get("realizedPL")),
+        "reason": "exact_broker_open_trade_and_stop_verified",
+    }
+
+
 def _reconcile(core: Any) -> Dict[str, Any]:
+    """Broker OPEN wins over stale local CLOSED only after strict stop verification.
+
+    No OANDA POST/PUT is called. Unknown broker IDs stay blocked. False CLOSED
+    local rows are restored without changing their historical original entry.
+    """
     snap = _open_trades(core)
     if not snap.get("ok"):
         return {"ok": False, "reason": "broker_snapshot_failed", "snapshot": snap}
     broker = {str(t.get("id") or ""): t for t in snap.get("xag") or [] if str(t.get("id") or "")}
     local = _local_open(core)
-    local_ids = {str(x.get("broker_trade_id") or "") for x in local if str(x.get("broker_trade_id") or "")}
+    local_ids = {str(x.get("broker_trade_id") or "") for x in local if x.get("broker_trade_id")}
+    unlinked_ids = set(broker) - local_ids
+    recovered = []
+
+    if unlinked_ids:
+        with core.get_conn() as conn:
+            historical = [
+                _d(r) for r in conn.execute(
+                    "SELECT * FROM metals_xag_live_trade_links WHERE broker_trade_id IS NOT NULL"
+                ).fetchall()
+            ]
+        by_id = {str(r["broker_trade_id"]): r for r in historical if r.get("broker_trade_id")}
+        for bid in sorted(unlinked_ids):
+            old = by_id.get(bid)
+            if not old:
+                continue  # Truly unknown broker trade: do not adopt it.
+            verified = _verified_broker_open_short(core, bid)
+            if not verified.get("ok"):
+                _audit(core, old.get("raw_signal_id"), "reconcile", "QUARANTINED",
+                       "broker_open_historical_link_stop_or_identity_unverified",
+                       old.get("id"), bid, {"verification": verified, "old_status": old.get("status")})
+                return {"ok": False, "reason": "historical_open_broker_stop_unverified",
+                        "unverified_trade_count": 1, "broker_xag_open_count": len(broker)}
+            if str(old.get("side") or "").lower() != SIDE or str(old.get("instrument") or "").upper() != INSTRUMENT:
+                return {"ok": False, "reason": "historical_link_side_or_instrument_conflict",
+                        "broker_xag_open_count": len(broker)}
+            prior = {"status": old.get("status"), "closed_at_utc": old.get("closed_at_utc"),
+                     "close_reason": old.get("close_reason"), "realized_pl": old.get("realized_pl")}
+            now = _now()
+            with core.get_conn() as conn:
+                conn.execute(
+                    """UPDATE metals_xag_live_trade_links
+                       SET updated_at_utc=?,status='OPEN',
+                           closed_at_utc=NULL,close_reason=NULL,
+                           realized_pl=?,current_stop_price=?,
+                           entry_price=?,broker_open_time_utc=?,
+                           manager_last_review_signal_id=NULL,
+                           last_reconciled_at_utc=?
+                       WHERE id=? AND broker_trade_id=?
+                         AND status NOT IN ('OPEN','OPEN_UNVERIFIED_STOP','CLOSE_RETRY')""",
+                    (now, verified.get("broker_realized_pl"), verified["stop_price"],
+                     verified["entry_price"], verified["broker_open_time_utc"],
+                     now, int(old["id"]), bid),
+                )
+                conn.commit()
+            _audit(core, old.get("raw_signal_id"), "reconcile", "RECOVERED_BROKER_OPEN",
+                   "authoritative OANDA open trade restored from stale CLOSED",
+                   old.get("id"), bid, {"previous_local": prior, "verified": verified,
+                                         "no_broker_orders": True})
+            recovered.append(bid)
+
+    # Fetch fresh local ownership after any repair, including concurrent updates.
+    local = _local_open(core)
+    local_ids = {str(x.get("broker_trade_id") or "") for x in local if x.get("broker_trade_id")}
     unlinked = [t for bid, t in broker.items() if bid not in local_ids]
+    if len(local_ids) != len(local):
+        return {"ok": False, "reason": "local_live_link_id_missing_or_duplicated"}
 
     for link in local:
         bid = str(link.get("broker_trade_id") or "")
-        if not bid or bid in broker:
+        if bid in broker:
+            if _num(core, broker[bid].get("currentUnits")) is None or float(_num(core, broker[bid].get("currentUnits")) or 0.0) >= 0:
+                return {"ok": False, "reason": "broker_owned_trade_not_short"}
             continue
+        # An apparently closed broker position is not locally CLOSED unless
+        # the broker explicitly reports CLOSED. Network failures cannot be
+        # interpreted as closure.
         detail = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}", "GET")
         trade = _d((detail.get("data") or {}).get("trade")) if detail.get("ok") else {}
         if str(trade.get("state") or "").upper() == "CLOSED":
             realized = _num(core, trade.get("realizedPL"))
-            close_price = _num(core, trade.get("averageClosePrice"))
             with core.get_conn() as conn:
                 conn.execute(
                     """UPDATE metals_xag_live_trade_links
                        SET updated_at_utc=?,status='CLOSED_RECONCILED',realized_pl=?,
                            closed_at_utc=COALESCE(NULLIF(closed_at_utc,''),?),
                            close_reason=COALESCE(NULLIF(close_reason,''),'BROKER_RECONCILED_CLOSED'),
-                           last_reconciled_at_utc=?,raw_json=raw_json
-                       WHERE id=?""",
+                           last_reconciled_at_utc=?
+                       WHERE id=? AND status IN ('OPEN','OPEN_UNVERIFIED_STOP','CLOSE_RETRY')""",
                     (_now(), realized, _now(), _now(), int(link["id"])),
                 )
                 conn.commit()
             _audit(core, link.get("raw_signal_id"), "reconcile", "CLOSED_RECONCILED",
-                   f"broker trade closed; averageClosePrice={close_price}", int(link["id"]), bid)
+                   "broker authoritative CLOSED", int(link["id"]), bid)
+        else:
+            return {"ok": False, "reason": "local_live_position_broker_state_unverified"}
 
+    local = _local_open(core)
+    local_ids = {str(x.get("broker_trade_id") or "") for x in local if x.get("broker_trade_id")}
+    unlinked = [t for bid, t in broker.items() if bid not in local_ids]
     return {
         "ok": True,
         "broker_xag_open_count": len(broker),
@@ -325,30 +443,23 @@ def _reconcile(core: Any) -> Dict[str, Any]:
         "unlinked_broker_xag_count": len(unlinked),
         "unlinked_broker_xag_ids": [str(t.get("id") or "") for t in unlinked],
         "has_broker_long": any(float(_num(core, t.get("currentUnits")) or 0.0) > 0 for t in broker.values()),
+        "recovered_historical_live_count": len(recovered),
+        "exact_live_ownership": len(unlinked) == 0 and len(broker) == len(local),
     }
-
 
 def _verify_stop(core: Any, broker_trade_id: str, fill_price: float) -> Dict[str, Any]:
-    resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{broker_trade_id}", "GET")
-    if not resp.get("ok"):
-        return {"ok": False, "reason": "trade_detail_read_failed", "response": resp}
-    trade = _d((resp.get("data") or {}).get("trade"))
-    sl = _d(trade.get("stopLossOrder"))
-    price = _num(core, sl.get("price"))
-    units = _num(core, trade.get("currentUnits"))
-    valid = bool(
-        str(trade.get("instrument") or "").upper() == INSTRUMENT
-        and units is not None and units < 0
-        and price is not None and price > float(fill_price)
-    )
+    verified = _verified_broker_open_short(core, broker_trade_id)
+    if not verified.get("ok"):
+        return {"ok": False, "reason": verified.get("reason") or "broker_stop_not_verified"}
+    # Preserve the live fill-price safety invariant even when the broker reports
+    # a slightly different average entry after execution.
+    if float(verified["stop_price"]) <= float(fill_price):
+        return {"ok": False, "reason": "attached_short_stop_below_fill_price"}
     return {
-        "ok": valid,
-        "reason": "verified" if valid else "missing_or_invalid_short_stop",
-        "stop_price": price,
-        "current_units": units,
-        "state": trade.get("state"),
+        "ok": True, "reason": "verified_broker_open_with_attached_short_stop",
+        "stop_price": verified["stop_price"],
+        "current_units": verified["units"], "state": "OPEN",
     }
-
 
 def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
     cfg = config_status(core)
@@ -357,14 +468,43 @@ def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
     bid = str(link.get("broker_trade_id") or "")
     if not bid:
         return {"ok": False, "reason": "broker_trade_id_missing"}
+    # A prior successful CLOSE request can have been recorded locally before
+    # OANDA actually confirmed CLOSED. Never issue another close unless GET
+    # confirms the position is still OPEN.
+    pre = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}", "GET")
+    pre_trade = _d((pre.get("data") or {}).get("trade")) if pre.get("ok") else {}
+    broker_state = str(pre_trade.get("state") or "").upper()
+    if broker_state not in {"OPEN", "CLOSED"}:
+        return {"ok": False, "blocked": True, "reason": "broker_close_state_unverified"}
+    if broker_state == "CLOSED":
+        realized = _num(core, pre_trade.get("realizedPL"))
+        with core.get_conn() as conn:
+            conn.execute(
+                "UPDATE metals_xag_live_trade_links SET updated_at_utc=?,status='CLOSED_RECONCILED',"
+                "realized_pl=?,closed_at_utc=COALESCE(NULLIF(closed_at_utc,''),?),"
+                "last_reconciled_at_utc=? WHERE id=?",
+                (_now(), realized, _now(), _now(), int(link["id"])),
+            )
+            conn.commit()
+        _audit(core, link.get("raw_signal_id"), "close", "CLOSED_RECONCILED",
+               "broker_confirmed_preexisting_close", int(link["id"]), bid)
+        return {"ok": True, "already_closed": True, "realized_pl": realized}
     last: Dict[str, Any] = {}
     for attempt in range(1, 4):
         resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}/close", "PUT", {"units": "ALL"})
         last = resp
         if resp.get("ok"):
+            # HTTP 200 is not sufficient evidence that the broker trade is flat.
+            # Reconciliation is broker-authoritative, as with the open entry.
+            after = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}", "GET")
+            bt = _d((after.get("data") or {}).get("trade")) if after.get("ok") else {}
+            if str(bt.get("state") or "").upper() != "CLOSED":
+                _audit(core, link.get("raw_signal_id"), "close", "PENDING_VERIFICATION",
+                       "OANDA close request accepted but CLOSED state not verified",
+                       int(link["id"]), bid)
+                break
             data = resp.get("data") or {}
-            fill = data.get("orderFillTransaction") or {}
-            realized = _num(core, fill.get("pl"))
+            realized = _num(core, bt.get("realizedPL"))
             with core.get_conn() as conn:
                 conn.execute(
                     """UPDATE metals_xag_live_trade_links
@@ -374,8 +514,8 @@ def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
                     (_now(), realized, _now(), str(reason), _now(), int(link["id"])),
                 )
                 conn.commit()
-            _audit(core, link.get("raw_signal_id"), "close", "CLOSED", reason, int(link["id"]), bid,
-                   {"attempt": attempt, "response": data})
+            _audit(core, link.get("raw_signal_id"), "close", "CLOSED_VERIFIED", reason, int(link["id"]), bid,
+                   {"attempt": attempt, "broker_state": "CLOSED"})
             return {"ok": True, "attempt": attempt, "realized_pl": realized}
         try:
             if bool(core.is_oanda_timeout_or_unknown_response(resp)):
@@ -502,7 +642,7 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         return {"ok": True, "blocked": True, "reason": "xag_live_not_armed", "config": cfg}
 
     if not (
-        demo_result.get("opened")
+        (demo_result.get("opened") or demo_result.get("approved_for_live"))
         and str(demo_result.get("asset") or "").upper() == ASSET
         and str(demo_result.get("side") or "").lower() == SIDE
     ):
@@ -524,7 +664,7 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
     rec = _reconcile(core)
     if not rec.get("ok"):
         return {"ok": False, "blocked": True, "reason": "pre_entry_reconciliation_failed", "reconcile": rec}
-    if rec.get("unlinked_broker_xag_count"):
+    if not rec.get("exact_live_ownership"):
         _audit(core, raw_signal_id, "entry", "BLOCKED", "unlinked_broker_xag_trade_present", raw=rec)
         return {"ok": False, "blocked": True, "reason": "unlinked_broker_xag_trade_present", "reconcile": rec}
     if rec.get("has_broker_long"):
@@ -569,6 +709,22 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         }
     }
     attempted_at = _now()
+    # Durable idempotency before submitting a non-idempotent broker order.
+    # UNKNOWN attempts are never automatically replayed into duplicate trades.
+    with core.get_conn() as conn:
+        prior_intent = conn.execute(
+            "SELECT status FROM metals_xag_live_entry_intents WHERE raw_signal_id=?",
+            (int(raw_signal_id),),
+        ).fetchone()
+        if prior_intent:
+            return {"ok": True, "blocked": True, "reason": "xag_live_entry_intent_already_exists",
+                    "intent_status": _d(prior_intent).get("status")}
+        conn.execute(
+            "INSERT INTO metals_xag_live_entry_intents "
+            "(raw_signal_id,created_at_utc,updated_at_utc,status,reason) VALUES (?,?,?,?,?)",
+            (int(raw_signal_id), attempted_at, attempted_at, "SUBMITTING", "broker_order_attempt"),
+        )
+        conn.commit()
     _audit(core, raw_signal_id, "entry", "SUBMITTING", "governed XAG SHORT live pilot", raw={
         "demo_link_id": demo_result.get("link_id"),
         "units": -1,
@@ -612,10 +768,21 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
                     fill_units = float(_num(core, t.get("currentUnits")) or -1.0)
                     fill_price = float(_num(core, t.get("price")) or entry)
         if not broker_trade_id:
+            with core.get_conn() as conn:
+                conn.execute("UPDATE metals_xag_live_entry_intents SET status=?,updated_at_utc=?,reason=? "
+                             "WHERE raw_signal_id=?",
+                             ("UNKNOWN_NEEDS_RECONCILIATION" if ambiguous else "BROKER_REJECTED",
+                              _now(), str(response.get("error") or "order_unconfirmed")[:400],
+                              int(raw_signal_id)))
+                conn.commit()
             _audit(core, raw_signal_id, "entry", "FAILED", "live XAG order failed or ambiguous", raw={"response": response})
             return {"ok": False, "reason": "live_xag_order_failed", "response": response}
 
     if fill_units >= 0:
+        with core.get_conn() as conn:
+            conn.execute("UPDATE metals_xag_live_entry_intents SET status='UNKNOWN_NEEDS_RECONCILIATION',updated_at_utc=?,reason=? "
+                         "WHERE raw_signal_id=?", (_now(), "broker_returned_nonshort", int(raw_signal_id)))
+            conn.commit()
         _audit(core, raw_signal_id, "entry", "CRITICAL", "broker returned non-short units", broker_trade_id=broker_trade_id)
         _request(core, f"/v3/accounts/{_account_id(core)}/trades/{broker_trade_id}/close", "PUT", {"units": "ALL"})
         return {"ok": False, "reason": "broker_short_direction_invariant_failed", "broker_trade_id": broker_trade_id}
@@ -633,7 +800,7 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
                 broker_trade_id,broker_order_id,broker_open_time_utc,status,
                 active_exit_policy,active_exit_policy_version,last_reconciled_at_utc,raw_json)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now, now, int(raw_signal_id), int(demo_result.get("link_id") or 0), ASSET, INSTRUMENT, SIDE,
+            (now, now, int(raw_signal_id), (int(demo_result["link_id"]) if demo_result.get("link_id") else None), ASSET, INSTRUMENT, SIDE,
              signal_time, int(raw_signal_id), target_risk, effective_risk, PILOT_UNITS, fill_units,
              fill_price, stop, stop, broker_trade_id, broker_order_id,
              str(fill.get("time") or attempted_at), "OPEN_UNVERIFIED_STOP",
@@ -642,6 +809,10 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         ))
         conn.commit()
 
+    with core.get_conn() as conn:
+        conn.execute("UPDATE metals_xag_live_entry_intents SET status='OPEN_UNVERIFIED_STOP',updated_at_utc=?,broker_trade_id=? "
+                     "WHERE raw_signal_id=?", (_now(), broker_trade_id, int(raw_signal_id)))
+        conn.commit()
     verified = _verify_stop(core, broker_trade_id, fill_price)
     if not verified.get("ok"):
         with core.get_conn() as conn:
@@ -664,6 +835,10 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
                WHERE id=?""",
             (_now(), verified.get("stop_price"), _now(), link_id),
         )
+        conn.commit()
+    with core.get_conn() as conn:
+        conn.execute("UPDATE metals_xag_live_entry_intents SET status='OPENED',updated_at_utc=?,broker_trade_id=? "
+                     "WHERE raw_signal_id=?", (_now(), broker_trade_id, int(raw_signal_id)))
         conn.commit()
     _audit(core, raw_signal_id, "entry", "OPENED",
            f"LIVE XAG SHORT opened; {POLICY}; one-unit pilot", link_id, broker_trade_id,
@@ -702,6 +877,8 @@ def runtime_status(core: Any) -> Dict[str, Any]:
         "tables_ok": tables_ok,
         "open_live_xag_short_count": open_count,
         "total_live_xag_short_links": total,
+        "independent_live_entry": True,
+        "broker_authoritative_closed_link_recovery": True,
         "safe_to_mark_executor_ready": bool(tables_ok and cfg.get("live_environment_ok") and cfg.get("credentials_ok")),
     })
     return cfg

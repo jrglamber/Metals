@@ -14,12 +14,14 @@ import metals_execution_contract_20261031 as execution_contract
 import metals_xag_execution_reporting_patch as xag_reporting
 import xag_short_live_probe as xag_live_probe
 import xag_short_live_override as xag_live_execution
+import metals_xag_live_independent_override as xag_independent
 
 app = base.app
 core = base.base.base.core
 VERSION = "metals_live_risk_entrypoint_v8_2026_10_31"
 
 XAG_SHORT_LIVE_INSTALL = xag_live_execution.install(core, app)
+XAG_INDEPENDENT_STATUS = xag_independent.install(core, app)
 XAG_REPORTING_INSTALL = xag_reporting.install(execution_contract, core)
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
@@ -100,6 +102,8 @@ LIVE_RISK_INSTALL = {
     "xag_short_live_sizing_probe_route_index": XAG_SIZING_PROBE_ROUTE.get("route_index"),
     "xag_short_live_sizing_probe_execution_authority": False,
     "xag_short_live_executor_installed": bool(XAG_SHORT_LIVE_INSTALL.get("installed")),
+    "xag_independent_live_installed": bool(XAG_INDEPENDENT_STATUS.get("installed")),
+    "xag_independent_version": XAG_INDEPENDENT_STATUS.get("version"),
     "xag_short_live_executor_version": XAG_SHORT_LIVE_INSTALL.get("version"),
     "xag_short_live_executor_fail_closed": bool(XAG_SHORT_LIVE_INSTALL.get("fail_closed")),
     "xag_short_live_executor_execution_authority": bool(XAG_SHORT_LIVE_INSTALL.get("execution_authority")),
