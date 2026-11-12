@@ -1,0 +1,23 @@
+name: Metals LIVE dashboard route smoke
+on:
+  push:
+    branches:
+      - recovery-pre-analysis-contract-20261010
+    paths:
+      - 'metals_dashboard_clean_entrypoint.py'
+      - 'metals_live_positions_combined.py'
+      - 'metals_live_candidate_support_patch.py'
+      - 'smoke_metals_live_dashboard.py'
+      - '.github/workflows/metals-live-dashboard-smoke.yml'
+  workflow_dispatch:
+jobs:
+  read-only-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Fetch production HTML and broker-confirmed LIVE positions
+        run: python smoke_metals_live_dashboard.py
