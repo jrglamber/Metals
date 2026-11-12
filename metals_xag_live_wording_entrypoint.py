@@ -200,6 +200,8 @@ try:
     from metals_xag_execution_chain_diag import snapshot as _xag_chain_snapshot
     _xag_chain = _xag_chain_snapshot(core, limit=20)
     print("METALS_XAG_SHORT_EXECUTION_CHAIN " + _json.dumps(_xag_chain, default=str), flush=True)
+    import metals_xag_execution_chain_diag as _xag_diag
+    print("METALS_XAG_LIVE_OWNERSHIP " + _json.dumps(_xag_diag.ownership_snapshot(core), default=str), flush=True)
 except Exception as _xag_chain_exc:
     print(f"METALS_XAG_SHORT_EXECUTION_CHAIN error={type(_xag_chain_exc).__name__}: {_xag_chain_exc}", flush=True)
 
