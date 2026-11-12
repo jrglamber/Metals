@@ -11,11 +11,13 @@ from typing import Any, Dict
 
 import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
+import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
 MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
+MANUAL_XAU_HWM_SYNC_INSTALL = campaign_hwm_sync.install(core, app)
 
 VERSION = "metals_xag_live_wording_v1_2026_10_31"
 
