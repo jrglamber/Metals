@@ -15,11 +15,13 @@ import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
 import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
+import metals_live_open_pnl_display as combined_open_pnl
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
 MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
 MANUAL_XAU_HWM_SYNC_INSTALL = campaign_hwm_sync.install(core, app)
+COMBINED_OPEN_PNL_INSTALL = combined_open_pnl.install(app)
 
 VERSION = "metals_xag_live_wording_v1_2026_10_31"
 
@@ -64,7 +66,7 @@ _HTML_REPLACEMENTS = (
     ),
     (
         "Top tiles are LIVE XAU only: XAU LONG + XAU SHORT. XAG is demo/research and are shown lower in Broker / OANDA / Accounting.",
-        "Financial top tiles (P&L, HWM, realised and risk) remain LIVE XAU only. Open Trades includes LIVE XAU plus LIVE XAG SHORT; XAG LONG remains research-only.",
+        "Open P&L includes broker-verified LIVE XAU + LIVE XAG SHORT. Historical realised, high-water and base XAU risk remain XAU-only; XAG LONG remains research-only.",
     ),
     (
         "XAG is demo/research",
@@ -124,6 +126,8 @@ class XagLiveWordingMiddleware:
                         # Broker-authoritative XAG SHORT positions, separately
                         # from the legacy XAU-only open-trades view.
                         text = live_xag_open_positions.render(core) + text
+                    if scope.get("path") in {"/", "/dashboard", "/dashboard/top"}:
+                        text = combined_open_pnl.inject_html(text)
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
                         if "pep-xau-campaign-reset" not in text:
