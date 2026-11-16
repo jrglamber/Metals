@@ -180,4 +180,17 @@ def install(app):
                 "reason": f"{type(exc).__name__}: {exc}"[:220],
                 "broker_writes": False,
             }
-    return {"installed": True, "version": VERSION, "broker_writes": False}
+    # analysis_entrypoint already mounted core.app at "/" before this wrapper
+    # installs late routes. Starlette would send /api/live-metals-open-pnl
+    # straight to that catch-all mount (404). Put this API route first, as the
+    # other production-level risk and telemetry routes already do.
+    candidates = [route for route in app.router.routes
+                  if getattr(route, "path", None) == "/api/live-metals-open-pnl"
+                  and getattr(route, "endpoint", None) is live_metals_open_pnl]
+    if len(candidates) != 1:
+        raise RuntimeError("Combined LIVE Metals P&L endpoint registration failed")
+    route = candidates[0]
+    app.router.routes.remove(route)
+    app.router.routes.insert(0, route)
+    return {"installed": True, "version": VERSION, "broker_writes": False,
+            "route": "/api/live-metals-open-pnl", "route_priority": 0}
