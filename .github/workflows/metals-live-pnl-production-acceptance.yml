@@ -8,15 +8,17 @@ on:
       - recovery-pre-analysis-contract-20261010
     paths:
       - 'metals_live_open_pnl_display.py'
+      - 'metals_combined_observed_hwm.py'
       - 'metals_xag_live_wording_entrypoint.py'
       - '.github/workflows/metals-live-pnl-production-acceptance.yml'
   workflow_dispatch:
 jobs:
   verify:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Verify public broker-verified combined PnL and Hub reconciliation
+      - name: Verify public broker-verified combined PnL, peak and Hub reconciliation
         env:
           METALS_URL: https://metals-production-bb81.up.railway.app
           HUB_URL: https://project-exit-plan-portfolio-hub-production.up.railway.app
@@ -34,6 +36,14 @@ jobs:
                   m=get(os.environ["METALS_URL"]+"/api/live-metals-open-pnl")
                   if m.get("ok") is not True:
                       raise AssertionError("Metals PnL producer unavailable: "+str(m.get("reason")))
+                  if m.get("high_water_status")!="OBSERVED_COMBINED_LIVE":
+                      raise AssertionError("Combined observed high-water unavailable: "+str(m.get("high_water_error")))
+                  peak=float(m["high_water_gbp"]); observed=float(m["open_pnl_gbp"])
+                  give=float(m["giveback_gbp"])
+                  if peak+0.01<observed or abs(give-max(0,peak-observed))>0.02:
+                      raise AssertionError("Combined Metals peak/giveback does not reconcile")
+                  if not m.get("high_water_tracking_started_at_utc") or not m.get("high_water_at_utc"):
+                      raise AssertionError("Combined Metals peak timestamps missing")
                   h=get(os.environ["HUB_URL"]+"/api/aggregate")
                   metals=((h.get("sources") or {}).get("metals") or {}).get("data") or {}
                   hb=metals.get("basket") or {}
