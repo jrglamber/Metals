@@ -70,6 +70,16 @@ class CombinedLivePnlTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 display.reconcile(payload)
 
+    def test_production_endpoint_precedes_existing_root_mount(self):
+        from fastapi import FastAPI
+        api = FastAPI()
+        api.mount("/", FastAPI())  # Same catch-all route order as Metals production.
+        installed = display.install(api)
+        self.assertTrue(installed["installed"])
+        self.assertEqual(installed["route_priority"], 0)
+        self.assertEqual(api.router.routes[0].path, "/api/live-metals-open-pnl")
+        self.assertEqual(api.router.routes[-1].path, "")
+
     def test_dashboard_script_deduplicated(self):
         html = "<html><body><h1>Metals</h1></body></html>"
         patched = display.inject_html(html)
