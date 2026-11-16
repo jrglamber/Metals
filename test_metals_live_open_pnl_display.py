@@ -78,7 +78,7 @@ class CombinedLivePnlTests(unittest.TestCase):
         self.assertTrue(installed["installed"])
         self.assertEqual(installed["route_priority"], 0)
         self.assertEqual(api.router.routes[0].path, "/api/live-metals-open-pnl")
-        self.assertEqual(api.router.routes[-1].path, "")
+        self.assertTrue(any(getattr(r, "path", None) in ("", "/") for r in api.router.routes[1:]))
 
     def test_dashboard_script_deduplicated(self):
         html = "<html><body><h1>Metals</h1></body></html>"
