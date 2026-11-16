@@ -112,7 +112,7 @@ _SCRIPT = r'''
       var node=nodes[i], parent=node.parentElement;
       for (var depth=0; parent && depth<6; depth++,parent=parent.parentElement) {
         var amounts=Array.from(parent.querySelectorAll('*')).filter(function(el) {
-          return !el.children.length && /^[+\-]?£[\d,]+(?:\.\d+)?$/.test((el.textContent||'').trim());
+          return !el.children.length && (el.getAttribute('data-pep-live-metals-pnl-value')==='1' || /^[-+]?£[\d,]+(?:\.\d+)?$|^£-[\d,]+(?:\.\d+)?$/.test((el.textContent||'').trim()));
         });
         if (amounts.length) return {label:node, amount:amounts[0], tile:parent};
       }
@@ -123,6 +123,7 @@ _SCRIPT = r'''
     var tile=findTile();
     if(!tile) return;
     tile.label.textContent=titleText;
+    tile.amount.setAttribute('data-pep-live-metals-pnl-value','1');
     var value=snapshot && snapshot.ok && Number.isFinite(Number(snapshot.open_pnl_gbp))
       ? Number(snapshot.open_pnl_gbp) : null;
     tile.amount.textContent=value === null ? '—' :
@@ -151,7 +152,7 @@ _SCRIPT = r'''
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', refresh);
   else refresh();
-  setInterval(refresh,5000);
+  setInterval(refresh,10000);
 })();
 </script>
 '''
