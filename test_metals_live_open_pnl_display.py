@@ -74,7 +74,7 @@ class CombinedLivePnlTests(unittest.TestCase):
         from fastapi import FastAPI
         api = FastAPI()
         api.mount("/", FastAPI())  # Same catch-all route order as Metals production.
-        installed = display.install(api)
+        installed = display.install(api, object())
         self.assertTrue(installed["installed"])
         self.assertEqual(installed["route_priority"], 0)
         self.assertEqual(api.router.routes[0].path, "/api/live-metals-open-pnl")
@@ -83,7 +83,7 @@ class CombinedLivePnlTests(unittest.TestCase):
     def test_dashboard_script_deduplicated(self):
         html = "<html><body><h1>Metals</h1></body></html>"
         patched = display.inject_html(html)
-        self.assertIn('pep-combined-live-metals-pnl-v1', patched)
+        self.assertIn('pep-combined-live-metals-pnl-v2', patched)
         self.assertIn("Broker P&L", patched)
         self.assertIn("/api/live-metals-open-pnl", patched)
         self.assertEqual(display.inject_html(patched), patched)
