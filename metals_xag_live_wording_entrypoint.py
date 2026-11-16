@@ -232,7 +232,7 @@ except Exception as _xag_chain_exc:
 print(
     "METALS_XAG_LIVE_WORDING "
     f"version={VERSION} xag_short=LIVE xag_long=RESEARCH_ONLY "
-    "financial_top_tiles=XAU_ONLY open_trades=XAU_PLUS_XAG_SHORT presentation_only=True "
+    "open_pnl=XAU_PLUS_XAG_SHORT historical_financials=XAU_ONLY open_trades=XAU_PLUS_XAG_SHORT presentation_only=True "
     f"manual_xau_campaign_reset={MANUAL_XAU_RESET_INSTALL.get('version')} "
     f"reset_routes={MANUAL_XAU_RESET_INSTALL.get('route_count')}",
     flush=True,
