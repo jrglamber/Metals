@@ -21,7 +21,7 @@ from metals_live_risk_entrypoint import core as core
 
 MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
 MANUAL_XAU_HWM_SYNC_INSTALL = campaign_hwm_sync.install(core, app)
-COMBINED_OPEN_PNL_INSTALL = combined_open_pnl.install(app)
+COMBINED_OPEN_PNL_INSTALL = combined_open_pnl.install(app, core)
 
 VERSION = "metals_xag_live_wording_v1_2026_10_31"
 
@@ -66,7 +66,7 @@ _HTML_REPLACEMENTS = (
     ),
     (
         "Top tiles are LIVE XAU only: XAU LONG + XAU SHORT. XAG is demo/research and are shown lower in Broker / OANDA / Accounting.",
-        "Open P&L includes broker-verified LIVE XAU + LIVE XAG SHORT. Historical realised, high-water and base XAU risk remain XAU-only; XAG LONG remains research-only.",
+        "Broker P&L and the observed combined high-water/giveback cover LIVE XAU + LIVE XAG SHORT. Historical realised and the XAU protection high-water and base risk remain XAU-only; XAG LONG remains research-only.",
     ),
     (
         "XAG is demo/research",
@@ -232,7 +232,7 @@ except Exception as _xag_chain_exc:
 print(
     "METALS_XAG_LIVE_WORDING "
     f"version={VERSION} xag_short=LIVE xag_long=RESEARCH_ONLY "
-    "open_pnl=XAU_PLUS_XAG_SHORT historical_financials=XAU_ONLY open_trades=XAU_PLUS_XAG_SHORT presentation_only=True "
+    "open_pnl=XAU_PLUS_XAG_SHORT high_water=COMBINED_OBSERVED_SEPARATE_FROM_XAU_PROTECTION realised=XAU_ONLY open_trades=XAU_PLUS_XAG_SHORT presentation_only=True "
     f"manual_xau_campaign_reset={MANUAL_XAU_RESET_INSTALL.get('version')} "
     f"reset_routes={MANUAL_XAU_RESET_INSTALL.get('route_count')}",
     flush=True,

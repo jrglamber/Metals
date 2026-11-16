@@ -100,44 +100,82 @@ def reconcile(payload, max_age_seconds=120):
 
 
 _SCRIPT = r'''
-<script id="pep-combined-live-metals-pnl-v1">
+<script id="pep-combined-live-metals-pnl-v2">
 (function() {
   'use strict';
-  var titleText = 'Open P&L · LIVE XAU + XAG SHORT';
-  function findTile() {
+  function findTile(labelPattern) {
     var nodes = Array.from(document.querySelectorAll('body *')).filter(function(el) {
-      return !el.children.length && /^(Broker P&L|Open P&L · LIVE XAU \+ XAG SHORT)$/.test((el.textContent || '').trim());
+      return !el.children.length && labelPattern.test(String(el.textContent || '').trim());
     });
     for (var i=0; i<nodes.length; i++) {
       var node=nodes[i], parent=node.parentElement;
       for (var depth=0; parent && depth<6; depth++,parent=parent.parentElement) {
         var amounts=Array.from(parent.querySelectorAll('*')).filter(function(el) {
-          return !el.children.length && (el.getAttribute('data-pep-live-metals-pnl-value')==='1' || /^[-+]?£[\d,]+(?:\.\d+)?$|^£-[\d,]+(?:\.\d+)?$/.test((el.textContent||'').trim()));
+          return !el.children.length && (el.getAttribute('data-pep-metal-money')==='1' ||
+            /^(?:[-+]?£|£-)[\d,]+(?:\.\d+)?$/.test((el.textContent||'').trim()));
         });
         if (amounts.length) return {label:node, amount:amounts[0], tile:parent};
       }
     }
     return null;
   }
-  function apply(snapshot) {
-    var tile=findTile();
-    if(!tile) return;
-    tile.label.textContent=titleText;
-    tile.amount.setAttribute('data-pep-live-metals-pnl-value','1');
-    var value=snapshot && snapshot.ok && Number.isFinite(Number(snapshot.open_pnl_gbp))
-      ? Number(snapshot.open_pnl_gbp) : null;
-    tile.amount.textContent=value === null ? '—' :
-      (value < 0 ? '-£' : '£') + Math.abs(value).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});
-    tile.amount.style.color=value===null?'#fbbf24':value<0?'#f87171':'#4ade80';
-    var notes=Array.from(tile.tile.querySelectorAll('*')).filter(function(el) {
-      return !el.children.length && (/LIVE Metals open P&L|LIVE XAU \+ XAG SHORT · broker|Realised £/.test(el.textContent||''));
+  function fmtMoney(value) {
+    return (value < 0 ? '-£' : '£') + Math.abs(value).toLocaleString('en-GB',{
+      minimumFractionDigits:2, maximumFractionDigits:2
     });
-    if(notes.length) {
-      var when=snapshot && snapshot.ok ? String(snapshot.observed_at_utc||'').replace('T',' ').slice(0,19)+' UTC' : '';
-      notes[0].textContent=value===null
-        ? 'LIVE XAU + XAG SHORT broker reconciliation unavailable — do not use prior P&L'
-        : 'LIVE XAU + XAG SHORT · Broker-verified '+when+' · Realised/HWM remain XAU-only';
-    }
+  }
+  function fmtWhen(value) {
+    return value ? String(value).replace('T',' ').slice(0,16) + ' UTC' : 'unknown';
+  }
+  function valid(value) {
+    return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+  }
+  function note(tile, text, match) {
+    var els=Array.from(tile.tile.querySelectorAll('*')).filter(function(el) {
+      return !el.children.length && el !== tile.label && el !== tile.amount &&
+        match.test((el.textContent||'').trim());
+    });
+    var n=els[0];
+    if(n) n.textContent=text;
+  }
+  function paint(tile, label, value, color) {
+    if(!tile)return;
+    tile.label.textContent=label;
+    tile.amount.setAttribute('data-pep-metal-money','1');
+    tile.amount.textContent=value === null ? '—' : fmtMoney(value);
+    tile.amount.style.color=value === null ? '#fbbf24' : color;
+  }
+  function apply(snap) {
+    var broker=findTile(/^(Broker P&L|Open P&L · LIVE XAU \+ XAG SHORT)$/i);
+    var hwm=findTile(/^(High-Water|High water)( · LIVE XAU \+ XAG SHORT)?$/i);
+    var give=findTile(/^(Giveback)( · LIVE XAU \+ XAG SHORT)?$/i);
+    var verified=!!(snap && snap.ok);
+    var pnl=verified && valid(snap.open_pnl_gbp) ? Number(snap.open_pnl_gbp) : null;
+    paint(broker,'Broker P&L · LIVE XAU + XAG SHORT',pnl,
+      pnl !== null && pnl < 0 ? '#f87171' : '#4ade80');
+    if(broker)note(broker,pnl === null ?
+      'Combined broker data unavailable — no previous figure reused' :
+      'XAU + XAG SHORT broker-verified '+fmtWhen(snap.observed_at_utc)+
+      ' · Realised remains XAU-only',/LIVE Metals open P&L|LIVE XAU \+ XAG SHORT|Realised £/i);
+
+    var peakOK=verified && snap.high_water_status === 'OBSERVED_COMBINED_LIVE' &&
+      valid(snap.high_water_gbp) && valid(snap.giveback_gbp);
+    var peak=peakOK ? Number(snap.high_water_gbp) : null;
+    var given=peakOK ? Number(snap.giveback_gbp) : null;
+    paint(hwm,'High-Water · LIVE XAU + XAG SHORT',peak,'#4ade80');
+    paint(give,'Giveback · LIVE XAU + XAG SHORT',given,
+      given !== null && given > 0 ? '#f87171' : '#4ade80');
+    if(hwm)note(hwm,peakOK ?
+      'Combined peak observed since '+fmtWhen(snap.high_water_tracking_started_at_utc)+
+      ' · peaked '+fmtWhen(snap.high_water_at_utc) :
+      'Combined peak tracking unavailable · XAU protection unchanged',
+      /(?:\d+(?:\.\d+)?R|LIVE Metals|XAU \+ XAG SHORT)/i);
+    if(give)note(give,peakOK ?
+      'Combined open P&L below observed peak'+
+      (valid(snap.giveback_pct)?' · '+Number(snap.giveback_pct).toFixed(1)+'%':'')+
+      ' · XAU protection unchanged' :
+      'Combined giveback unavailable · XAU protection unchanged',
+      /(?:\d+(?:\.\d+)?R|XAU \+ XAG SHORT|giveback)/i);
   }
   var active=false;
   async function refresh() {
@@ -157,25 +195,38 @@ _SCRIPT = r'''
 </script>
 '''
 
-
 def inject_html(html):
     """Inject only once into a full HTML dashboard response."""
     text = str(html)
-    if 'pep-combined-live-metals-pnl-v1' not in text:
+    if 'pep-combined-live-metals-pnl-v2' not in text:
         text = text.replace("</body>", _SCRIPT + "\n</body>", 1) if "</body>" in text else text + _SCRIPT
     return text
 
 
-def install(app):
+def install(app, core):
     @app.get("/api/live-metals-open-pnl")
     def live_metals_open_pnl():
         try:
             from metals_dashboard_clean_entrypoint import live_metals_open_positions
-            return reconcile(live_metals_open_positions())
+            snapshot = reconcile(live_metals_open_positions())
+            try:
+                from metals_combined_observed_hwm import observe
+                snapshot.update(observe(core, snapshot))
+            except Exception as exc:
+                # A database outage must not corrupt broker-verified open P&L.
+                snapshot.update({
+                    "high_water_status": "UNAVAILABLE",
+                    "high_water_gbp": None, "high_water_at_utc": None,
+                    "high_water_tracking_started_at_utc": None,
+                    "giveback_gbp": None, "giveback_pct": None,
+                    "high_water_error": f"{type(exc).__name__}: {exc}"[:160],
+                })
+            return snapshot
         except Exception as exc:
             return {
                 "ok": False, "version": VERSION, "scope": SCOPE,
-                "open_pnl_gbp": None, "xau_open_pnl_gbp": None,
+                "open_pnl_gbp": None, "high_water_status": "UNAVAILABLE",
+                "high_water_gbp": None, "giveback_gbp": None, "xau_open_pnl_gbp": None,
                 "xag_short_open_pnl_gbp": None, "observed_at_utc": None,
                 "reason": f"{type(exc).__name__}: {exc}"[:220],
                 "broker_writes": False,
