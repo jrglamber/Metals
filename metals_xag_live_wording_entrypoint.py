@@ -8,6 +8,7 @@ clear that legacy top tiles remain XAU-only until aggregate accounting expands.
 from __future__ import annotations
 
 from typing import Any, Dict
+import json
 
 import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
@@ -113,6 +114,22 @@ class XagLiveWordingMiddleware:
                     content_type = value.decode("latin-1", errors="ignore").lower()
                     break
 
+            if scope.get("path") == "/dashboard/top" and "application/json" in content_type:
+                try:
+                    top_payload = json.loads(body.decode("utf-8"))
+                    if isinstance(top_payload, dict) and top_payload.get("status") == "ok":
+                        broker_proof = combined_open_pnl.live_snapshot(core)
+                        top_payload = combined_open_pnl.project_dashboard_top(top_payload, broker_proof)
+                        body = json.dumps(top_payload, separators=(",", ":"), default=str).encode("utf-8")
+                except Exception as exc:
+                    # Fail visibly rather than allowing legacy XAU-only top
+                    # financials to masquerade as combined live Metals.
+                    print("METALS_TOP_COMBINED_PROJECTION_FAILED "
+                          + f"{type(exc).__name__}: {exc}", flush=True)
+                    body = json.dumps({
+                        "status": "error", "error": "Combined live Metals reporting unavailable",
+                    }).encode("utf-8")
+
             if "text/html" in content_type:
                 try:
                     text = body.decode("utf-8")
@@ -127,8 +144,10 @@ class XagLiveWordingMiddleware:
                         # Broker-authoritative XAG SHORT positions, separately
                         # from the legacy XAU-only open-trades view.
                         text = live_xag_open_positions.render(core) + text
-                    if scope.get("path") in {"/", "/dashboard", "/dashboard/top"}:
-                        text = combined_open_pnl.inject_html(text)
+                    if scope.get("path") == "/dashboard":
+                        # Integrate at the existing top-card renderer; never
+                        # mutate another KPI card after a legacy refresh.
+                        text = combined_open_pnl.rewrite_dashboard_html(text)
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
                         if "pep-xau-campaign-reset" not in text:
@@ -142,8 +161,16 @@ class XagLiveWordingMiddleware:
                             else:
                                 text = text.replace("</body>", add + "</body>", 1)
                     body = text.encode("utf-8")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print("METALS_TOP_HTML_REWRITE_FAILED "
+                          + f"{type(exc).__name__}: {exc}", flush=True)
+                    if scope.get("path") == "/dashboard":
+                        # Make a presentation failure obvious instead of
+                        # silently claiming XAU-only values are combined.
+                        text = body.decode("utf-8", errors="replace")
+                        text = text.replace('<div id="topStatus"',
+                            '<div class="section-note" style="color:#fbbf24">Combined Metals dashboard rendering unavailable; use Portfolio Hub for broker-verified XAU + XAG figures.</div><div id="topStatus"', 1)
+                        body = text.encode("utf-8")
 
             clean = [(k, v) for k, v in headers if k.lower() not in {b"content-length", b"content-encoding"}]
             clean.append((b"content-length", str(len(body)).encode("ascii")))
