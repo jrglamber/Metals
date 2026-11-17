@@ -215,6 +215,8 @@ def transaction_financials(transactions, links, broker_trades, now=None):
             components["net_gbp"]+=amount
             # Transaction timestamp gives correct week/month for partial and
             # multi-close fills; never use the trade's final closeTime.
+            if event_time.date()==now.date():
+                daily["today"]+=amount
             if event_time.isocalendar()[:2]==now.isocalendar()[:2]:
                 daily["week"]+=amount
             if event_time.year==now.year and event_time.month==now.month:
@@ -239,6 +241,7 @@ def transaction_financials(transactions, links, broker_trades, now=None):
         "reconciliation_issues":sorted(issues),
         "broker_trade_cumulative_pl_verified": "order_fill_pl_mismatch_broker_trade_history" not in issues and len(cumulative)==len(ids),
         "financial_components_gbp":{k:round(float(v),4) for k,v in components.items()},
+        "realised_today_gbp":round(float(daily["today"]),4) if not issues else None,
         "realised_all_time_gbp":round(float(net),4) if not issues else None,
         "realised_week_gbp":round(float(daily["week"]),4) if not issues else None,
         "realised_month_gbp":round(float(daily["month"]),4) if not issues else None,
