@@ -1,0 +1,26 @@
+name: LIVE Metals XAG Short stop-risk production acceptance
+on:
+  pull_request:
+    paths:
+      - 'smoke_xag_live_stop_risk.py'
+      - '.github/workflows/xag-live-stop-risk-acceptance.yml'
+  push:
+    branches:
+      - recovery-pre-analysis-contract-20261010
+    paths:
+      - 'portfolio_live_risk.py'
+      - 'smoke_xag_live_stop_risk.py'
+      - '.github/workflows/xag-live-stop-risk-acceptance.yml'
+  workflow_dispatch:
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile smoke_xag_live_stop_risk.py
+      - name: Verify actual live XAU/XAG risk scope and broker-stop completeness
+        run: python smoke_xag_live_stop_risk.py
