@@ -1,0 +1,22 @@
+name: Metals combined top-card production smoke
+on:
+  push:
+    branches:
+      - recovery-pre-analysis-contract-20261010
+    paths:
+      - 'metals_live_open_pnl_display.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - 'smoke_metals_combined_top.py'
+      - '.github/workflows/metals-combined-top-smoke.yml'
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify live server-rendered combined top tiles against broker scope
+        run: python smoke_metals_combined_top.py
