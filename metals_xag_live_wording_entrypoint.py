@@ -16,6 +16,7 @@ import metals_xag_live_independent_override as live_xag_health
 import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_live_open_pnl_display as combined_open_pnl
+from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
@@ -215,6 +216,13 @@ def live_metals_lane_accounting():
         return {"ok": False, "reporting_status": "schema_or_broker_error",
                 "error": f"{type(exc).__name__}: {exc}"}
 
+
+# This late-installed GET route must precede the pre-existing root mount.
+# Otherwise the Hub receives HTTP 404 and labels lane reporting unavailable.
+LANE_ACCOUNTING_ROUTE = promote_read_only_route(
+    app, "/api/live-metals-lane-accounting", live_metals_lane_accounting
+)
+print("METALS_LANE_ACCOUNTING_ROUTE " + str(LANE_ACCOUNTING_ROUTE), flush=True)
 
 app.add_middleware(XagLiveWordingMiddleware)
 
