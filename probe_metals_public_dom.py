@@ -60,3 +60,14 @@ for path in ("/dashboard", "/dashboard/top"):
             for m in re.finditer(r"[^\\n]{0,200}topTiles[^\\n]{0,200}",html):
                 print("TOP_JS",repr(m.group()[:550]))
     except Exception as e: print("DEEP_ERR",path,type(e).__name__,str(e))
+
+try:
+  with urlopen(Request(BASE+"/dashboard",headers={"Accept":"text/html"},method="GET"),timeout=25) as rr:
+    html=rr.read().decode("utf-8","replace")
+  ix=html.find("async function loadTop")
+  print("LOAD_TOP_JS",repr(html[ix:ix+5300]))
+  with urlopen(Request(BASE+"/api/live-metals-open-pnl",headers={"Accept":"application/json"},method="GET"),timeout=25) as rr:
+    import json
+    obj=json.loads(rr.read().decode("utf-8"))
+    print("COMBINED_PROOF", {k:obj.get(k) for k in ("ok","scope","open_count","open_pnl_gbp","high_water_status","high_water_gbp","giveback_gbp","giveback_pct","reason")})
+except Exception as e: print("DEEP_JS_ERR",type(e).__name__,str(e))
