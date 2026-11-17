@@ -1,103 +1,64 @@
-"""Browser-less DOM regression for the production Metals combined-P&L widget.
-
-Exercises the REAL embedded JavaScript against a minimal DOM. No network,
-broker commands, risk settings, or runtime side effects.
-"""
-import base64
-import shutil
-import subprocess
+"""Combined Metals top-card scope regression, keeping NAV and XAU protection separate."""
 import unittest
+import metals_live_open_pnl_display as display
 
-from metals_live_open_pnl_display import _SCRIPT
+def top():
+    return {
+        "status":"ok",
+        "account":{"nav":5434.42,"balance":5423.88,"unrealized_pl":10.54},
+        "accounting":{"week_pnl":19.09,"month_pnl":37.63},
+        "strategy":{"headline_pnl":8.49,"open_pnl":8.49,"realized_pnl":248.69,
+                    "open_trades":16,"local_open_trades":16,
+                    "high_water_gbp":61.79,"high_water_r":9.40,
+                    "giveback_gbp":53.29,"giveback_pct":86.3,
+                    "giveback_r":8.11,"basket_r":1.29},
+    }
 
+def proof():
+    return {"ok":True,"scope":display.SCOPE,
+            "open_count":38,"xau_count":16,"xag_short_count":22,
+            "open_pnl_gbp":11.35,"high_water_status":"OBSERVED_COMBINED_LIVE",
+            "high_water_gbp":72.24,"giveback_gbp":60.89,"giveback_pct":84.28,
+            "high_water_at_utc":"2026-11-17T01:26:00Z",
+            "high_water_tracking_started_at_utc":"2026-11-16T18:38:00Z"}
 
-NODE_TEST = r"""
-const assert = require('node:assert/strict');
-const vm = require('node:vm');
+class DashboardTopTests(unittest.TestCase):
+    def test_combined_does_not_corrupt_nav_or_realised_or_xau_hwm(self):
+        original=top()
+        out=display.project_dashboard_top(original,proof())
+        s=out["strategy"]
+        self.assertEqual((s["headline_pnl"],s["open_trades"]),(11.35,38))
+        self.assertEqual((s["xau_count"],s["xag_short_count"]),(16,22))
+        self.assertEqual((s["high_water_gbp"],s["giveback_gbp"]),(72.24,60.89))
+        self.assertEqual(s["giveback_pct"],84.28)
+        for k in ("basket_r","high_water_r","giveback_r"):
+            self.assertIsNone(s[k])
+        self.assertEqual(out["account"]["nav"],5434.42)
+        self.assertEqual(out["accounting"]["week_pnl"],19.09)
+        self.assertEqual(s["realized_pnl"],248.69)
+        self.assertEqual(out["xau_only_strategy"]["open_trades"],16)
+        self.assertEqual(out["xau_only_strategy"]["high_water_gbp"],61.79)
+        self.assertEqual(original["strategy"]["open_trades"],16)
 
-const htmlScript=Buffer.from(process.argv[1], 'base64').toString('utf8');
-const script=htmlScript.replace(/^\s*<script[^>]*>/,'').replace(/<\/script>\s*$/,'');
+    def test_unverified_combined_never_falls_back_to_xau_financials(self):
+        out=display.project_dashboard_top(top(),{"ok":False,"reason":"XAG ownership mismatch"})
+        s=out["strategy"]
+        for k in ("headline_pnl","open_pnl","open_trades","high_water_gbp",
+                  "giveback_gbp","giveback_pct","high_water_r","giveback_r"):
+            self.assertIsNone(s[k],k)
+        self.assertEqual(s["combined_reporting_status"],"BROKER_UNVERIFIED")
+        self.assertEqual(out["account"]["nav"],5434.42)
 
-class Element {
-  constructor(text='', children=[]) {
-    this._text=text; this.children=children; this.parentElement=null;
-    this.style={}; this.attrs={};
-    for(const child of children) child.parentElement=this;
-  }
-  get textContent() {
-    return this.children.length ? this.children.map(c=>c.textContent).join(' ') : this._text;
-  }
-  set textContent(value) {this._text=String(value); this.children=[];}
-  querySelectorAll(selector) {
-    if(selector!=='*') throw Error('Unexpected selector '+selector);
-    const all=[];
-    for(const child of this.children) {all.push(child,...child.querySelectorAll('*'));}
-    return all;
-  }
-  getAttribute(k) {return this.attrs[k] ?? null;}
-  setAttribute(k,v) {this.attrs[k]=v;}
-}
+    def test_missing_peak_does_not_hide_verified_open_pnl(self):
+        p=proof();p["high_water_status"]="UNAVAILABLE"
+        s=display.project_dashboard_top(top(),p)["strategy"]
+        self.assertEqual(s["headline_pnl"],11.35)
+        self.assertEqual(s["open_trades"],38)
+        self.assertIsNone(s["high_water_gbp"])
+        self.assertEqual(s["combined_reporting_status"],"HWM_UNAVAILABLE")
 
-function card(label,value,note) {
-  const labelEl=new Element(label), valueEl=new Element(value), noteEl=new Element(note);
-  return {root:new Element('',[labelEl,valueEl,noteEl]),label:labelEl,value:valueEl,note:noteEl};
-}
-async function run(givebackValue) {
-  const nav=card('NAV','£5,427.62','Bal £5,423.88 · Account-wide UPL £3.74');
-  const broker=card('Broker P&L','£2.25','LIVE Metals open P&L');
-  const high=card('High-Water · LIVE XAU + XAG SHORT','£72.24','XAU + XAG SHORT historic peak');
-  const give=card('Giveback · LIVE XAU + XAG SHORT',givebackValue,'8.96R');
-  const others=card('This Month','£37.63','LIVE Metals realised this month');
-  const body=new Element('',[new Element('',[nav.root,broker.root,high.root,give.root,others.root])]);
-  const document={
-    readyState:'complete',
-    querySelectorAll(selector) {
-      if(selector!=='body *') throw Error('Unexpected document selector '+selector);
-      return body.querySelectorAll('*');
-    },
-  };
-  const snapshot={
-    ok:true,open_pnl_gbp:4.36,high_water_status:'OBSERVED_COMBINED_LIVE',
-    high_water_gbp:72.24,giveback_gbp:67.88,giveback_pct:94.0,
-    observed_at_utc:'2026-11-17T18:31:00+00:00',
-    high_water_tracking_started_at_utc:'2026-11-16T18:38:00+00:00',
-    high_water_at_utc:'2026-11-17T01:26:00+00:00',
-  };
-  vm.runInNewContext(script,{
-    document, console, setInterval:()=>{},
-    fetch: async ()=>({ok:true,json:async ()=>snapshot}),
-  });
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(nav.label.textContent,'NAV');
-  assert.equal(nav.value.textContent,'£5,427.62','NAV must NEVER contain giveback');
-  assert.equal(broker.value.textContent,'£4.36');
-  assert.equal(high.value.textContent,'£72.24');
-  assert.equal(others.value.textContent,'£37.63');
-  if(givebackValue==='£58.81 · 95.2%') {
-    assert.equal(give.value.textContent,'£67.88','combined giveback must replace XAU-only value');
-    assert.match(give.note.textContent,/94\.0%/);
-    assert.match(broker.label.textContent,/Broker P&L/);
-  } else {
-    assert.equal(give.value.textContent,givebackValue,'Unrecognised metric must not borrow NAV');
-  }
-}
-(async ()=>{
-  await run('£58.81 · 95.2%');
-  await run('not a currency value');
-  console.log('PASS: NAV safe; combined P&L, high-water and giveback stay within own cards');
-})().catch(err=>{console.error(err);process.exit(1);});
-"""
+    def test_missing_top_renderer_fails_closed(self):
+        with self.assertRaises(ValueError):
+            display.rewrite_dashboard_html("async function loadTop(force=false){}")
 
-class CombinedDashboardDomTests(unittest.TestCase):
-    def test_metric_cards_are_never_cross_written(self):
-        if not shutil.which("node"):
-            self.skipTest("Node.js unavailable")
-        proc=subprocess.run(
-            ["node","-e",NODE_TEST,base64.b64encode(_SCRIPT.encode()).decode()],
-            capture_output=True, text=True, timeout=20,
-        )
-        self.assertEqual(proc.returncode,0,proc.stdout+"\n"+proc.stderr)
-        self.assertIn("NAV safe",proc.stdout)
-
-if __name__=="__main__":
-    unittest.main()
+if __name__=="__main__": unittest.main()
