@@ -107,13 +107,13 @@ _SCRIPT = r'''
   // Legacy Giveback has a composite value like "£58.81 · 95.2%": treating
   // that as non-money previously made the lookup climb into the NAV card.
   function text(el) {
-    return String(el.textContent || '').replace(/\\s+/g,' ').trim();
+    return String(el.textContent || '').replace(/\s+/g,' ').trim();
   }
   function metricTitle(t) {
-    return /^(?:NAV|Broker P&L(?: · LIVE XAU \\+ XAG SHORT)?|Open P&L(?: · LIVE XAU \\+ XAG SHORT)?|High[- ]Water(?: · LIVE XAU \\+ XAG SHORT)?|Giveback(?: · LIVE XAU \\+ XAG SHORT)?|This Week|This Month|Open Trades|48h\\+ Trades|Signal Health|Signals|Candidate Support)$/i.test(t);
+    return /^(?:NAV|Broker P&L(?: · LIVE XAU \+ XAG SHORT)?|Open P&L(?: · LIVE XAU \+ XAG SHORT)?|High[- ]Water(?: · LIVE XAU \+ XAG SHORT)?|Giveback(?: · LIVE XAU \+ XAG SHORT)?|This Week|This Month|Open Trades|48h\+ Trades|Signal Health|Signals|Candidate Support)$/i.test(t);
   }
   function metricValue(t) {
-    return /^(?:[-+]?£|£-)[\\d,]+(?:\\.\\d+)?(?:\\s*[·•]\\s*\\d+(?:\\.\\d+)?%)?$/.test(t) || /^[—–-]$/.test(t);
+    return /^(?:[-+]?£|£-)[\d,]+(?:\.\d+)?(?:\s*[·•]\s*\d+(?:\.\d+)?%)?$/.test(t) || /^[—–-]$/.test(t);
   }
   function findTile(labelPattern) {
     var nodes=Array.from(document.querySelectorAll('body *')).filter(function(el) {
