@@ -73,7 +73,7 @@ def check():
 
 if __name__=="__main__":
     last=None
-    for attempt in range(8):
+    for attempt in range(18):
         try:
             check()
             break
