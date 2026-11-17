@@ -80,39 +80,62 @@ def _pending_stop_orders(base, account, token):
 
 
 def _verified_stop(t, pending):
-    """Use only a currently attached, broker-authoritative stop order."""
-    trade_id = str(t.get('id') or '').strip()
-    for id_field, expected_type, embedded in (
+    """Verify a live broker-attached stop, with no local stop-price inference.
+
+    OANDA Trade can embed full dependent stop orders, while TradeSummary
+    exposes an OrderID. Accept either authoritative representation, but never
+    an unrelated pending order, cancelled stop, or an unlinked local value.
+    """
+    tid = str(t.get('id') or '').strip()
+    if not tid or (t.get('state') and str(t.get('state')).upper() != 'OPEN'):
+        return None
+
+    fields = (
         ('stopLossOrderID','STOP_LOSS','stopLossOrder'),
         ('guaranteedStopLossOrderID','GUARANTEED_STOP_LOSS','guaranteedStopLossOrder'),
         ('trailingStopLossOrderID','TRAILING_STOP_LOSS','trailingStopLossOrder'),
-    ):
+    )
+    for id_field, kind, embedded in fields:
         oid = str(t.get(id_field) or '').strip()
-        candidate = pending.get(oid) if oid else None
-        if candidate:
-            if (str(candidate.get('id') or '').strip() != oid
-                    or str(candidate.get('type') or '').upper() != expected_type
-                    or str(candidate.get('state') or '').upper() != 'PENDING'
-                    or str(candidate.get('tradeID') or '').strip() != trade_id):
+        candidates = []
+        if oid:
+            found = pending.get(oid)
+            if isinstance(found, dict):
+                candidates.append((found, True))
+
+        full = t.get(embedded)
+        if isinstance(full, dict):
+            candidates.append((full, False))
+
+        # If OANDA returned full Trade rather than TradeSummary, there may be
+        # no top-level OrderID. The pending broker order still belongs to the
+        # trade when its tradeID matches exactly. Require unique match.
+        if not oid and not candidates:
+            matched=[order for order in pending.values()
+                     if isinstance(order, dict)
+                     and str(order.get('tradeID') or '').strip() == tid
+                     and str(order.get('type') or '').upper() == kind
+                     and str(order.get('state') or '').upper() == 'PENDING']
+            if len(matched)==1:
+                candidates.append((matched[0],True))
+        for order, from_pending in candidates:
+            order_id = str(order.get('id') or '').strip()
+            if not order_id or (oid and order_id != oid):
                 continue
-            price = _f(candidate.get('price') or candidate.get('trailingStopValue'))
-            if price is not None and price > 0:
-                return price
-        # Existing XAU broker-supplied embedded attached stop, if it has an ID.
-        # Do not accept an unlinked scalar or a locally inferred stop.
-        existing = t.get(embedded)
-        if isinstance(existing, dict) and oid:
-            if str(existing.get('id') or '') != oid:
+            if order.get('type') and str(order.get('type')).upper() != kind:
                 continue
-            if str(existing.get('state') or 'PENDING').upper() != 'PENDING':
+            if str(order.get('state') or '').upper() != 'PENDING':
                 continue
-            if existing.get('tradeID') and str(existing.get('tradeID')) != trade_id:
+            trade_id = str(order.get('tradeID') or '').strip()
+            if from_pending:
+                if trade_id != tid:
+                    continue
+            elif trade_id and trade_id != tid:
                 continue
-            price = _f(existing.get('price') or existing.get('trailingStopValue'))
+            price = _f(order.get('price') or order.get('trailingStopValue'))
             if price is not None and price > 0:
                 return price
     return None
-
 
 def _calculate(mode):
     account,token=_credentials(mode)
