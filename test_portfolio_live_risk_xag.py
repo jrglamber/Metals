@@ -66,6 +66,48 @@ class MetalsXagRiskTests(unittest.TestCase):
                 ]} if path=="pendingOrders" else None)
                 self.assertEqual(d["unquantified_trade_count"],1)
 
+    def test_full_embedded_trade_orders_without_top_level_order_ids(self):
+        def replacement(path):
+            if path=="openTrades":
+                return {"trades":[
+                    {"id":"a1","state":"OPEN","instrument":"XAU_USD",
+                     "currentUnits":"1","price":"4000",
+                     "stopLossOrder":{"id":"o1","state":"PENDING",
+                                      "tradeID":"a1","type":"STOP_LOSS","price":"3990"}},
+                    {"id":"s1","state":"OPEN","instrument":"XAG_USD",
+                     "currentUnits":"-1","price":"30",
+                     "stopLossOrder":{"id":"o2","state":"PENDING",
+                                      "tradeID":"s1","type":"STOP_LOSS","price":"32"}},
+                ]}
+            if path=="pendingOrders": return {"orders":[]}
+        result=self.calculate(replacement)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["quantified_trade_count"],2)
+        self.assertEqual(result["without_stop_trade_count"],0)
+
+    def test_pending_orders_can_prove_stop_when_trade_has_no_top_id(self):
+        def replacement(path):
+            if path=="openTrades":
+                return {"trades":[
+                    {"id":"a1","state":"OPEN","instrument":"XAU_USD",
+                     "currentUnits":"1","price":"4000"},
+                    {"id":"s1","state":"OPEN","instrument":"XAG_USD",
+                     "currentUnits":"-1","price":"30"},
+                ]}
+        result=self.calculate(replacement)
+        self.assertEqual(result["quantified_trade_count"],2)
+
+    def test_wrong_trade_id_embedded_stop_rejected(self):
+        trade={"id":"s1","state":"OPEN","instrument":"XAG_USD",
+               "stopLossOrder":{"id":"o2","state":"PENDING","type":"STOP_LOSS",
+                                "tradeID":"some-other-trade","price":"32"}}
+        self.assertIsNone(risk._verified_stop(trade,{}))
+
+    def test_broker_embedded_stop_without_id_rejected(self):
+        trade={"id":"s1","state":"OPEN","instrument":"XAG_USD",
+               "stopLossOrder":{"state":"PENDING","price":"32"}}
+        self.assertIsNone(risk._verified_stop(trade,{}))
+
     def test_failure_fetching_pending_orders_fails_closed(self):
         def broken(path):
             if path=="pendingOrders": raise RuntimeError("OANDA timeout")
