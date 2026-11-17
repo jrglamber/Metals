@@ -34,7 +34,7 @@ def _allowed(mode,instrument):
     if mode=='indices':
         cfg={x.strip().upper() for x in os.getenv('BROKER_ALLOWED_INSTRUMENTS','').split(',') if x.strip()}
         return s in cfg if cfg else s in {'NAS100_USD','SPX500_USD','US500_USD'}
-    if mode=='metals': return s=='XAU_USD'
+    if mode=='metals': return s in {'XAU_USD','XAG_USD'}
     cfg=os.getenv('BCO_OANDA_INSTRUMENT','').strip().upper(); return s==cfg if cfg else ('BCO' in s or 'BRENT' in s)
 def _mid(base,account,token,instrument):
     try:
@@ -59,15 +59,84 @@ def _stop(t):
             p=_f(o.get('price') or o.get('trailingStopValue'))
             if p and p>0: return p
     return None
+def _pending_stop_orders(base, account, token):
+    """Read pending broker stops once; missing/invalid stops stay unquantified.
+
+    OANDA openTrades can return only stopLossOrderID, not an embedded order.
+    An independent pending-order GET proves the current broker price.
+    """
+    data = _get_json(base, account, token, 'pendingOrders')
+    orders = data.get('orders') or []
+    if not isinstance(orders, list):
+        raise ValueError('invalid pending broker stop-order payload')
+    index = {}
+    for item in orders:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get('id') or '').strip()
+        if oid and oid not in index:
+            index[oid] = item
+    return index
+
+
+def _verified_stop(t, pending):
+    """Use only a currently attached, broker-authoritative stop order."""
+    trade_id = str(t.get('id') or '').strip()
+    for id_field, expected_type, embedded in (
+        ('stopLossOrderID','STOP_LOSS','stopLossOrder'),
+        ('guaranteedStopLossOrderID','GUARANTEED_STOP_LOSS','guaranteedStopLossOrder'),
+        ('trailingStopLossOrderID','TRAILING_STOP_LOSS','trailingStopLossOrder'),
+    ):
+        oid = str(t.get(id_field) or '').strip()
+        candidate = pending.get(oid) if oid else None
+        if candidate:
+            if (str(candidate.get('id') or '').strip() != oid
+                    or str(candidate.get('type') or '').upper() != expected_type
+                    or str(candidate.get('state') or '').upper() != 'PENDING'
+                    or str(candidate.get('tradeID') or '').strip() != trade_id):
+                continue
+            price = _f(candidate.get('price') or candidate.get('trailingStopValue'))
+            if price is not None and price > 0:
+                return price
+        # Existing XAU broker-supplied embedded attached stop, if it has an ID.
+        # Do not accept an unlinked scalar or a locally inferred stop.
+        existing = t.get(embedded)
+        if isinstance(existing, dict) and oid:
+            if str(existing.get('id') or '') != oid:
+                continue
+            if str(existing.get('state') or 'PENDING').upper() != 'PENDING':
+                continue
+            if existing.get('tradeID') and str(existing.get('tradeID')) != trade_id:
+                continue
+            price = _f(existing.get('price') or existing.get('trailingStopValue'))
+            if price is not None and price > 0:
+                return price
+    return None
+
+
 def _calculate(mode):
     account,token=_credentials(mode)
     if not account or not token: return {'ok':False,'version':VERSION,'scope':mode,'calculated_at_utc':_now(),'error':'OANDA credentials not configured for live risk telemetry','capital_at_risk_gbp':None}
     base=_api_base(mode); home=str(((_get_json(base,account,token,'summary').get('account') or {}).get('currency') or 'GBP')).upper()
+    if mode == 'metals' and home != 'GBP':
+        return {'ok':False,'version':VERSION,'scope':mode,'error':'Metals broker account must be GBP for stop-floor reporting','capital_at_risk_gbp':None}
     trades=[t for t in (_get_json(base,account,token,'openTrades').get('trades') or []) if _allowed(mode,t.get('instrument'))]
-    memo={}; total=0.0; floor=0.0; quant=0; no_stop=0; no_conv=0; by={}
+    pending = {}
+    if mode == 'metals':
+        try: pending = _pending_stop_orders(base,account,token)
+        except Exception as exc:
+            return {'ok':False,'version':VERSION,'scope':mode,
+                    'error':'Broker pending stop orders unavailable: '+f'{type(exc).__name__}: {exc}'[:120],
+                    'capital_at_risk_gbp':None}
+    memo={}; total=0.0; floor=0.0; quant=0; no_stop=0; no_conv=0; by={}; known_ids=[]
     for t in trades:
-        ins=str(t.get('instrument') or 'UNKNOWN').upper(); entry=_f(t.get('price')); units=_f(t.get('currentUnits')); stop=_stop(t)
-        row=by.setdefault(ins,{'open_trade_count':0,'quantified_trade_count':0,'without_stop_trade_count':0,'conversion_missing_trade_count':0,'capital_at_risk_gbp':0.0,'locked_profit_floor_gbp':0.0}); row['open_trade_count']+=1
+        ins=str(t.get('instrument') or 'UNKNOWN').upper(); entry=_f(t.get('price')); units=_f(t.get('currentUnits')); stop=_verified_stop(t,pending) if mode == 'metals' else _stop(t)
+        row=by.setdefault(ins,{'open_trade_count':0,'long_trade_count':0,'short_trade_count':0,'quantified_trade_count':0,'without_stop_trade_count':0,'conversion_missing_trade_count':0,'capital_at_risk_gbp':0.0,'locked_profit_floor_gbp':0.0})
+        row['open_trade_count']+=1
+        if units is not None:
+            if units>0: row['long_trade_count']+=1
+            elif units<0: row['short_trade_count']+=1
+        if str(t.get('id') or ''): known_ids.append(str(t.get('id')))
         if entry is None or units is None or abs(units)<=0 or stop is None: no_stop+=1; row['without_stop_trade_count']+=1; continue
         quote=ins.rsplit('_',1)[-1] if '_' in ins else home; fac=_factor(base,account,token,quote,home,memo)
         if fac is None: no_conv+=1; row['conversion_missing_trade_count']+=1; continue
@@ -75,7 +144,7 @@ def _calculate(mode):
         else: loss=max(0.0,stop-entry); gain=max(0.0,entry-stop)
         r=loss*abs(units)*fac; f=gain*abs(units)*fac; total+=r; floor+=f; quant+=1; row['quantified_trade_count']+=1; row['capital_at_risk_gbp']+=r; row['locked_profit_floor_gbp']+=f
     for row in by.values(): row['capital_at_risk_gbp']=round(row['capital_at_risk_gbp'],2); row['locked_profit_floor_gbp']=round(row['locked_profit_floor_gbp'],2)
-    return {'ok':True,'version':VERSION,'scope':mode,'calculated_at_utc':_now(),'account_currency':home,'open_trade_count':len(trades),'quantified_trade_count':quant,'without_stop_trade_count':no_stop,'conversion_missing_trade_count':no_conv,'unquantified_trade_count':no_stop+no_conv,'capital_at_risk_gbp':round(total,2),'locked_profit_floor_gbp':round(floor,2),'by_instrument':by,'method':'broker_entry_to_current_stop_x_actual_units_converted_to_account_currency','execution_authority':False}
+    return {'ok':True,'version':VERSION,'scope':mode,'calculated_at_utc':_now(),'account_currency':home,'open_trade_count':len(trades),'quantified_trade_count':quant,'without_stop_trade_count':no_stop,'conversion_missing_trade_count':no_conv,'unquantified_trade_count':no_stop+no_conv,'capital_at_risk_gbp':round(total,2),'locked_profit_floor_gbp':round(floor,2),'by_instrument':by,'broker_trade_ids':sorted(known_ids),'method':'broker_entry_to_current_stop_x_actual_units_converted_to_account_currency','execution_authority':False}
 def _read(mode):
     global _cache,_cache_at
     now=time.monotonic()
