@@ -264,6 +264,18 @@ XAG_LEDGER_AUDIT_ROUTE = promote_read_only_route(
 )
 print("METALS_XAG_LEDGER_AUDIT_ROUTE " + str(XAG_LEDGER_AUDIT_ROUTE), flush=True)
 
+# Shadow reconciliation of broker transaction cash movements (GBP).
+# On-demand only; does not alter accounting or claim success in the Hub.
+@app.get("/api/metals-xag-transaction-audit")
+def metals_xag_transaction_audit_endpoint():
+    from metals_xag_transaction_audit import snapshot
+    return snapshot(core)
+
+XAG_TRANSACTION_AUDIT_ROUTE = promote_read_only_route(
+    app, "/api/metals-xag-transaction-audit", metals_xag_transaction_audit_endpoint
+)
+print("METALS_XAG_TRANSACTION_AUDIT_ROUTE " + str(XAG_TRANSACTION_AUDIT_ROUTE), flush=True)
+
 app.add_middleware(XagLiveWordingMiddleware)
 
 # Read-only XAG routing audit. Do not replay or retry candidate execution.
