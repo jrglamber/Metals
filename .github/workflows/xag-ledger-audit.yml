@@ -1,0 +1,61 @@
+name: XAG broker realised-ledger read-only audit
+on:
+  pull_request:
+    paths:
+      - 'metals_xag_ledger_audit.py'
+      - 'test_metals_xag_ledger_audit.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/xag-ledger-audit.yml'
+  push:
+    branches: [recovery-pre-analysis-contract-20261010]
+    paths:
+      - 'metals_xag_ledger_audit.py'
+      - 'test_metals_xag_ledger_audit.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/xag-ledger-audit.yml'
+  workflow_dispatch:
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pure read-only audit regressions
+        run: |
+          python -m py_compile metals_xag_ledger_audit.py test_metals_xag_ledger_audit.py metals_xag_live_wording_entrypoint.py
+          python -m unittest -v test_metals_xag_ledger_audit
+      - name: Production XAG broker history coverage (no credentials or trade IDs printed)
+        if: github.event_name != 'pull_request'
+        run: |
+          python - <<'PY'
+          import json,time,urllib.request
+          url='https://metals-production-bb81.up.railway.app/api/metals-xag-ledger-audit'
+          for attempt in range(24):
+            try:
+              with urllib.request.urlopen(url,timeout=40) as r:
+                if r.status!=200:raise AssertionError(f'HTTP {r.status}')
+                d=json.load(r)
+              required=['broker_history_complete','account_currency','local_trade_links',
+                        'broker_xag_short_closed','trade_ownership_verified',
+                        'broker_nonzero_financing_trades','broker_multiclose_trades','blockers']
+              missing=[k for k in required if k not in d]
+              if missing:raise AssertionError('Audit contract missing '+','.join(missing))
+              print('AUDIT_SUMMARY',json.dumps({k:d.get(k) for k in (
+                'ok','account_currency','broker_history_complete','broker_history_pages',
+                'local_trade_links','local_xag_closed_links',
+                'broker_xag_short_closed','broker_xag_short_open',
+                'broker_shorts_not_locally_linked',
+                'local_links_missing_from_broker','local_closed_not_broker_closed',
+                'broker_closed_not_locally_closed','broker_nonzero_financing_trades',
+                'broker_multiclose_trades','broker_open_partially_realised',
+                'trade_ownership_verified','net_realised_gbp_verified','blockers')}))
+              print('PASS: read-only XAG history audit collected safely')
+              break
+            except Exception as exc:
+              print('retry',attempt+1,type(exc).__name__,str(exc)[:120])
+              time.sleep(6)
+          else:raise SystemExit('FAIL: XAG production ledger diagnostic unavailable')
+          PY
