@@ -181,7 +181,7 @@ _TOP_RENDER_REPLACEMENTS = (
     ("card('Broker P&L',money(s.headline_pnl),", 
      "card('Broker P&L · LIVE XAU + XAG SHORT',money(s.headline_pnl),"),
     ("LIVE Metals open P&L · Realised ",
-     "Combined broker-verified · Realised XAU-only "),
+     "Combined broker-verified · Realised " + chr(36) + "{s.xag_realised_verified?'XAU + XAG SHORT':'XAU-only (XAG audit pending)'} "),
     ("card('High-Water',money(s.high_water_gbp),",
      "card('High-Water · LIVE XAU + XAG SHORT',money(s.high_water_gbp),"),
     ("DOLLAR{Number(s.high_water_r||0).toFixed(2)}R · ",
