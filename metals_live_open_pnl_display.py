@@ -186,13 +186,13 @@ _TOP_RENDER_REPLACEMENTS = (
      "card('High-Water · LIVE XAU + XAG SHORT',money(s.high_water_gbp),"),
     ("DOLLAR{Number(s.high_water_r||0).toFixed(2)}R · ",
      "Combined observed peak · "),
-    (" · LIVE MetalsDOLLAR{", " · XAU protection separateDOLLAR{"),
-    ("card('Giveback',DOLLAR{money(s.giveback_gbp)}",
-     "card('Giveback · LIVE XAU + XAG SHORT',DOLLAR{money(s.giveback_gbp)}"),
+    (" · LIVE Metals" + chr(96), " · XAU protection separate" + chr(96)),
+    ("card('Giveback'," + chr(96) + "DOLLAR{money(s.giveback_gbp)}",
+     "card('Giveback · LIVE XAU + XAG SHORT'," + chr(96) + "DOLLAR{money(s.giveback_gbp)}"),
+    (chr(96) + "DOLLAR{money(s.giveback_gbp)} · DOLLAR{Number(s.giveback_pct||0).toFixed(1)}%" + chr(96),
+     chr(96) + "DOLLAR{money(s.giveback_gbp)} · DOLLAR{s.giveback_pct==null?'unavailable':Number(s.giveback_pct).toFixed(1)+'%'}" + chr(96)),
     ("DOLLAR{Number(s.giveback_r||0).toFixed(2)}R",
      "From combined observed peak · XAU protection separate"),
-    ("DOLLAR{Number(s.giveback_pct||0).toFixed(1)}%",
-     "DOLLAR{s.giveback_pct==null?'unavailable':Number(s.giveback_pct).toFixed(1)+'%'}"),
     ("card('Open Trades',eh(s.open_trades||0),",
      "card('Open Trades',s.open_trades==null?'—':eh(s.open_trades),"),
     ("LIVE Metals · local DOLLAR{eh(s.local_open_trades||0)}",
@@ -200,7 +200,6 @@ _TOP_RENDER_REPLACEMENTS = (
     ("Oldest DOLLAR{eh(s.oldest_hold||0)}h",
      "XAU only · Oldest DOLLAR{eh(s.oldest_hold||0)}h"),
 )
-
 
 def rewrite_dashboard_html(html):
     if "async function loadTop(force=false)" not in html:
