@@ -80,13 +80,11 @@ class CombinedLivePnlTests(unittest.TestCase):
         self.assertEqual(api.router.routes[0].path, "/api/live-metals-open-pnl")
         self.assertTrue(any(getattr(r, "path", None) in ("", "/") for r in api.router.routes[1:]))
 
-    def test_dashboard_script_deduplicated(self):
-        html = "<html><body><h1>Metals</h1></body></html>"
-        patched = display.inject_html(html)
-        self.assertIn('pep-combined-live-metals-pnl-v2', patched)
-        self.assertIn("Broker P&L", patched)
-        self.assertIn("/api/live-metals-open-pnl", patched)
-        self.assertEqual(display.inject_html(patched), patched)
+    def test_no_late_dom_patch_remaining(self):
+        # The legacy top renderer is the sole writer of metric cards.
+        self.assertFalse(hasattr(display, "_SCRIPT"))
+        self.assertFalse(hasattr(display, "inject_html"))
+        self.assertTrue(callable(display.rewrite_dashboard_html))
 
 
 if __name__ == "__main__":
