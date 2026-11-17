@@ -6,6 +6,7 @@ on:
       - 'metals_xag_realised_verified.py'
       - 'metals_live_open_pnl_display.py'
       - 'test_metals_xag_realised_verified.py'
+      - 'smoke_xag_realised_live.py'
       - 'test_metals_xag_transaction_audit.py'
       - 'metals_xag_live_wording_entrypoint.py'
       - '.github/workflows/xag-transaction-audit.yml'
@@ -16,6 +17,7 @@ on:
       - 'metals_xag_realised_verified.py'
       - 'metals_live_open_pnl_display.py'
       - 'test_metals_xag_realised_verified.py'
+      - 'smoke_xag_realised_live.py'
       - 'test_metals_xag_transaction_audit.py'
       - 'metals_xag_live_wording_entrypoint.py'
       - '.github/workflows/xag-transaction-audit.yml'
@@ -60,3 +62,7 @@ jobs:
               time.sleep(6)
           else:raise SystemExit('FAIL: broker transaction shadow audit unavailable')
           PY
+
+      - name: Production XAG realised ledger dashboard integration
+        if: github.event_name != 'pull_request'
+        run: python smoke_xag_realised_live.py
