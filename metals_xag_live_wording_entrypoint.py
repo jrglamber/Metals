@@ -251,6 +251,19 @@ LANE_ACCOUNTING_ROUTE = promote_read_only_route(
 )
 print("METALS_LANE_ACCOUNTING_ROUTE " + str(LANE_ACCOUNTING_ROUTE), flush=True)
 
+# On-demand, read-only XAG realised-ledger audit. A separate endpoint avoids
+# adding OANDA historical requests to the Hub's normal 5-second refresh.
+# Diagnostics are aggregate counts only; no raw trade IDs/account tokens.
+@app.get("/api/metals-xag-ledger-audit")
+def metals_xag_ledger_audit_endpoint():
+    from metals_xag_ledger_audit import snapshot
+    return snapshot(core)
+
+XAG_LEDGER_AUDIT_ROUTE = promote_read_only_route(
+    app, "/api/metals-xag-ledger-audit", metals_xag_ledger_audit_endpoint
+)
+print("METALS_XAG_LEDGER_AUDIT_ROUTE " + str(XAG_LEDGER_AUDIT_ROUTE), flush=True)
+
 app.add_middleware(XagLiveWordingMiddleware)
 
 # Read-only XAG routing audit. Do not replay or retry candidate execution.
