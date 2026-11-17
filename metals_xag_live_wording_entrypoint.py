@@ -120,6 +120,15 @@ class XagLiveWordingMiddleware:
                     if isinstance(top_payload, dict) and top_payload.get("status") == "ok":
                         broker_proof = combined_open_pnl.live_snapshot(core)
                         top_payload = combined_open_pnl.project_dashboard_top(top_payload, broker_proof)
+                        from metals_xag_realised_verified import verify as verify_xag_cash, apply_top
+                        from metals_xag_transaction_audit import snapshot as xag_cash_snapshot
+                        try:
+                            xag_realised_proof = verify_xag_cash(xag_cash_snapshot(core))
+                        except Exception as xag_exc:
+                            xag_realised_proof = {
+                                "ok": False, "reason_type": type(xag_exc).__name__
+                            }
+                        top_payload = apply_top(top_payload, xag_realised_proof)
                         body = json.dumps(top_payload, separators=(",", ":"), default=str).encode("utf-8")
                 except Exception as exc:
                     # Fail visibly rather than allowing legacy XAU-only top
@@ -236,8 +245,23 @@ def live_metals_lane_accounting():
             lane["reporting_status"] = "awaiting_reconciliation"
             for key in ("realised_week_gbp", "realised_month_gbp", "realised_all_time_gbp", "unrealised_gbp"):
                 lane[key] = None
-        result["ok"] = result["reconciled"]
-        result["reporting_status"] = "available" if result["reconciled"] else "awaiting_reconciliation"
+        # XAG Short is independently reconciled from authoritative OANDA
+        # transactions. XAU LONG/SHORT per-lane split remains unverified; the
+        # existing XAU aggregate accounting source remains unchanged.
+        from metals_xag_transaction_audit import snapshot as xag_cash_snapshot
+        from metals_xag_realised_verified import verify as verify_xag_cash
+        try:
+            xag_cash = verify_xag_cash(xag_cash_snapshot(core))
+            result["xag_short_verified_realised"] = xag_cash
+            result["xag_short_net_gbp_verified"] = True
+            result["reporting_status"] = "xag_short_net_verified_xau_split_pending"
+        except Exception as xag_exc:
+            result["xag_short_net_gbp_verified"] = False
+            result["xag_short_verification_error"] = type(xag_exc).__name__
+            result["reporting_status"] = "awaiting_reconciliation"
+        # Do NOT claim all three lane ledgers are independently reconciled.
+        result["reconciled"] = False
+        result["ok"] = False
         return result
     except Exception as exc:
         return {"ok": False, "reporting_status": "schema_or_broker_error",
