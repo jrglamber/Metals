@@ -71,3 +71,14 @@ try:
     obj=json.loads(rr.read().decode("utf-8"))
     print("COMBINED_PROOF", {k:obj.get(k) for k in ("ok","scope","open_count","open_pnl_gbp","high_water_status","high_water_gbp","giveback_gbp","giveback_pct","reason")})
 except Exception as e: print("DEEP_JS_ERR",type(e).__name__,str(e))
+
+from metals_live_open_pnl_display import rewrite_dashboard_html
+with urlopen(Request(BASE+"/dashboard",headers={"Accept":"text/html"},method="GET"),timeout=25) as response:
+    live_html=response.read().decode("utf-8","replace")
+patched_html=rewrite_dashboard_html(live_html)
+assert "Broker P&L · LIVE XAU + XAG SHORT" in patched_html
+assert "High-Water · LIVE XAU + XAG SHORT" in patched_html
+assert "Giveback · LIVE XAU + XAG SHORT" in patched_html
+assert "From combined observed peak" in patched_html
+assert "card('NAV',money(a.nav)" in patched_html
+print("LIVE_HTML_REWRITE_OK",len(patched_html))
