@@ -1,0 +1,56 @@
+name: XAG net GBP broker transaction shadow reconciliation
+on:
+  pull_request:
+    paths:
+      - 'metals_xag_transaction_audit.py'
+      - 'test_metals_xag_transaction_audit.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/xag-transaction-audit.yml'
+  push:
+    branches: [recovery-pre-analysis-contract-20261010]
+    paths:
+      - 'metals_xag_transaction_audit.py'
+      - 'test_metals_xag_transaction_audit.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/xag-transaction-audit.yml'
+  workflow_dispatch:
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pure strict net-GBP accounting regressions
+        run: |
+          python -m py_compile metals_xag_transaction_audit.py test_metals_xag_transaction_audit.py metals_xag_live_wording_entrypoint.py
+          python -m unittest -v test_metals_xag_transaction_audit
+      - name: Broker-backed shadow transaction coverage with no order writes
+        if: github.event_name != 'pull_request'
+        run: |
+          python - <<'PY'
+          import json,urllib.request,time
+          url="https://metals-production-bb81.up.railway.app/api/metals-xag-transaction-audit"
+          for attempt in range(24):
+            try:
+              with urllib.request.urlopen(url,timeout=100) as r:
+                if r.status!=200:raise AssertionError('HTTP '+str(r.status))
+                d=json.load(r)
+              if not isinstance(d,dict) or 'version' not in d:
+                raise AssertionError('Malformed audit payload')
+              print('TRANSACTION_AUDIT_SUMMARY',json.dumps({k:d.get(k) for k in (
+                'ok','trade_ownership_verified','net_realised_gbp_verified','transaction_history_complete',
+                'broker_transaction_range_pages','transaction_id_span','broker_trade_count',
+                'broker_closed_xag_trades','transaction_count','relevant_events',
+                'broker_trade_cumulative_pl_verified','financial_components_gbp',
+                'realised_all_time_gbp','realised_month_gbp','realised_week_gbp',
+                'reconciliation_issues','blockers','error_type')}))
+              print('PASS: broker transaction audit collected; no totals promoted')
+              break
+            except Exception as exc:
+              print('Retry',attempt+1,type(exc).__name__,str(exc)[:120])
+              time.sleep(6)
+          else:raise SystemExit('FAIL: broker transaction shadow audit unavailable')
+          PY
