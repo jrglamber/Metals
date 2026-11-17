@@ -40,3 +40,23 @@ for path in ["/", "/dashboard", "/dashboard/top"]:
             if idx>=0:
                 print("HTML_EXCERPT",label,repr(html[max(0,idx-100):min(len(html),idx+520)]))
     except Exception as e:print("PATH_ERROR",path,str(e))
+
+print("DEEP_DASHBOARD_PROBE")
+for path in ("/dashboard", "/dashboard/top"):
+    try:
+        with urlopen(Request(BASE+path,headers={"Accept":"text/html,application/json"},method="GET"),timeout=30) as rr:
+            html=rr.read(1000000).decode("utf-8","replace")
+        if path.endswith("/top"):
+            import json
+            d=json.loads(html)
+            print("top_payload_type",type(d).__name__,"keys",list(d.keys())[:40])
+            for k,v in d.items():
+                if isinstance(v,dict):print("top_sub_keys",k,list(v.keys())[:45])
+            print("top_payload_prefix",repr(html[:1200]))
+        else:
+            for pat in ('id="topTiles"', "dashboard/top", "Basket High-Water", "Giveback"):
+                ix=html.find(pat)
+                if ix>=0:print("PROBE",pat,repr(html[max(0,ix-260):ix+1300]))
+            for m in re.finditer(r"[^\\n]{0,200}topTiles[^\\n]{0,200}",html):
+                print("TOP_JS",repr(m.group()[:550]))
+    except Exception as e: print("DEEP_ERR",path,type(e).__name__,str(e))
