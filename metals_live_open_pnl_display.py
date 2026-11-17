@@ -99,156 +99,125 @@ def reconcile(payload, max_age_seconds=120):
     }
 
 
-_SCRIPT = r'''
-<script id="pep-combined-live-metals-pnl-v2">
-(function() {
-  'use strict';
-  // Never climb from one KPI into the grid and overwrite another KPI.
-  // Legacy Giveback has a composite value like "£58.81 · 95.2%": treating
-  // that as non-money previously made the lookup climb into the NAV card.
-  function text(el) {
-    return String(el.textContent || '').replace(/\s+/g,' ').trim();
-  }
-  function metricTitle(t) {
-    return /^(?:NAV|Broker P&L(?: · LIVE XAU \+ XAG SHORT)?|Open P&L(?: · LIVE XAU \+ XAG SHORT)?|High[- ]Water(?: · LIVE XAU \+ XAG SHORT)?|Giveback(?: · LIVE XAU \+ XAG SHORT)?|This Week|This Month|Open Trades|48h\+ Trades|Signal Health|Signals|Candidate Support)$/i.test(t);
-  }
-  function metricValue(t) {
-    return /^(?:[-+]?£|£-)[\d,]+(?:\.\d+)?(?:\s*[·•]\s*\d+(?:\.\d+)?%)?$/.test(t) || /^[—–-]$/.test(t);
-  }
-  function findTile(labelPattern) {
-    var nodes=Array.from(document.querySelectorAll('body *')).filter(function(el) {
-      return !el.children.length && labelPattern.test(text(el));
-    });
-    for(var i=0;i<nodes.length;i++) {
-      var node=nodes[i], parent=node.parentElement;
-      for(var depth=0;parent && depth<6;depth++,parent=parent.parentElement) {
-        var leaves=Array.from(parent.querySelectorAll('*')).filter(function(el) {
-          return !el.children.length;
-        });
-        // An ancestor containing another KPI title is never this card.
-        if(leaves.some(function(el) { return el!==node && metricTitle(text(el)); })) break;
-        var amounts=leaves.filter(function(el) {
-          return el!==node && (el.getAttribute('data-pep-metal-money')==='1' ||
-                               metricValue(text(el)));
-        });
-        if(amounts.length===1) return {label:node,amount:amounts[0],tile:parent};
-        if(amounts.length>1) break;
-      }
-    }
-    return null;
-  }
-  function fmtMoney(value) {
-    return (value < 0 ? '-£' : '£') + Math.abs(value).toLocaleString('en-GB',{
-      minimumFractionDigits:2, maximumFractionDigits:2
-    });
-  }
-  function fmtWhen(value) {
-    return value ? String(value).replace('T',' ').slice(0,16) + ' UTC' : 'unknown';
-  }
-  function valid(value) {
-    return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
-  }
-  function note(tile, text, match) {
-    var els=Array.from(tile.tile.querySelectorAll('*')).filter(function(el) {
-      return !el.children.length && el !== tile.label && el !== tile.amount &&
-        match.test((el.textContent||'').trim());
-    });
-    var n=els[0];
-    if(n) n.textContent=text;
-  }
-  function paint(tile, label, value, color) {
-    if(!tile)return;
-    tile.label.textContent=label;
-    tile.amount.setAttribute('data-pep-metal-money','1');
-    tile.amount.textContent=value === null ? '—' : fmtMoney(value);
-    tile.amount.style.color=value === null ? '#fbbf24' : color;
-  }
-  function apply(snap) {
-    var broker=findTile(/^(Broker P&L|Open P&L · LIVE XAU \+ XAG SHORT)$/i);
-    var hwm=findTile(/^(High-Water|High water)( · LIVE XAU \+ XAG SHORT)?$/i);
-    var give=findTile(/^(Giveback)( · LIVE XAU \+ XAG SHORT)?$/i);
-    var verified=!!(snap && snap.ok);
-    var pnl=verified && valid(snap.open_pnl_gbp) ? Number(snap.open_pnl_gbp) : null;
-    paint(broker,'Broker P&L · LIVE XAU + XAG SHORT',pnl,
-      pnl !== null && pnl < 0 ? '#f87171' : '#4ade80');
-    if(broker)note(broker,pnl === null ?
-      'Combined broker data unavailable — no previous figure reused' :
-      'XAU + XAG SHORT broker-verified '+fmtWhen(snap.observed_at_utc)+
-      ' · Realised remains XAU-only',/LIVE Metals open P&L|LIVE XAU \+ XAG SHORT|Realised £/i);
+def live_snapshot(core):
+    """Same broker-verified combined proof for the API and top dashboard."""
+    try:
+        from metals_dashboard_clean_entrypoint import live_metals_open_positions
+        snapshot = reconcile(live_metals_open_positions())
+        try:
+            from metals_combined_observed_hwm import observe
+            snapshot.update(observe(core, snapshot))
+        except Exception as exc:
+            snapshot.update({
+                "high_water_status": "UNAVAILABLE",
+                "high_water_gbp": None, "high_water_at_utc": None,
+                "high_water_tracking_started_at_utc": None,
+                "giveback_gbp": None, "giveback_pct": None,
+                "high_water_error": f"{type(exc).__name__}: {exc}"[:160],
+            })
+        return snapshot
+    except Exception as exc:
+        return {
+            "ok": False, "version": VERSION, "scope": SCOPE,
+            "open_pnl_gbp": None, "high_water_status": "UNAVAILABLE",
+            "high_water_gbp": None, "giveback_gbp": None,
+            "xau_open_pnl_gbp": None, "xag_short_open_pnl_gbp": None,
+            "observed_at_utc": None,
+            "reason": f"{type(exc).__name__}: {exc}"[:220],
+            "broker_writes": False,
+        }
 
-    var peakOK=verified && snap.high_water_status === 'OBSERVED_COMBINED_LIVE' &&
-      valid(snap.high_water_gbp) && valid(snap.giveback_gbp);
-    var peak=peakOK ? Number(snap.high_water_gbp) : null;
-    var given=peakOK ? Number(snap.giveback_gbp) : null;
-    paint(hwm,'High-Water · LIVE XAU + XAG SHORT',peak,'#4ade80');
-    paint(give,'Giveback · LIVE XAU + XAG SHORT',given,
-      given !== null && given > 0 ? '#f87171' : '#4ade80');
-    if(hwm)note(hwm,peakOK ?
-      'Combined peak observed since '+fmtWhen(snap.high_water_tracking_started_at_utc)+
-      ' · peaked '+fmtWhen(snap.high_water_at_utc) :
-      'Combined peak tracking unavailable · XAU protection unchanged',
-      /(?:\d+(?:\.\d+)?R|LIVE Metals|XAU \+ XAG SHORT)/i);
-    if(give)note(give,peakOK ?
-      'Combined open P&L below observed peak'+
-      (valid(snap.giveback_pct)?' · '+Number(snap.giveback_pct).toFixed(1)+'%':'')+
-      ' · XAU protection unchanged' :
-      'Combined giveback unavailable · XAU protection unchanged',
-      /(?:\d+(?:\.\d+)?R|XAU \+ XAG SHORT|giveback)/i);
-  }
-  var active=false;
-  async function refresh() {
-    if(active)return;
-    active=true;
-    try {
-      var response=await fetch('/api/live-metals-open-pnl',{cache:'no-store'});
-      if(!response.ok) throw Error('HTTP '+response.status);
-      apply(await response.json());
-    } catch(err) { apply({ok:false}); }
-    finally { active=false; }
-  }
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', refresh);
-  else refresh();
-  setInterval(refresh,10000);
-})();
-</script>
-'''
 
-def inject_html(html):
-    """Inject only once into a full HTML dashboard response."""
-    text = str(html)
-    if 'pep-combined-live-metals-pnl-v2' not in text:
-        text = text.replace("</body>", _SCRIPT + "\n</body>", 1) if "</body>" in text else text + _SCRIPT
-    return text
+def project_dashboard_top(payload, proof):
+    """Project LIVE XAU+XAG accounting into the presentation-only top endpoint.
+
+    Preserve the full XAU-only producer strategy separately. Do not project
+    historical realised or XAU protection state as combined financials.
+    Missing broker proof must never fall back to seemingly valid XAU-only totals.
+    """
+    import copy
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return payload
+    out = copy.deepcopy(payload)
+    original = out.get("strategy")
+    if not isinstance(original, dict):
+        raise ValueError("Live Metals top strategy missing")
+    out["xau_only_strategy"] = copy.deepcopy(original)
+    s = out["strategy"]
+    verified = (isinstance(proof, dict) and proof.get("ok") is True
+                and proof.get("scope") == SCOPE)
+    s["headline_pnl"] = _number(proof.get("open_pnl_gbp")) if verified else None
+    s["open_pnl"] = s["headline_pnl"]
+    s["open_trades"] = _count(proof.get("open_count")) if verified else None
+    s["xau_count"] = _count(proof.get("xau_count")) if verified else None
+    s["xag_short_count"] = _count(proof.get("xag_short_count")) if verified else None
+    peak = bool(verified and proof.get("high_water_status") == "OBSERVED_COMBINED_LIVE")
+    s["high_water_gbp"] = _number(proof.get("high_water_gbp")) if peak else None
+    s["high_water_time"] = proof.get("high_water_at_utc") if peak else None
+    s["high_water_tracking_started_at_utc"] = (
+        proof.get("high_water_tracking_started_at_utc") if peak else None)
+    s["giveback_gbp"] = _number(proof.get("giveback_gbp")) if peak else None
+    s["giveback_pct"] = _number(proof.get("giveback_pct")) if peak else None
+    # Never reinterpret an XAU-only R multiple as XAU + XAG portfolio R.
+    for key in ("basket_r", "high_water_r", "giveback_r"):
+        s[key] = None
+    s["combined_reporting_status"] = (
+        "BROKER_VERIFIED" if peak else "HWM_UNAVAILABLE" if verified
+        else "BROKER_UNVERIFIED")
+    s["combined_reporting_reason"] = (
+        None if peak else str(proof.get("high_water_error") or
+                              proof.get("reason") or "Combined Metals proof unavailable")[:180])
+    s["combined_reporting_scope"] = SCOPE
+    s["realised_scope"] = "XAU_ONLY_XAG_LEDGER_PENDING"
+    out["combined_metals_source"] = "/api/live-metals-open-pnl"
+    return out
+
+
+# Replace the *existing* dashboard renderer's labels, not its live execution
+# model, so /dashboard/top remains the single writer of all visible KPI cards.
+# The legacy renderer fetches /dashboard/top and then replaces #topTiles using
+# innerHTML. A separate late-running DOM patch causes races and cross-card edits.
+_TOP_RENDER_REPLACEMENTS = (
+    ("card('Broker P&L',money(s.headline_pnl),", 
+     "card('Broker P&L · LIVE XAU + XAG SHORT',money(s.headline_pnl),"),
+    ("LIVE Metals open P&L · Realised ",
+     "Combined broker-verified · Realised XAU-only "),
+    ("card('High-Water',money(s.high_water_gbp),",
+     "card('High-Water · LIVE XAU + XAG SHORT',money(s.high_water_gbp),"),
+    ("DOLLAR{Number(s.high_water_r||0).toFixed(2)}R · ",
+     "Combined observed peak · "),
+    (" · LIVE MetalsDOLLAR{", " · XAU protection separateDOLLAR{"),
+    ("card('Giveback',DOLLAR{money(s.giveback_gbp)}",
+     "card('Giveback · LIVE XAU + XAG SHORT',DOLLAR{money(s.giveback_gbp)}"),
+    ("DOLLAR{Number(s.giveback_r||0).toFixed(2)}R",
+     "From combined observed peak · XAU protection separate"),
+    ("DOLLAR{Number(s.giveback_pct||0).toFixed(1)}%",
+     "DOLLAR{s.giveback_pct==null?'unavailable':Number(s.giveback_pct).toFixed(1)+'%'}"),
+    ("card('Open Trades',eh(s.open_trades||0),",
+     "card('Open Trades',s.open_trades==null?'—':eh(s.open_trades),"),
+    ("LIVE Metals · local DOLLAR{eh(s.local_open_trades||0)}",
+     "LIVE XAU DOLLAR{eh(s.xau_count==null?'—':s.xau_count)} · LIVE XAG SHORT DOLLAR{eh(s.xag_short_count==null?'—':s.xag_short_count)}"),
+    ("Oldest DOLLAR{eh(s.oldest_hold||0)}h",
+     "XAU only · Oldest DOLLAR{eh(s.oldest_hold||0)}h"),
+)
+
+
+def rewrite_dashboard_html(html):
+    if "async function loadTop(force=false)" not in html:
+        raise ValueError("Metals top renderer signature changed")
+    result = html
+    for find, replace in _TOP_RENDER_REPLACEMENTS:
+        find, replace = find.replace("DOLLAR", "$"), replace.replace("DOLLAR", "$")
+        if find not in result:
+            raise ValueError("Metals top renderer contract missing: " + find[:80])
+        result = result.replace(find, replace, 1)
+    return result
 
 
 def install(app, core):
     @app.get("/api/live-metals-open-pnl")
     def live_metals_open_pnl():
-        try:
-            from metals_dashboard_clean_entrypoint import live_metals_open_positions
-            snapshot = reconcile(live_metals_open_positions())
-            try:
-                from metals_combined_observed_hwm import observe
-                snapshot.update(observe(core, snapshot))
-            except Exception as exc:
-                # A database outage must not corrupt broker-verified open P&L.
-                snapshot.update({
-                    "high_water_status": "UNAVAILABLE",
-                    "high_water_gbp": None, "high_water_at_utc": None,
-                    "high_water_tracking_started_at_utc": None,
-                    "giveback_gbp": None, "giveback_pct": None,
-                    "high_water_error": f"{type(exc).__name__}: {exc}"[:160],
-                })
-            return snapshot
-        except Exception as exc:
-            return {
-                "ok": False, "version": VERSION, "scope": SCOPE,
-                "open_pnl_gbp": None, "high_water_status": "UNAVAILABLE",
-                "high_water_gbp": None, "giveback_gbp": None, "xau_open_pnl_gbp": None,
-                "xag_short_open_pnl_gbp": None, "observed_at_utc": None,
-                "reason": f"{type(exc).__name__}: {exc}"[:220],
-                "broker_writes": False,
-            }
+        return live_snapshot(core)
     # analysis_entrypoint already mounted core.app at "/" before this wrapper
     # installs late routes. Starlette would send /api/live-metals-open-pnl
     # straight to that catch-all mount (404). Put this API route first, as the
