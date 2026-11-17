@@ -68,3 +68,50 @@ def verify(audit,now=None,max_age_seconds=900):
         "broker_transaction_count":int(audit["transaction_count"]),
         **fields,
     }
+
+
+def apply_top(payload, proof):
+    """Extend the existing XAU top-card data with separately proven XAG cash.
+
+    XAU campaign protection, positions, broker NAV and the original XAU-only
+    realised source remain untouched. Fail closed if a value is not present.
+    """
+    import copy
+    if not isinstance(payload,dict) or payload.get("status")!="ok":
+        return payload
+    out=copy.deepcopy(payload)
+    strat=out.get("strategy") or {}
+    accounting=out.get("accounting") or {}
+    if not isinstance(strat,dict) or not isinstance(accounting,dict):
+        raise ValueError("Metals top realised schema missing")
+    out["xau_only_accounting"]=copy.deepcopy(accounting)
+    strat["xag_realised_verified"]=False
+    strat["realised_scope"]="XAU_ONLY_XAG_LEDGER_PENDING"
+    if not isinstance(proof,dict) or proof.get("ok") is not True:
+        return out
+    fields=(
+        ("realized_pnl","realised_all_time_gbp",strat),
+        ("week_pnl","realised_week_gbp",accounting),
+        ("month_pnl","realised_month_gbp",accounting),
+    )
+    projected={}
+    for target,source,record in fields:
+        base=finite(record.get(target))
+        incremental=finite(proof.get(source))
+        if base is None or incremental is None:
+            raise ValueError("Metals realised top source missing " + target)
+        projected[target]=round(base+incremental,4)
+    strat["xau_only_realized_pnl"]=strat["realized_pnl"]
+    strat["realized_pnl"]=projected["realized_pnl"]
+    accounting["week_pnl"]=projected["week_pnl"]
+    accounting["month_pnl"]=projected["month_pnl"]
+    # Some renderer variants omit today's realised, so only modify if present.
+    for today_key in ("today_pnl","realized_today_pnl"):
+        if today_key in accounting:
+            today_base=finite(accounting[today_key])
+            if today_base is not None:
+                accounting[today_key]=round(today_base+proof["realised_today_gbp"],4)
+    strat["xag_realised_verified"]=True
+    strat["realised_scope"]="XAU_LEGACY_PLUS_XAG_SHORT_NET_BROKER_VERIFIED"
+    out["xag_short_verified_realised"]=dict(proof)
+    return out
