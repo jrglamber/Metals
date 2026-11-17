@@ -1,0 +1,17 @@
+name: Metals dashboard public DOM probe
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/metals-live-ui-probe.yml'
+      - 'probe_metals_public_dom.py'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python probe_metals_public_dom.py
