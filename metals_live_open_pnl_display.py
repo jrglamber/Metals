@@ -103,18 +103,36 @@ _SCRIPT = r'''
 <script id="pep-combined-live-metals-pnl-v2">
 (function() {
   'use strict';
+  // Never climb from one KPI into the grid and overwrite another KPI.
+  // Legacy Giveback has a composite value like "£58.81 · 95.2%": treating
+  // that as non-money previously made the lookup climb into the NAV card.
+  function text(el) {
+    return String(el.textContent || '').replace(/\\s+/g,' ').trim();
+  }
+  function metricTitle(t) {
+    return /^(?:NAV|Broker P&L(?: · LIVE XAU \\+ XAG SHORT)?|Open P&L(?: · LIVE XAU \\+ XAG SHORT)?|High[- ]Water(?: · LIVE XAU \\+ XAG SHORT)?|Giveback(?: · LIVE XAU \\+ XAG SHORT)?|This Week|This Month|Open Trades|48h\\+ Trades|Signal Health|Signals|Candidate Support)$/i.test(t);
+  }
+  function metricValue(t) {
+    return /^(?:[-+]?£|£-)[\\d,]+(?:\\.\\d+)?(?:\\s*[·•]\\s*\\d+(?:\\.\\d+)?%)?$/.test(t) || /^[—–-]$/.test(t);
+  }
   function findTile(labelPattern) {
-    var nodes = Array.from(document.querySelectorAll('body *')).filter(function(el) {
-      return !el.children.length && labelPattern.test(String(el.textContent || '').trim());
+    var nodes=Array.from(document.querySelectorAll('body *')).filter(function(el) {
+      return !el.children.length && labelPattern.test(text(el));
     });
-    for (var i=0; i<nodes.length; i++) {
+    for(var i=0;i<nodes.length;i++) {
       var node=nodes[i], parent=node.parentElement;
-      for (var depth=0; parent && depth<6; depth++,parent=parent.parentElement) {
-        var amounts=Array.from(parent.querySelectorAll('*')).filter(function(el) {
-          return !el.children.length && (el.getAttribute('data-pep-metal-money')==='1' ||
-            /^(?:[-+]?£|£-)[\d,]+(?:\.\d+)?$/.test((el.textContent||'').trim()));
+      for(var depth=0;parent && depth<6;depth++,parent=parent.parentElement) {
+        var leaves=Array.from(parent.querySelectorAll('*')).filter(function(el) {
+          return !el.children.length;
         });
-        if (amounts.length) return {label:node, amount:amounts[0], tile:parent};
+        // An ancestor containing another KPI title is never this card.
+        if(leaves.some(function(el) { return el!==node && metricTitle(text(el)); })) break;
+        var amounts=leaves.filter(function(el) {
+          return el!==node && (el.getAttribute('data-pep-metal-money')==='1' ||
+                               metricValue(text(el)));
+        });
+        if(amounts.length===1) return {label:node,amount:amounts[0],tile:parent};
+        if(amounts.length>1) break;
       }
     }
     return null;
