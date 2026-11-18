@@ -24,6 +24,7 @@ def seed(path):
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE metals_xau_live_runtime_state (key TEXT,value TEXT,updated_at_utc TEXT)")
         conn.execute("INSERT INTO metals_xau_live_runtime_state(key,value) VALUES('accounting_epoch_utc','2026-10-14T09:00:00+00:00')")
+        conn.execute("INSERT INTO metals_xau_live_runtime_state(key,value,updated_at_utc) VALUES('broker_transaction_cursor','99','2026-11-18T14:55:00+00:00')")
         conn.execute("CREATE TABLE metals_xau_live_broker_transactions (transaction_id TEXT,transaction_time TEXT,transaction_type TEXT,instrument TEXT,pl_gbp REAL,financing_gbp REAL,net_realized_gbp REAL,synced_at_utc TEXT)")
         conn.executemany("INSERT INTO metals_xau_live_broker_transactions VALUES(?,?,?,?,?,?,?,?)",[
             ('111','2026-11-15T22:30:00+00:00','ORDER_FILL','XAU_USD',5,0,5,'2026-11-18T14:00:00+00:00'),
@@ -93,6 +94,14 @@ class ExportTests(unittest.TestCase):
         m=self.archive()
         self.assertFalse(m['combined_cash_totals_available'])
         self.assertEqual(m['xau']['invalid_transaction_ids'],['112'])
+
+    def test_stale_broker_cursor_blocks_combined_numbers(self):
+        with self.core.get_conn() as conn:
+            conn.execute("UPDATE metals_xau_live_runtime_state SET updated_at_utc='2026-11-17T07:00:00Z' WHERE key='broker_transaction_cursor'")
+        m=self.archive()
+        self.assertFalse(m['combined_cash_totals_available'])
+        self.assertFalse(m['xau']['transaction_sync_fresh_within_15_minutes'])
+        self.assertIsNone(m['this_week_net_gbp'])
 
     def test_mismatching_xag_proof_is_rejected(self):
         def mismatch(core):
