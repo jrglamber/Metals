@@ -17,6 +17,7 @@ import metals_xag_live_independent_override as live_xag_health
 import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_live_open_pnl_display as combined_open_pnl
+import metals_reporting_snapshot as authoritative_reporting
 from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
@@ -127,17 +128,23 @@ class XagLiveWordingMiddleware:
                 try:
                     top_payload = json.loads(body.decode("utf-8"))
                     if isinstance(top_payload, dict) and top_payload.get("status") == "ok":
-                        broker_proof = combined_open_pnl.live_snapshot(core)
+                        # Top cards and Hub now share the same broker-observed
+                        # snapshot and explicit cash/risk verification status.
+                        report = authoritative_reporting.snapshot(core)
+                        broker_proof = report["combined"]
                         top_payload = combined_open_pnl.project_dashboard_top(top_payload, broker_proof)
-                        from metals_xag_realised_verified import verify as verify_xag_cash, apply_top
-                        from metals_xag_transaction_audit import snapshot as xag_cash_snapshot
-                        try:
-                            xag_realised_proof = verify_xag_cash(xag_cash_snapshot(core))
-                        except Exception as xag_exc:
-                            xag_realised_proof = {
-                                "ok": False, "reason_type": type(xag_exc).__name__
-                            }
-                        top_payload = apply_top(top_payload, xag_realised_proof)
+                        from metals_xag_realised_verified import apply_top
+                        cash = report["cash"]
+                        top_payload = apply_top(top_payload, cash["proof"] if cash["ok"]
+                                                else {"ok": False})
+                        top_payload["metals_reporting_snapshot"] = {
+                            "version": report["version"],
+                            "generated_at_utc": report["generated_at_utc"],
+                            "complete": report["complete"],
+                            "cash_status": cash["status"],
+                            "risk_status": report["risk"]["status"],
+                            "open_status": "BROKER_VERIFIED" if report["ok"] else "UNVERIFIED",
+                        }
                         body = json.dumps(top_payload, separators=(",", ":"), default=str).encode("utf-8")
                 except Exception as exc:
                     # Fail visibly rather than allowing legacy XAU-only top
@@ -199,6 +206,19 @@ class XagLiveWordingMiddleware:
 
         await self.inner(scope, receive, capture)
 
+
+# Canonical producer-owned GET contract consumed by both top cards and Hub.
+# Each sub-snapshot retains its own age and confidence; never fabricate zeros.
+@app.get("/api/live-metals-reporting-snapshot")
+def live_metals_reporting_snapshot():
+    return authoritative_reporting.snapshot(core)
+
+REPORTING_SNAPSHOT_ROUTE = promote_read_only_route(
+    app, "/api/live-metals-reporting-snapshot", live_metals_reporting_snapshot
+)
+print("METALS_REPORTING_SNAPSHOT_ROUTE " +
+      json.dumps({"installed": REPORTING_SNAPSHOT_ROUTE, "version": authoritative_reporting.VERSION}),
+      flush=True)
 
 # Read-only lane-accounting probe. Do not expose partial totals as authoritative.
 @app.get("/api/live-metals-lane-accounting")
