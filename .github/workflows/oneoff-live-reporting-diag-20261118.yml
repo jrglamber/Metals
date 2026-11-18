@@ -1,0 +1,50 @@
+name: Read-only Metals reporting incident diagnostic 2026-11-18
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oneoff-live-reporting-diag-20261118.yml']
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect broker reporting endpoints without exposing trade identifiers
+        run: |
+          python - <<'PY'
+          import json,urllib.request,time
+          M="https://metals-production-bb81.up.railway.app"
+          H="https://project-exit-plan-portfolio-hub-production.up.railway.app"
+          def read(base,path):
+              t=time.monotonic()
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+path,headers={"Accept":"application/json","User-Agent":"reporting-incident-readonly"}),timeout=12) as r:
+                      d=json.load(r)
+                  return d,round(time.monotonic()-t,2)
+              except Exception as e:
+                  return {"exception":type(e).__name__,"details":str(e)[:160]},round(time.monotonic()-t,2)
+          for n in range(2):
+              print("SAMPLE",n)
+              for base,path in [(M,"/api/live-xau-open-positions"),(M,"/api/live-metals-open-positions"),(M,"/api/live-metals-open-pnl"),(M,"/api/live-metals-lane-accounting"),(M,"/api/metals-xag-transaction-audit"),(M,"/api/portfolio-risk"),(M,"/dashboard/top"),(H,"/api/aggregate")]:
+                  d,duration=read(base,path)
+                  if path=="/api/aggregate":
+                      m=((d.get("sources") or {}).get("metals") or {}).get("data") or {}; b=m.get("basket") or {}; acc=m.get("accounting") or {}; p=d.get("portfolio") or {}
+                      selected={"broker_verification":b.get("live_positions_status"),"position_error":b.get("live_positions_error"),"positions":b.get("open_trades"),"pnl_gbp":b.get("pnl_gbp"),"peak_status":b.get("combined_high_water_status"),"peak_error":b.get("combined_high_water_error"),"scope":acc.get("realised_scope"),"month_realised":acc.get("realised_month_gbp"),"week_realised":acc.get("realised_week_gbp"),"lane_status":acc.get("lane_reporting_status"),"risk_count":m.get("live_risk_open_trade_count"),"stop_scope":p.get("live_stop_floor_scope_status")}
+                  elif path=="/dashboard/top":
+                      s=d.get("strategy") or {}; selected={"status":d.get("status"),"scope":s.get("combined_reporting_scope"),"combined_status":s.get("combined_reporting_status"),"combined_reason":s.get("combined_reporting_reason"),"open_trades":s.get("open_trades"),"headline_pnl":s.get("headline_pnl"),"high_water":s.get("high_water_gbp"),"realised":s.get("realized_pnl"),"xag_cash_verified":s.get("xag_realised_verified")}
+                  elif path=="/api/portfolio-risk":
+                      selected={k:d.get(k) for k in ("ok","scope","open_trade_count","quantified_trade_count","unquantified_trade_count","stale","cached","error")}
+                      selected["by_instrument"]={k:{a:v.get(a) for a in ("open_trade_count","quantified_trade_count","without_stop_trade_count")} for k,v in (d.get("by_instrument") or {}).items()}
+                  elif path=="/api/live-metals-open-positions":
+                      selected={k:d.get(k) for k in ("ok","partial","xau_ok","xag_ok","xau_count","xag_count","count","xau_error","xag_error","observed_at_utc")}
+                  elif path=="/api/live-metals-open-pnl":
+                      selected={k:d.get(k) for k in ("ok","reason","high_water_error","high_water_status","open_count","open_pnl_gbp","high_water_gbp")}
+                  elif path=="/api/live-xau-open-positions":
+                      selected={k:d.get(k) for k in ("ok","scope","count","error")}
+                  elif path=="/api/live-metals-lane-accounting":
+                      selected={k:d.get(k) for k in ("ok","reporting_status","error","xag_short_net_gbp_verified","xag_short_verification_error")}
+                  else:
+                      selected={k:d.get(k) for k in ("ok","error_type","audit_refresh_in_progress","verified_proof_age_seconds","net_realised_gbp_verified","transaction_history_complete","retry_delay_seconds")}
+                  print(path,round(duration,2),json.dumps(selected,default=str)[:1000])
+              if n==0:time.sleep(5)
+          PY
