@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import os
 import threading
+import math
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-VERSION = "metals_xau_intrahour_broker_stops_v2_2026_10_07"
+VERSION = "metals_xau_intrahour_broker_stops_v3_2026_11_18"
 DEFAULT_POLL_SECONDS = 5.0
 MIN_HOLD_CANDLES = 48
 
@@ -76,6 +78,25 @@ def _safe_stop_write_failure_detail(written: Dict[str, Any]) -> Dict[str, str]:
             if isinstance(child, dict):
                 visit.append((f"{prefix}.{name}", child))
     return detail
+
+
+def _xau_broker_stop_price(price: Optional[float], side: str) -> Optional[float]:
+    """Align XAU_USD stop with OANDA's 3-decimal display precision.
+
+    For a short buy-stop, round upward; for a long sell-stop, round downward.
+    Rounding away from the market avoids accidentally crossing a live price
+    and never claims more protection than the unrounded strategy candidate.
+    """
+    if price is None or side not in {"long", "short"}:
+        return None
+    try:
+        number = float(price)
+        if not math.isfinite(number) or number <= 0:
+            return None
+        direction = ROUND_CEILING if side == "short" else ROUND_FLOOR
+        return float(Decimal(str(number)).quantize(Decimal("0.001"), rounding=direction))
+    except (ValueError, TypeError, ArithmeticError):
+        return None
 
 
 def install(core: Any, app: Any) -> Dict[str, Any]:
@@ -295,9 +316,14 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 if not cand.get("eligible"):
                     summary["unchanged"] += 1
                     continue
-                stop_price = _f(core, cand.get("stop_price"))
+                raw_stop_price = _f(core, cand.get("stop_price"))
                 current_price = _f(core, metrics.get("current_price"))
                 side = _s(core, metrics.get("side") or work.get("side") or "long").lower()
+                stop_price = _xau_broker_stop_price(raw_stop_price, side)
+                if stop_price is not None:
+                    # The writer consumes cand["stop_price"] when building the
+                    # OANDA replacement order.  Never send excess precision.
+                    cand["stop_price"] = stop_price
                 if stop_price is None or stop_price <= 0 or current_price is None or current_price <= 0:
                     summary["errors"] += 1
                     integrity(
