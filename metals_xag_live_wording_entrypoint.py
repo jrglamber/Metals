@@ -263,6 +263,15 @@ def live_metals_lane_accounting():
             xag_cash = verify_xag_cash(xag_cash_snapshot(core))
             result["xag_short_verified_realised"] = xag_cash
             result["xag_short_net_gbp_verified"] = True
+            result["xag_short_ledger_audit"]["net_gbp_broker_transactions_verified"] = True
+            result["missing_reconciliation_requirements"] = [
+                "authoritative_xau_broker_transaction_history_coverage",
+                "xau_long_short_net_gbp_per_lane_attribution",
+            ]
+            result["coverage_warning"] = (
+                "XAG SHORT net GBP broker cash verified; "
+                "XAU LONG/SHORT historical per-side split remains unverified"
+            )
             result["reporting_status"] = "xag_short_net_verified_xau_split_pending"
         except Exception as xag_exc:
             result["xag_short_net_gbp_verified"] = False
