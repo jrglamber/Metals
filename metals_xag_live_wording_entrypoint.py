@@ -21,6 +21,15 @@ from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
 
+# Research-only observer recovery; no execution policy or broker authority.
+import metals_ai_observer_resilience as ai_observer_resilience
+try:
+    METALS_AI_OBSERVER_RECOVERY = ai_observer_resilience.install(core)
+    print("METALS_AI_OBSERVER_RECOVERY " + json.dumps(METALS_AI_OBSERVER_RECOVERY, default=str), flush=True)
+except Exception as ai_observer_exc:
+    METALS_AI_OBSERVER_RECOVERY = {"installed": False, "error_type": type(ai_observer_exc).__name__}
+    print("METALS_AI_OBSERVER_RECOVERY " + json.dumps(METALS_AI_OBSERVER_RECOVERY), flush=True)
+
 MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
 MANUAL_XAU_HWM_SYNC_INSTALL = campaign_hwm_sync.install(core, app)
 COMBINED_OPEN_PNL_INSTALL = combined_open_pnl.install(app, core)
