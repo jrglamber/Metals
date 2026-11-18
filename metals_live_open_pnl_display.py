@@ -210,6 +210,17 @@ def rewrite_dashboard_html(html):
         if find not in result:
             raise ValueError("Metals top renderer contract missing: " + find[:80])
         result = result.replace(find, replace, 1)
+    # The original Metals renderer's money(null) was £0.00 because
+    # Number(null) === 0. For UNKNOWN combined broker figures this is
+    # financially misleading. Zero is only valid when the API says 0.
+    money_code="function money(v){const n=Number(v);"
+    if money_code not in result:
+        raise ValueError("Metals money formatter changed; null guard missing")
+    result=result.replace(
+        money_code,
+        "function money(v){if(v==null||v==='')return '—';const n=Number(v);",
+        1,
+    )
     return result
 
 
