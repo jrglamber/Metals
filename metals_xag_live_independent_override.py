@@ -13,6 +13,7 @@ from typing import Any, Dict
 
 import metals_strategy_governance_override as governance
 import xag_short_live_override as live
+import xag_local_reconciliation_watchdog as reconcile_watchdog
 
 VERSION = "metals_xag_independent_live_short_v1_2026_11_12"
 SIGNAL_MAX_AGE_MINUTES = 30
@@ -195,6 +196,7 @@ def health(core: Any) -> Dict[str, Any]:
         "practice_basket_required": False,
         "one_unit_pilot": True,
         "read_only": True,
+        "broker_local_reconciliation_watchdog": reconcile_watchdog.health(),
     }
 
 
@@ -256,6 +258,13 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         recovered = {"ok": False, "reason": f"startup_reconcile_error:{type(exc).__name__}"}
     print("XAG_LIVE_RECOVERY " + json.dumps({k:v for k,v in recovered.items()
           if k not in ("unlinked_broker_xag_ids",)}, default=str), flush=True)
+    # Startup alone is insufficient: a broker trade can close hours later
+    # without another eligible signal triggering _reconcile. Continue the
+    # existing broker-authoritative reconciliation automatically once a minute.
+    watchdog = reconcile_watchdog.start(core)
+    print("XAG_LOCAL_RECONCILE_WATCHDOG " +
+          json.dumps({k:watchdog.get(k) for k in ("installed","thread_alive","reason","version")}),
+          flush=True)
     return {
         "installed": True, "version": VERSION, "entry_scope": "XAG_SHORT_ONLY",
         "practice_orders_for_xag_short": False,
@@ -265,6 +274,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "max_open": live.MAX_OPEN,
         "startup_reconcile": recovered.get("ok"),
         "startup_recovered_historical": recovered.get("recovered_historical_live_count", 0),
+        "periodic_broker_reconciliation": watchdog.get("thread_alive") is True,
     }
 
 
