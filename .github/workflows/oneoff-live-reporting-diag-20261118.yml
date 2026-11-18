@@ -47,6 +47,12 @@ jobs:
               rows=l["rows"]
               print("LOCAL_LINKS",len(rows),"STATUSES",dict(Counter(str(x.get("status")) for x in rows)),
                     "ACTIVE",sum(x.get("status") in ("OPEN","OPEN_UNVERIFIED_STOP","CLOSE_RETRY") for x in rows))
+          req=urllib.request.Request(M+"/dashboard",headers={"User-Agent":"reporting-incident-readonly","Accept":"text/html"})
+          with urllib.request.urlopen(req,timeout=12) as resp:
+              html=resp.read().decode("utf-8","replace")
+          for term in ("card('This Week'","card('This Month'","card('Broker P&L","card('High-Water'","card('Giveback'","function money("):
+              pos=html.find(term)
+              print("HTML_SIGNATURE",term,"found",pos>=0,"snippet",html[pos:pos+370].replace("\\n"," ") if pos>=0 else "")
           for n in range(2):
               print("SAMPLE",n)
               for base,path in [(M,"/api/live-xau-open-positions"),(M,"/api/live-metals-open-positions"),(M,"/api/live-metals-open-pnl"),(M,"/api/live-metals-lane-accounting"),(M,"/api/metals-xag-transaction-audit"),(M,"/api/portfolio-risk"),(M,"/dashboard/top"),(H,"/api/aggregate")]:
