@@ -115,6 +115,28 @@ def _capture(core):
             "giveback_gbp": None, "reason_type": type(exc).__name__,
         }
 
+
+    # Use the *same* reconciled broker population for XAG open R. The XAG
+    # ledger stores the actual initial GBP risk per fill; it is not the
+    # separately reported current-stop capital-at-risk.
+    try:
+        from metals_xag_live_basket_r import project as project_xag_r
+        with core.get_conn() as conn:
+            xag_links = [dict(row) for row in conn.execute(
+                """SELECT broker_trade_id, status, estimated_risk_amount
+                   FROM metals_xag_live_trade_links
+                   WHERE status IN ('OPEN','OPEN_UNVERIFIED_STOP','CLOSE_RETRY')"""
+            ).fetchall()]
+        report["xag_short_open_basket"] = project_xag_r(
+            report["positions"], report["combined"], xag_links)
+    except Exception as exc:
+        report["xag_short_open_basket"] = {
+            "ok": False, "scope": "LIVE_XAG_SHORT_OPEN_INITIAL_RISK",
+            "current_r": None, "open_pnl_gbp": None,
+            "status": "UNVERIFIED", "reason_type": type(exc).__name__,
+            "broker_writes": False,
+        }
+
     try:
         raw_cash = cash_snapshot(core)
         verified_cash = verify(raw_cash)
