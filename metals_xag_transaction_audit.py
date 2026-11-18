@@ -22,9 +22,11 @@ TX_RANGE_SIZE = 300
 CACHE_SECONDS = 180  # Successful full-history proof is expensive (many broker pages).
 FAIL_CACHE_SECONDS = 30  # Retry a first transient failure within 30 seconds.
 MAX_FAIL_CACHE_SECONDS = 300  # Back off during an extended OANDA outage.
+MAX_VERIFIED_PROOF_AGE_SECONDS = 480  # Never serve an older full-history result.
 _cache = None
 _at = 0.0
 _consecutive_failures = 0
+_refreshing = False
 _lock = threading.Lock()
 
 
@@ -346,31 +348,80 @@ def audit_live(core):
     }
 
 
-def snapshot(core):
-    global _cache, _at, _consecutive_failures
-    with _lock:
-        cache_age = time.monotonic() - _at
-        retry_delay = min(MAX_FAIL_CACHE_SECONDS,
-                          FAIL_CACHE_SECONDS * (2 ** max(0, _consecutive_failures - 1)))
-        limit = CACHE_SECONDS if (_cache or {}).get("ok") is True else retry_delay
-        if _cache is not None and cache_age < limit:
-            return dict(_cache)
+def _refresh_snapshot(core):
+    """Perform all expensive OANDA broker GETs outside the API request/lock."""
+    global _cache, _at, _consecutive_failures, _refreshing
+    try:
         try:
             result = audit_live(core)
         except Exception as exc:
-            result = {"ok":False, "version":VERSION,
-                      "net_realised_gbp_verified":False,
-                      "transaction_history_complete":False,
-                      "reconciliation_issues":["producer_unavailable"],
-                      "error_type":type(exc).__name__}
-        if result.get("ok") is True:
-            _consecutive_failures = 0
-        else:
-            _consecutive_failures += 1
-            result["retry_delay_seconds"] = min(
-                MAX_FAIL_CACHE_SECONDS,
-                FAIL_CACHE_SECONDS * (2 ** max(0, _consecutive_failures - 1)))
+            result = {"ok": False, "version": VERSION,
+                      "net_realised_gbp_verified": False,
+                      "transaction_history_complete": False,
+                      "reconciliation_issues": ["producer_unavailable"],
+                      "error_type": type(exc).__name__}
+        if not isinstance(result, dict):
+            result = {"ok": False, "version": VERSION,
+                      "error_type": "InvalidAuditResult"}
+        result = dict(result)
         result["time_utc"] = datetime.now(timezone.utc).isoformat()
-        _cache = dict(result)
-        _at = time.monotonic()
-        return result
+        with _lock:
+            if result.get("ok") is True:
+                _consecutive_failures = 0
+            else:
+                _consecutive_failures += 1
+                result["retry_delay_seconds"] = min(
+                    MAX_FAIL_CACHE_SECONDS,
+                    FAIL_CACHE_SECONDS * (2 ** min(10, max(0, _consecutive_failures - 1))))
+            _cache = result
+            _at = time.monotonic()
+    finally:
+        with _lock:
+            _refreshing = False
+
+
+def snapshot(core):
+    """Nonblocking latest broker-verified cash proof, never a fabricated total.
+
+    The full audit can read 33+ OANDA transaction pages and exceed the Hub's
+    five-second request deadline. Refresh in one daemon worker while returning
+    the last time-stamped proof for at most eight minutes; initial/cold state,
+    expired proof, and failed audits stay unverified. Trading is unaffected.
+    """
+    global _refreshing
+    now = time.monotonic()
+    with _lock:
+        cache = dict(_cache) if _cache is not None else None
+        age = max(0, now - _at) if cache is not None else None
+        retry_delay = min(
+            MAX_FAIL_CACHE_SECONDS,
+            FAIL_CACHE_SECONDS * (2 ** min(10, max(0, _consecutive_failures - 1))))
+        refresh_due = (cache is None or age >=
+                       (CACHE_SECONDS if cache.get("ok") is True else retry_delay))
+        if refresh_due and not _refreshing:
+            _refreshing = True
+            threading.Thread(
+                target=_refresh_snapshot, args=(core,),
+                name="metals-xag-net-gbp-readonly-audit",
+                daemon=True,
+            ).start()
+        in_progress = _refreshing
+        if cache is not None and cache.get("ok") is True and age <= MAX_VERIFIED_PROOF_AGE_SECONDS:
+            # The original timestamp is never replaced with now. Hub freshness
+            # and XAG broker-cash scope verification remain mandatory.
+            cache["audit_refresh_in_progress"] = in_progress
+            cache["verified_proof_age_seconds"] = round(age, 2)
+            return cache
+        if cache is not None and cache.get("ok") is False and not refresh_due:
+            cache["audit_refresh_in_progress"] = in_progress
+            return cache
+        return {
+            "ok": False, "version": VERSION,
+            "net_realised_gbp_verified": False,
+            "transaction_history_complete": False,
+            "error_type": "AUDIT_REFRESHING" if in_progress else "AUDIT_PROOF_EXPIRED",
+            "audit_refresh_in_progress": in_progress,
+            "last_verified_time_utc": (cache or {}).get("time_utc")
+                                    if (cache or {}).get("ok") is True else None,
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+        }
