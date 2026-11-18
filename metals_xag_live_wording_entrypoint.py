@@ -18,6 +18,7 @@ import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_live_open_pnl_display as combined_open_pnl
 import metals_reporting_snapshot as authoritative_reporting
+import metals_live_analysis_export as live_analysis_export
 from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
@@ -64,6 +65,10 @@ execution_contract._STALE_REPLACEMENTS = _existing + tuple(
 )
 
 _HTML_REPLACEMENTS = (
+    (
+        'href="/export/metals-research.zip">⬇ Metals Analysis ZIP',
+        'href="/export/metals-live-analysis.zip">⬇ Live Metals Analysis ZIP',
+    ),
     (
         "XAU LONG + XAU SHORT live · XAG demo/research",
         "XAU LONG + XAU SHORT + XAG SHORT live · XAG LONG research-only",
@@ -337,6 +342,13 @@ XAG_TRANSACTION_AUDIT_ROUTE = promote_read_only_route(
     app, "/api/metals-xag-transaction-audit", metals_xag_transaction_audit_endpoint
 )
 print("METALS_XAG_TRANSACTION_AUDIT_ROUTE " + str(XAG_TRANSACTION_AUDIT_ROUTE), flush=True)
+
+# Read-only LIVE cash/weekly export. The older demo/research routes remain
+# available at their original URLs but no longer masquerade as Live Analysis.
+LIVE_ANALYSIS_EXPORT_INSTALL = live_analysis_export.install(
+    app, core, promote_read_only_route
+)
+print("METALS_LIVE_ANALYSIS_EXPORT " + json.dumps(LIVE_ANALYSIS_EXPORT_INSTALL), flush=True)
 
 app.add_middleware(XagLiveWordingMiddleware)
 
