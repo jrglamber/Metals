@@ -87,6 +87,98 @@ def xag_stack_diagnostic(live):
         "note":"Lifetime ordinal cohorts are DESCRIPTIVE, NOT proof that the live +2R gate improves ROI. Link R excludes any financing not present on the link."
     }
 
+def xag_demo_plus_2r_gate(research):
+    """Indicative historical entry-admission gate on DEMO, not live execution.
+
+    Uses only information timestamped before each entry; a 5-minute embargo
+    avoids processing a same-signal basket observation after the hypothetical
+    decision. This is a one-pass no-feedback diagnostic (not an equity replay).
+    """
+    from bisect import bisect_right
+    from datetime import timedelta
+    all_links=rows(research,"metals-demo-broker-links.csv")
+    links=[]
+    for r in all_links:
+        if r.get("asset")!="XAGUSD" or str(r.get("side") or "").lower()!="short":
+            continue
+        opened=timestamp(r.get("created_at_utc"))
+        if not opened:continue
+        r=dict(r)
+        r["_opened"]=opened
+        r["_closed"]=timestamp(r.get("closed_at_utc"))
+        links.append(r)
+    links.sort(key=lambda r:r["_opened"])
+    snaps=[]
+    for r in rows(research,"metals-demo-basket-snapshots.csv"):
+        if r.get("asset")!="XAGUSD" or str(r.get("side") or "").lower()!="short" or r.get("scope")!="ASSET_SIDE":
+            continue
+        stamp=timestamp(r.get("created_at_utc"))
+        R=num(r.get("basket_r"))
+        if stamp and R is not None:
+            snaps.append((stamp,R))
+    snaps.sort(key=lambda x:x[0])
+    snap_times=[v[0] for v in snaps]
+    cycles=[]
+    cycle_start=None
+    cycle_ordinal=0
+    eligible=[]
+    blocked=[]
+    passed=[]
+    missing=0
+    max_ordinal=0
+    live_before=0
+    for r in links:
+        now=r["_opened"]
+        existing=[p for p in cycles if p["_opened"]<now and
+                  (p["_closed"] is None or p["_closed"]>now)]
+        if not existing:
+            cycles=[]
+            cycle_start=now
+            cycle_ordinal=0
+        cycle_ordinal+=1
+        max_ordinal=max(max_ordinal,cycle_ordinal)
+        if cycle_ordinal>20:
+            idx=bisect_right(snap_times,now-timedelta(minutes=5))-1
+            valid=idx>=0 and timedelta(0)<=now-snaps[idx][0]<=timedelta(hours=4)
+            banked=0.0
+            banked_valid=True
+            for prior in cycles:
+                if prior["_closed"] and prior["_closed"]<=now:
+                    pnl=num(prior.get("realized_pl"))
+                    risk=num(prior.get("estimated_risk_amount"))
+                    if pnl is None or risk is None or risk<=0:
+                        banked_valid=False
+                    else: banked+=pnl/risk
+            actual_pnl=num(r.get("realized_pl"))
+            actual_risk=num(r.get("estimated_risk_amount"))
+            actual_r=actual_pnl/actual_risk if actual_pnl is not None and actual_risk and actual_risk>0 else None
+            if not valid or not banked_valid:
+                missing+=1
+            else:
+                proxy_R=snaps[idx][1]+banked
+                (passed if proxy_R>=2 else blocked).append(actual_r)
+                eligible.append(proxy_R)
+        cycles.append(r)
+    return {
+        "source":"PRACTICE XAG Short entries joined to prior DEMO basket-R snapshots",
+        "demo_xag_short_entries":len(links),
+        "max_reconstructed_campaign_ordinal":max_ordinal,
+        "post_20_with_fresh_prior_R_proxy":len(passed)+len(blocked),
+        "post_20_unknown_funding":missing,
+        "pass_plus_2r_proxy":len(passed),
+        "blocked_plus_2r_proxy":len(blocked),
+        "passed_actual_subsequent_closed_r":stats(passed),
+        "blocked_actual_subsequent_closed_r":stats(blocked),
+        "observed_proxy_funding_r":stats(eligible),
+        "can_claim_live_counterfactual_return":False,
+        "model":"latest pre-entry demo side basket R + prior closed trade R (not exact XAU banked-harvest definition)",
+        "biases":["demo policy and entries differ from live",
+                  "no-feedback: blocked entries would change subsequent basket states",
+                  "historical demo basket observations can be incomplete",
+                  "risk and financing estimates differ from broker full cash proof"],
+    }
+
+
 def xag_demo_exit_study(research):
     r=rows(research,"metals-exit-challenger-shadow.csv")
     subset=[x for x in r if x.get("asset")=="XAGUSD" and x.get("side","").lower()=="short"]
@@ -227,6 +319,7 @@ def main():
         "baseline_realised_this_month_gbp":m.get("this_month_net_gbp"),
         "baseline_realised_all_time_gbp":m.get("all_time_net_gbp"),
         "xag_plus_2r_stacking":xag_stack_diagnostic(live),
+        "xag_plus_2r_demo_gate":xag_demo_plus_2r_gate(research),
         "xag_basket_harvest":xag_demo_exit_study(research),
         "combined_family_profit_lock":combined_cash_study(live),
         "trading_changes":False,
