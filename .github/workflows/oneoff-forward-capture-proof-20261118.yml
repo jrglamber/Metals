@@ -1,4 +1,5 @@
 name: One-off forward Metals capture verification
+# Re-read recorded rows after first production capture
 on:
   push:
     branches: [main]
