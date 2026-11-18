@@ -1,0 +1,19 @@
+name: XAU intrahour stop write diagnostics
+on:
+  pull_request:
+    paths:
+      - 'metals_intrahour_exit_override.py'
+      - 'test_metals_xau_stop_write_diagnostics.py'
+  push:
+    branches: [fix/xau-short-stop-write-diagnostics-20261118]
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile metals_intrahour_exit_override.py
+      - run: python -m unittest -v test_metals_xau_stop_write_diagnostics
