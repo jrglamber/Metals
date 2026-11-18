@@ -52,8 +52,18 @@ def check():
                         float(account["balance"])+float(account["unrealized_pl"]),
                         abs_tol=0.06):
         raise AssertionError("Account NAV corrupted by combined giveback")
-    if s["realized_pnl"] != xau["realized_pnl"]:
-        raise AssertionError("XAU historical realised unexpectedly changed")
+    # The displayed total legitimately includes separately broker-verified
+    # XAG Short net cash. The XAU-only baseline must remain intact.
+    xag_cash=top.get("xag_short_verified_realised") or {}
+    if (s.get("xag_realised_verified") is not True or
+            xag_cash.get("ok") is not True or
+            xag_cash.get("scope") != "XAG_SHORT_BROKER_NET_CASH_GBP"):
+        raise AssertionError("Broker-verified XAG Short realised cash missing")
+    expected=float(xau["realized_pnl"])+float(xag_cash["realised_all_time_gbp"])
+    if not math.isclose(float(s["realized_pnl"]),expected,abs_tol=0.03):
+        raise AssertionError("Displayed realised must equal unchanged XAU plus verified XAG net GBP")
+    if s.get("xau_only_realized_pnl") != xau.get("realized_pnl"):
+        raise AssertionError("XAU-only realised baseline was not preserved")
     if xau.get("high_water_gbp") is None:
         raise AssertionError("XAU protection HWM lost")
     # The source API and top endpoint are separate broker snapshots; only
