@@ -107,10 +107,37 @@ def xag_demo_exit_study(research):
             "actual_r":stats([v for _,v in a]),"delta_r":stats(diffs),
             "challenger_won_pairs":sum(h>v for h,v in a),
             "actual_won_pairs":sum(h<v for h,v in a)}
+    # Pair like-for-like challenger outcomes for the SAME underlying demo link.
+    # A shadow-vs-actual comparison is not necessarily today's MFE25 live policy:
+    # label the historical actual exit policy and isolate matched candidates.
+    actual_policy_by_challenger=defaultdict(Counter)
+    by_link=defaultdict(dict)
+    for x in subset:
+        name=x.get("challenger") or "UNKNOWN"
+        ap=x.get("actual_policy") or "UNKNOWN"
+        actual_policy_by_challenger[name][ap]+=1
+        key=str(x.get("link_id") or "")
+        hypo=num(x.get("hypothetical_exit_r"))
+        if key and hypo is not None and str(x.get("paired_complete","")).strip().lower() in ("1","true","yes"):
+            by_link[key][name]=hypo
+    heads={}
+    for a,b in [("MFE_GIVEBACK_25","ATR2_CHANDELIER"),
+                ("MFE_GIVEBACK_25","MFE_GIVEBACK_50"),
+                ("ATR2_CHANDELIER","MFE_GIVEBACK_50")]:
+        matched=[d[a]-d[b] for d in by_link.values() if a in d and b in d]
+        heads[a+"_minus_"+b]={"paired_candidates":len(matched),
+                             "delta_r":stats(matched),
+                             "a_wins":sum(v>0 for v in matched),
+                             "b_wins":sum(v<0 for v in matched)}
     bs=rows(research,"metals-demo-basket-snapshots.csv")
     xag=[x for x in bs if x.get("asset")=="XAGUSD" and
          (x.get("side") or "").upper()=="SHORT"]
     by_scope=Counter((x.get("scope") or "UNKNOWN") for x in xag)
+    group_max=defaultdict(float)
+    for x in xag:
+        name=str(x.get("basket_key") or "UNKNOWN")
+        val=num(x.get("high_water_r"))
+        if val is not None:group_max[name]=max(group_max[name],val)
     vals=[num(x.get("basket_r")) for x in xag]
     vals=[x for x in vals if x is not None]
     hws=[num(x.get("high_water_r")) for x in xag]
@@ -120,7 +147,12 @@ def xag_demo_exit_study(research):
         "all_demo_xag_short_shadow_rows":len(subset),
         "challenger_rows":dict(counts.most_common(25)),
         "paired_exit_r_comparisons":paired_results,
+        "historical_actual_policy_by_challenger": {
+            k:dict(v.most_common(12)) for k,v in actual_policy_by_challenger.items()},
+        "same_demo_link_exit_policy_head_to_head":heads,
         "xag_demo_basket_snapshots":len(xag),"scopes":dict(by_scope),
+        "distinct_basket_keys":len(group_max),
+        "basket_key_peak_at_least_30r":sum(v>=30 for v in group_max.values()),
         "demo_basket_r":stats(vals),"demo_high_water_r":stats(hws),
         "demo_snapshot_exceedance_not_independent_harvests":{
             f"{n}R":sum(x>=n for x in hws) for n in (10,20,30,40,50,80)},
@@ -156,7 +188,8 @@ def combined_cash_study(live):
         "date_cash_peak":peak_day,
         "daily_cash_change":stats(day_returns),
         "xau_hwm_events":len(xau),
-        "combined_open_hwm":manifest.get("combined_open_basket_hwm"),
+        "combined_open_hwm":{k:v for k,v in (manifest.get("combined_open_basket_hwm") or {}).items()
+                             if k in ("started_at_utc","high_water_at_utc","high_water_gbp")},
         "can_exactly_replay_family_equity_lock":False,
         "limits":["realised-only series excludes floating XAU/XAG P&L",
                   "combined open HWM is a single peak and began 16 Nov",
