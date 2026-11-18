@@ -1,0 +1,58 @@
+name: Metals forward research capture reliability
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/metals-forward-capture-reliability.yml']
+  schedule:
+    - cron: '37 */2 * * *'
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Check forward samples, verified-cash continuity and worker health
+        run: |
+          python - <<'PY'
+          from datetime import datetime,timezone
+          import csv,io,json,urllib.request,zipfile
+          root="https://metals-production-bb81.up.railway.app"
+          def get(path):
+            request=urllib.request.Request(root+path,headers={"User-Agent":"PEP-Forward-Capture-Canary/1.0"})
+            with urllib.request.urlopen(request,timeout=45) as resp:
+              assert resp.status==200
+              return resp.read(16000000)
+          def age(x):
+            if not x:return None
+            d=datetime.fromisoformat(str(x).replace("Z","+00:00"))
+            if d.tzinfo is None:return None
+            return (datetime.now(timezone.utc)-d.astimezone(timezone.utc)).total_seconds()
+          health=json.loads(get("/api/metals-forward-economic-research/status"))
+          assert health.get("thread_alive") is True,"forward research worker stopped"
+          assert health.get("execution_authority") is False
+          assert health.get("broker_order_writes") is False
+          z=zipfile.ZipFile(io.BytesIO(get("/export/metals-live-analysis.zip")))
+          manifest=json.loads(z.read("manifest.json"))
+          proof=manifest.get("forward_capture") or {}
+          assert proof.get("version")=="metals_forward_economic_capture_v1_2026_11_18"
+          assert "live-metals-forward-economic-equity.csv" in z.namelist()
+          samples=list(csv.DictReader(io.TextIOWrapper(z.open("live-metals-forward-economic-equity.csv"),encoding="utf-8-sig")))
+          assert samples,"forward research has no persisted samples"
+          last=samples[-1]
+          latest=age(last.get("sampled_at_utc"))
+          print("LATEST",json.dumps({k:last.get(k) for k in
+            ("sampled_at_utc","status","reason","total_open_count","xag_funding_status","cash_broker_verified")}))
+          print("HEALTH",json.dumps({k:health.get(k) for k in
+            ("thread_alive","last_sample_at_utc","last_complete_at_utc","last_status","last_error_class")}))
+          assert latest is not None and -10<=latest<=1200,"forward capture stale for over 20 minutes"
+          complete=[r for r in samples if r.get("status")=="COMPLETE"]
+          assert complete,"no fully verified research samples captured"
+          last_complete=complete[-1]
+          for k in ("economic_equity_gbp","economic_high_water_gbp","economic_giveback_gbp"):
+            assert last_complete.get(k) not in ("",None),"complete sample missing "+k
+          gap=age(last_complete.get("sampled_at_utc"))
+          print("LAST_COMPLETE_AGE_SECONDS",gap,"SAMPLE_COUNT",len(samples),"COMPLETE_COUNT",len(complete))
+          assert gap is not None and -10<=gap<=3600,"no verified economic-equity sample for 60 minutes"
+          assert all(r.get("economic_equity_gbp") in (None,"") for r in samples if r.get("status")!="COMPLETE"),"unverified economic cash promoted"
+          print("PASS Metals forward research capture and independent proof consistency")
+          PY
