@@ -22,12 +22,12 @@ class Core:
         self.conn.execute("INSERT INTO metals_xau_live_broker_transactions VALUES('XAU_USD',12,-2,10)")
         self.conn.execute("""CREATE TABLE metals_xag_live_trade_links (
             broker_trade_id TEXT,created_at_utc TEXT,closed_at_utc TEXT,status TEXT,
-            realized_pl REAL,financing REAL,estimated_risk_amount REAL)""")
+            realized_pl REAL,estimated_risk_amount REAL)""")
         self.conn.execute("CREATE TABLE metals_xag_live_campaign_state (id INTEGER,start ed TEXT)") if False else None
         self.conn.execute("CREATE TABLE metals_xag_live_campaign_state (id INTEGER,started_at_utc TEXT)")
         self.conn.execute("INSERT INTO metals_xag_live_campaign_state VALUES(1,?)",(when.isoformat(),))
-        self.conn.execute("INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?,?)",
-            ("S1",when.isoformat(),None,"OPEN",None,None,2))
+        self.conn.execute("INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?)",
+            ("S1",when.isoformat(),None,"OPEN",None,2))
         self.conn.commit()
     def get_conn(self):
         return self.conn
@@ -125,8 +125,8 @@ class StudyTests(unittest.TestCase):
 
     def test_closed_link_banked_r_is_estimated_not_mislabelled_exact(self):
         self.core.conn.execute(
-            "INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?,?)",
-            ("S0",self.t.isoformat(),self.t.isoformat(),"CLOSED_RECONCILED",5,-0.1,2))
+            "INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?)",
+            ("S0",self.t.isoformat(),self.t.isoformat(),"CLOSED_RECONCILED",5,2))
         self.core.conn.commit()
         capture._capture(self.core,report(self.t),now=self.t)
         r=self.rows()[0]
@@ -138,7 +138,7 @@ class StudyTests(unittest.TestCase):
     def test_incomplete_closed_trade_financing_never_promoted_to_exact_r(self):
         self.core.conn.execute(
             "INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?,?)",
-            ("S0",self.t.isoformat(),self.t.isoformat(),"CLOSED",None,None,2))
+            ("S0",self.t.isoformat(),self.t.isoformat(),"CLOSED",None,2))
         self.core.conn.commit()
         capture._capture(self.core,report(self.t),now=self.t)
         row=self.rows()[0]
