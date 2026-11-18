@@ -41,12 +41,15 @@ class VerifiedRealisedTests(unittest.TestCase):
         self.assertEqual(t["strategy"]["realised_scope"],
             "XAU_LEGACY_PLUS_XAG_SHORT_NET_BROKER_VERIFIED")
 
-    def test_failed_verification_preserves_xau_only(self):
+    def test_failed_verification_preserves_xau_only_without_mislabeling_total(self):
         x=apply_top(top(),{"ok":False})
-        self.assertEqual(x["strategy"]["realized_pnl"],250.43)
-        self.assertEqual(x["accounting"]["week_pnl"],20.82)
+        self.assertIsNone(x["strategy"]["realized_pnl"])
+        self.assertIsNone(x["accounting"]["week_pnl"])
+        self.assertIsNone(x["accounting"]["month_pnl"])
+        self.assertEqual(x["xau_only_strategy"]["realized_pnl"],250.43)
+        self.assertEqual(x["xau_only_accounting"]["week_pnl"],20.82)
         self.assertFalse(x["strategy"]["xag_realised_verified"])
-        self.assertEqual(x["strategy"]["realised_scope"],"XAU_ONLY_XAG_LEDGER_PENDING")
+        self.assertEqual(x["strategy"]["realised_scope"],"COMBINED_METALS_CASH_UNVERIFIED")
 
     def test_no_double_add_across_source(self):
         src=top()
