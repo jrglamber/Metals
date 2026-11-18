@@ -1,0 +1,70 @@
+name: One-off canonical Metals and Hub reporting production verification
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oneoff-authoritative-report-verification.yml']
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Compare authoritative Metals contract and deployed Hub
+        run: |
+          python - <<'PY'
+          import json,time,urllib.request,datetime
+          M="https://metals-production-bb81.up.railway.app"
+          H="https://project-exit-plan-portfolio-hub-production.up.railway.app"
+          def get(base,path):
+            start=time.monotonic()
+            req=urllib.request.Request(base+path,headers={'Accept':'application/json','User-Agent':'PEP-authoritative-contract-probe'})
+            with urllib.request.urlopen(req,timeout=20) as resp:
+              assert resp.status==200
+              x=json.load(resp)
+            return x,round(time.monotonic()-start,2)
+          seen_good=False
+          for i in range(3):
+            m,mt=get(M,'/api/live-metals-reporting-snapshot')
+            h,ht=get(H,'/api/aggregate')
+            top,tt=get(M,'/dashboard/top')
+            src=((h.get('sources') or {}).get('metals') or {}).get('data') or {}
+            b=src.get('basket') or {}
+            a=src.get('accounting') or {}
+            p=h.get('portfolio') or {}
+            rp=src.get('live_metals_report') or {}
+            s=top.get('strategy') or {}
+            pos=m.get('positions') or {}
+            comb=m.get('combined') or {}
+            cash=m.get('cash') or {}
+            risk=m.get('risk') or {}
+            print('OBS',i,
+              json.dumps({'metals_http_seconds':mt,'hub_http_seconds':ht,'top_seconds':tt,
+                'contract':m.get('version'),
+                'position_count':pos.get('count'),'xau':pos.get('xau_count'),'xag_short':pos.get('xag_short_count'),
+                'position_ok':pos.get('ok'),'combined_ok':comb.get('ok'),
+                'peak_ok':comb.get('high_water_status'),'open_pnl':comb.get('open_pnl_gbp'),
+                'risk_status':risk.get('status'),'risk_count':(risk.get('data') or {}).get('quantified_trade_count'),
+                'cash_status':cash.get('status'),'cash_age':cash.get('observed_at_utc'),
+                'hub_contract':rp.get('version'),'hub_open_status':b.get('live_positions_status'),
+                'hub_open_count':b.get('open_trades'),'hub_risk_status':rp.get('risk_status'),
+                'hub_stop_scope':p.get('live_stop_floor_scope_status'),
+                'hub_cash_scope':a.get('realised_scope'),'hub_week':a.get('realised_week_gbp'),
+                'hub_month':a.get('realised_month_gbp'),
+                'top_cash_verified':s.get('xag_realised_verified'),'top_realised':s.get('realized_pnl')}))
+            assert m.get('version')=='metals_reporting_snapshot_v1_20261118'
+            assert rp.get('version')=='metals_reporting_snapshot_v1_20261118', "Hub did not consume new contract"
+            assert isinstance(m.get('generated_at_utc'),str)
+            assert all(isinstance(m.get(k),dict) for k in ('positions','combined','cash','risk'))
+            if a.get('realised_scope') == 'COMBINED_METALS_CASH_UNVERIFIED':
+              for fld in ('realised_week_gbp','realised_month_gbp','realised_all_time_gbp'):
+                assert a.get(fld) is None, "XAU-only fallback incorrectly promoted"
+            if pos.get('ok') and comb.get('ok') and risk.get('ok') and cash.get('ok'):
+              if (b.get('live_positions_status')=='BROKER_VERIFIED' and
+                  rp.get('risk_status')=='BROKER_POPULATION_MATCHED' and
+                  p.get('live_stop_floor_scope_status')=='COMPLETE' and
+                  a.get('xag_short_broker_net_verified') is True):
+                seen_good=True
+            if i<2:time.sleep(6)
+          assert seen_good,"No fully broker-verified Hub snapshot in 3 samples"
+          print("PASS fully verified canonical Metals producer -> Hub sample")
+          PY
