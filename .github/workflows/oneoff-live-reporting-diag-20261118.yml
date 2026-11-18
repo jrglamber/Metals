@@ -23,6 +23,30 @@ jobs:
                   return d,round(time.monotonic()-t,2)
               except Exception as e:
                   return {"exception":type(e).__name__,"details":str(e)[:160]},round(time.monotonic()-t,2)
+          # Additional aggregate-only ownership and audit diagnostics.
+          for path in ("/api/xag-short-live-health","/api/metals-xag-ledger-audit","/api/metals-xag-transaction-audit"):
+              d,t=read(M,path)
+              keys=("ok","execution_health","broker_open_short_count","tracked_open_count",
+                    "untracked_broker_count","orphan_local_count","unresolved_entry_intent_count",
+                    "trade_ownership_verified","local_broker_close_state_mismatch",
+                    "broker_closed_not_locally_closed","local_closed_not_broker_closed",
+                    "missing_local_trade_count","unlinked_broker_trade_count",
+                    "reporting_status","blockers","ownership_blockers",
+                    "reconciliation_issues","error_type","retry_delay_seconds","audit_refresh_in_progress")
+              print("OWNERSHIP",path,t,json.dumps({k:d.get(k) for k in keys if k in d},default=str)[:1600])
+              if path.endswith("health"):
+                  recent=d.get("recent_execution") or {}
+                  print("LAST_EXEC",json.dumps({k:recent.get(k) for k in ("action","status","reason","created_at_utc")})[:380])
+              if path.endswith("ledger-audit"):
+                  print("LEDGER_KEYS",sorted(d.keys()))
+          # Detect whether duplicate local XAG rows, stale OPEN rows, or truly
+          # unlinked broker trades explain the mismatch; never print account IDs.
+          l,t=read(M,"/api/xag-short-live-links")
+          if isinstance(l.get("rows"),list):
+              from collections import Counter
+              rows=l["rows"]
+              print("LOCAL_LINKS",len(rows),"STATUSES",dict(Counter(str(x.get("status")) for x in rows)),
+                    "ACTIVE",sum(x.get("status") in ("OPEN","OPEN_UNVERIFIED_STOP","CLOSE_RETRY") for x in rows))
           for n in range(2):
               print("SAMPLE",n)
               for base,path in [(M,"/api/live-xau-open-positions"),(M,"/api/live-metals-open-positions"),(M,"/api/live-metals-open-pnl"),(M,"/api/live-metals-lane-accounting"),(M,"/api/metals-xag-transaction-audit"),(M,"/api/portfolio-risk"),(M,"/dashboard/top"),(H,"/api/aggregate")]:
