@@ -19,6 +19,7 @@ import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_live_open_pnl_display as combined_open_pnl
 import metals_reporting_snapshot as authoritative_reporting
 import metals_live_analysis_export as live_analysis_export
+import metals_forward_economic_capture as forward_capture
 from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
 from metals_live_risk_entrypoint import core as core
@@ -349,6 +350,29 @@ LIVE_ANALYSIS_EXPORT_INSTALL = live_analysis_export.install(
     app, core, promote_read_only_route
 )
 print("METALS_LIVE_ANALYSIS_EXPORT " + json.dumps(LIVE_ANALYSIS_EXPORT_INSTALL), flush=True)
+
+# Independent research capture: one broker-backed sample every 5 minutes.
+# Worker never changes trades, execution gates or harvesting. Missing proofs
+# are recorded as UNKNOWN; no fabricated cash, open-R or historical points.
+@app.get("/api/metals-forward-economic-research/status")
+def metals_forward_research_status():
+    return forward_capture.health()
+
+FORWARD_RESEARCH_ROUTE = promote_read_only_route(
+    app, "/api/metals-forward-economic-research/status",
+    metals_forward_research_status
+)
+print("METALS_FORWARD_RESEARCH_ROUTE "+str(FORWARD_RESEARCH_ROUTE),flush=True)
+try:
+    FORWARD_RESEARCH_INSTALL = forward_capture.start(core)
+    print("METALS_FORWARD_RESEARCH_WORKER "+
+          json.dumps(FORWARD_RESEARCH_INSTALL,default=str),flush=True)
+except Exception as exc:
+    # Research failure MUST NOT prevent the live strategy from starting.
+    FORWARD_RESEARCH_INSTALL = {"thread_alive":False,
+                                "error_class":type(exc).__name__}
+    print("METALS_FORWARD_RESEARCH_START_ERROR "+
+          type(exc).__name__,flush=True)
 
 app.add_middleware(XagLiveWordingMiddleware)
 
