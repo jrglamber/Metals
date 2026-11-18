@@ -117,7 +117,7 @@ def _xag_funding(conn, positions, now):
     marks = []
     tracked = [dict(r) for r in conn.execute(
         "SELECT broker_trade_id,created_at_utc,closed_at_utc,status,"
-        "realized_pl,financing,estimated_risk_amount "
+        "realized_pl,estimated_risk_amount "
         "FROM metals_xag_live_trade_links"
     ).fetchall()]
     by_id = {str(r.get("broker_trade_id")): r for r in tracked if r.get("broker_trade_id")}
