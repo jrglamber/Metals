@@ -1,5 +1,5 @@
 name: One-off forward Metals capture verification
-# Re-read recorded rows after first production capture
+# Final verification of nonblocking recovery and complete broker audit
 on:
   push:
     branches: [main]
