@@ -112,6 +112,7 @@ def xag_demo_exit_study(research):
     # label the historical actual exit policy and isolate matched candidates.
     actual_policy_by_challenger=defaultdict(Counter)
     by_link=defaultdict(dict)
+    link_entry_time={}
     for x in subset:
         name=x.get("challenger") or "UNKNOWN"
         ap=x.get("actual_policy") or "UNKNOWN"
@@ -120,15 +121,29 @@ def xag_demo_exit_study(research):
         hypo=num(x.get("hypothetical_exit_r"))
         if key and hypo is not None and str(x.get("paired_complete","")).strip().lower() in ("1","true","yes"):
             by_link[key][name]=hypo
+            link_entry_time[key]=str(x.get("entry_time") or "")
     heads={}
     for a,b in [("MFE_GIVEBACK_25","ATR2_CHANDELIER"),
                 ("MFE_GIVEBACK_25","MFE_GIVEBACK_50"),
                 ("ATR2_CHANDELIER","MFE_GIVEBACK_50")]:
         matched=[d[a]-d[b] for d in by_link.values() if a in d and b in d]
-        heads[a+"_minus_"+b]={"paired_candidates":len(matched),
-                             "delta_r":stats(matched),
-                             "a_wins":sum(v>0 for v in matched),
-                             "b_wins":sum(v<0 for v in matched)}
+        chronological=sorted(
+            [(link_entry_time[k],d[a]-d[b]) for k,d in by_link.items()
+             if a in d and b in d],key=lambda x:x[0])
+        mid=len(chronological)//2
+        first=[v for _,v in chronological[:mid]]
+        second=[v for _,v in chronological[mid:]]
+        sd=statistics.stdev(matched) if len(matched)>1 else None
+        ci=(1.96*sd/math.sqrt(len(matched))) if sd is not None else None
+        heads[a+"_minus_"+b]={
+            "paired_candidates":len(matched),"delta_r":stats(matched),
+            "naive_independent_95pct_mean_delta_interval":
+                [round(statistics.mean(matched)-ci,4),
+                 round(statistics.mean(matched)+ci,4)] if ci is not None else None,
+            "earlier_half_delta_r":stats(first),
+            "later_half_delta_r":stats(second),
+            "a_wins":sum(v>0 for v in matched),
+            "b_wins":sum(v<0 for v in matched)}
     bs=rows(research,"metals-demo-basket-snapshots.csv")
     xag=[x for x in bs if x.get("asset")=="XAGUSD" and
          (x.get("side") or "").upper()=="SHORT"]
