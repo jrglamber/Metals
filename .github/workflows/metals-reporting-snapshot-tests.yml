@@ -1,0 +1,23 @@
+name: Authoritative Metals reporting snapshot acceptance
+on:
+  push:
+    branches: [recovery-pre-analysis-contract-20261010]
+    paths:
+      - 'metals_reporting_snapshot.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - 'test_metals_reporting_snapshot.py'
+      - '.github/workflows/metals-reporting-snapshot-tests.yml'
+  workflow_dispatch:
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Canonical reporting contract and zero broker execution
+        run: |
+          python -m py_compile metals_reporting_snapshot.py metals_xag_live_wording_entrypoint.py
+          python -m unittest -v test_metals_reporting_snapshot
