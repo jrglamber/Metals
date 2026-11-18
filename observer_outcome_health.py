@@ -1,11 +1,59 @@
 """Read-only observer capture health and forward market markouts."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def _date(value):
     if not value: return None
     try: return datetime.fromisoformat(str(value).replace("Z","+00:00")).astimezone(timezone.utc)
     except (ValueError,TypeError): return None
+
+
+def _eligible(row):
+    try:
+        return int(row.get("api_eligible") or 0) != 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _unresolved_recent_errors(rows, now):
+    """A prior failure is not a current incident after same-asset recovery.
+
+    RETRY_WAIT is a retry, not a final failure; the existing overdue check
+    handles retries stuck for more than three hours. Old errors remain counted
+    in history but do not trigger the RECENT_AI_ERRORS alarm.
+    """
+    completed_by_asset = {}
+    for row in rows:
+        if str(row.get("status") or "").upper() != "COMPLETE":
+            continue
+        asset = str(row.get("asset") or "UNKNOWN")
+        when = (_date(row.get("completed_at_utc")) or
+                _date(row.get("updated_at_utc")) or
+                _date(row.get("created_at_utc")))
+        if when and (asset not in completed_by_asset or when > completed_by_asset[asset]):
+            completed_by_asset[asset] = when
+
+    active = []
+    cutoff = now - timedelta(hours=24)
+    for row in rows[:100]:
+        if str(row.get("status") or "").upper() != "ERROR" or not _eligible(row):
+            continue
+        when = (_date(row.get("updated_at_utc")) or
+                _date(row.get("completed_at_utc")) or
+                _date(row.get("created_at_utc")))
+        if not when or when < cutoff:
+            continue
+        asset = str(row.get("asset") or "UNKNOWN")
+        recovered = completed_by_asset.get(asset)
+        if recovered and recovered >= when:
+            continue
+        active.append({
+            "asset": asset,
+            "failed_at_utc": when.isoformat(),
+            "http_status": row.get("last_http_status"),
+            "error_class": str(row.get("error") or "").split(":", 1)[0][:64],
+        })
+    return active
 
 def audit(core, table):
     now=datetime.now(timezone.utc)
@@ -20,7 +68,7 @@ def audit(core, table):
                 "table":table}
     latest=rows[0] if rows else None
     complete=next((r for r in rows if str(r.get("status")).upper()=="COMPLETE"),None)
-    eligible=next((r for r in rows if int(r.get("api_eligible") or 0)),None)
+    eligible=next((r for r in rows if _eligible(r)),None)
     def age(r,field):
         dt=_date(r.get(field)) if r else None
         return round((now-dt).total_seconds()/3600,2) if dt else None
@@ -29,14 +77,15 @@ def audit(core, table):
     eligible_age=age(eligible,"created_at_utc")
     recent=rows[:100]
     errors=[r for r in recent if str(r.get("status")).upper() in ("ERROR","RETRY_WAIT")]
-    pending=[r for r in rows if int(r.get("api_eligible") or 0)
+    active_errors = _unresolved_recent_errors(rows, now)
+    pending=[r for r in rows if _eligible(r)
              and str(r.get("status")).upper() not in ("COMPLETE","ERROR")
              and (age(r,"created_at_utc") or 0)>3]
     alerts=[]
     if capture_age is None or capture_age>4: alerts.append("CAPTURE_STALE")
     if pending: alerts.append("ELIGIBLE_CALL_OVERDUE")
-    if errors: alerts.append("RECENT_AI_ERRORS")
-    if eligible and (eligible_age or 999)<24 and (complete_age is None or complete_age>24):
+    if active_errors: alerts.append("RECENT_AI_ERRORS")
+    if eligible and eligible_age is not None and eligible_age<24 and (complete_age is None or complete_age>24):
         alerts.append("NO_COMPLETED_AI_CALL_DESPITE_RECENT_ELIGIBLE_EVENTS")
     # Market markout only; do not mistake price direction for realised bot P&L.
     prices=[]
@@ -63,6 +112,8 @@ def audit(core, table):
     return {"ok":not alerts,"research_only":True,"alerts":alerts,
             "capture_age_hours":capture_age,"latest_complete_age_hours":complete_age,
             "latest_eligible_age_hours":eligible_age,"error_count_recent_100":len(errors),
+            "active_ai_error_count":len(active_errors),
+            "active_ai_errors":active_errors[:5],
             "overdue_eligible_count":len(pending),"captured_rows":len(rows),
             "forward_24h":{"metric":"market_price_not_broker_trade_pnl",
                            "settled_count":len(outcomes),"recent":outcomes[-50:]}}
