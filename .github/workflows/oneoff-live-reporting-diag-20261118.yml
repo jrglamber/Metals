@@ -1,5 +1,5 @@
 name: Read-only Metals reporting incident diagnostic 2026-11-18
-# Recheck after broker-authoritative local closure repair and combined cash guards
+# Final steady-state read-only check after recovery regression deployment
 on:
   push:
     branches: [main]
