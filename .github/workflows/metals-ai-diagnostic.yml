@@ -20,7 +20,7 @@ jobs:
                   return r.read().decode('utf-8')
           try:
               d=json.loads(get(BASE+'/api/ai-observer/status'))
-              print('STATUS',json.dumps({k:d.get(k) for k in ('ok','alerts','capture_age_hours','latest_complete_age_hours','latest_eligible_age_hours','error_count_recent_100','overdue_eligible_count','ai_enabled','api_key_configured','model','thread_alive','worker_started','counts')},default=str))
+              print('STATUS',json.dumps({k:d.get(k) for k in ('ok','alerts','capture_age_hours','latest_complete_age_hours','latest_eligible_age_hours','error_count_recent_100','active_ai_error_count','overdue_eligible_count','ai_enabled','api_key_configured','model','thread_alive','worker_started','counts')},default=str))
           except Exception as e: print('STATUS_ERROR',type(e).__name__,str(e)[:100])
           try:
               rows=list(csv.DictReader(io.StringIO(get(BASE+'/export/ai-regime-observer.csv?limit=150'))))
