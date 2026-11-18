@@ -247,11 +247,58 @@ def build_bundle(core, xag_reader=None, now=None):
         _csv(zf,"live-xau-harvest-events.csv",
              _optional_records(core,"metals_xau_live_harvest_events"),
              ["created_at_utc","cycle_id","threshold_r","status","broker_trade_id","expected_upl_gbp","realized_pl_gbp","reason"])
+        # Forward-only research recorder: timestamped economic-equity path and
+        # all underlying LIVE broker marks, independent of demo history.
+        # A failed/empty capture is explicitly disclosed, never silently
+        # replaced by reconstructed or fabricated historical values.
+        forward_fields=[
+            "sampled_at_utc","source_generated_at_utc","status","reason",
+            "xau_open_count","xag_open_count","total_open_count",
+            "xag_campaign_epoch_utc","xag_campaign_entries","xag_open_r",
+            "xag_banked_r_proxy","xag_funding_r_proxy","xag_funding_status",
+            "xau_verified_since_epoch_gbp","xag_verified_lifetime_gbp",
+            "combined_realised_since_epochs_gbp","combined_open_pnl_gbp",
+            "family_campaign_id","family_bootstrap_partial",
+            "family_baseline_realised_gbp","realised_since_family_baseline_gbp",
+            "economic_equity_gbp","economic_high_water_gbp",
+            "economic_giveback_gbp","mark_to_market_complete",
+            "broker_population_matched","cash_broker_verified",
+            "position_marks_json","execution_authority"
+        ]
+        try:
+            from metals_forward_economic_capture import export_rows,VERSION as forward_version
+            forward = export_rows(core)
+            _csv(zf,"live-metals-forward-economic-equity.csv",forward,forward_fields)
+            manifest["forward_capture"]={
+                "version":forward_version,
+                "scope":"LIVE_METALS_FORWARD_SINCE_CAPTURE_DEPLOYMENT",
+                "status":"ACTIVE_WITH_COMPLETE_SAMPLES" if any(
+                    r.get("status")=="COMPLETE" for r in forward
+                ) else "NO_COMPLETE_SAMPLES_YET",
+                "sample_count":len(forward),
+                "complete_count":sum(r.get("status")=="COMPLETE" for r in forward),
+                "first_sample_utc":forward[0].get("sampled_at_utc") if forward else None,
+                "last_sample_utc":forward[-1].get("sampled_at_utc") if forward else None,
+                "captures_broker_marks_as_json":True,
+                "xag_banked_r_is_proxy_excluding_unattributed_financing":True,
+                "prior_history_backfilled":False,
+                "execution_authority":False,
+            }
+        except Exception as exc:
+            zf.writestr("live-metals-forward-economic-equity-unavailable.json",
+                json.dumps({"status":"UNAVAILABLE","reason_type":type(exc).__name__,
+                    "prior_history_backfilled":False,"execution_authority":False}))
+            manifest["forward_capture"]={
+                "status":"UNAVAILABLE","reason_type":type(exc).__name__,
+                "prior_history_backfilled":False,"execution_authority":False}
         zf.writestr("manifest.json",json.dumps(manifest,indent=2,default=str))
         zf.writestr("README.txt",("LIVE Metals analysis, not practice/demo. UTC events bucketed into Europe/London dates.\n"
           "XAU source = broker-synced XAU transaction ledger since its accounting epoch; verify separately before treating as independently complete lifetime history.\n"
           "XAG source = independently verified short-only OANDA cash attribution, including daily financing and fees.\n"
           "Partial/missing XAG cash proof -> BLANK combined amounts, NOT zero.\n"
+          "Forward economic-equity samples begin only when the research recorder is installed; no backfilled live portfolio history.\n"
+          "XAG campaign funding R is explicitly a trade-link proxy, which excludes unallocated broker financing.\n"
+          "Position marks for future counterfactual replays are JSON within the forward-equity CSV.\n"
           "No live order placement, exits, stake sizing, or other trading changes.\n"))
     return zip_mem.getvalue(), manifest
 
