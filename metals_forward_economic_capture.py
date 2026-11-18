@@ -225,6 +225,19 @@ def _capture(core, report, now=None):
             xau_cash = None
         row["xau_verified_since_epoch_gbp"] = xau_cash
         if good_positions:
+            # Preserve each XAU trade's original live risk basis alongside its
+            # broker mark, so future integer-trade basket replay is possible.
+            try:
+                xau_risks = {
+                    str(r["broker_trade_id"]): _number(r["estimated_risk_amount"])
+                    for r in conn.execute(
+                        "SELECT broker_trade_id,estimated_risk_amount "
+                        "FROM metals_xau_live_trade_links "
+                        "WHERE UPPER(COALESCE(status,'')) IN ('OPEN','OPEN_UNVERIFIED_STOP','CLOSE_RETRY')"
+                    ).fetchall()
+                }
+            except Exception:
+                xau_risks = {}
             xag = _xag_funding(conn,p,now)
             row.update({"xag_campaign_epoch_utc":xag.get("epoch"),
                 "xag_campaign_entries":xag.get("count"),
@@ -235,14 +248,18 @@ def _capture(core, report, now=None):
             by_id = {str(m["trade_id"]):m for m in xag.get("marks") or []}
             for t in p.get("trades") or []:
                 if t.get("instrument") == "XAU_USD":
-                    by_id[str(t.get("broker_trade_id"))] = {
-                        "trade_id":str(t.get("broker_trade_id")),
+                    tid=str(t.get("broker_trade_id"))
+                    risk_basis=xau_risks.get(tid)
+                    upl=_number(t.get("unrealized_gbp"))
+                    by_id[tid] = {
+                        "trade_id":tid,
                         "instrument":"XAU_USD","side":t.get("side"),
                         "opened_at_utc":t.get("opened_at_utc"),
                         "units":t.get("units"),"entry_price":t.get("entry_price"),
-                        "unrealized_gbp":_number(t.get("unrealized_gbp")),
-                        "estimated_risk_gbp":None,
-                        "current_r":None,"stop_price":t.get("stop_price")}
+                        "unrealized_gbp":upl,
+                        "estimated_risk_gbp":risk_basis,
+                        "current_r":round(upl/risk_basis,6) if risk_basis and upl is not None and risk_basis>0 else None,
+                        "stop_price":t.get("stop_price")}
             # If XAG R isn't calculable, still preserve raw observed marks.
             if len(by_id) != int(p.get("count") or 0):
                 for t in p.get("trades") or []:
