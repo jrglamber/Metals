@@ -128,8 +128,11 @@ def build_bundle(core, xag_reader=None, now=None):
         try:
             epoch_row = conn.execute("SELECT value FROM metals_xau_live_runtime_state WHERE key='accounting_epoch_utc'").fetchone()
             epoch = str(dict(epoch_row).get("value")) if epoch_row else None
+            cursor_row = conn.execute("SELECT updated_at_utc FROM metals_xau_live_runtime_state WHERE key='broker_transaction_cursor'").fetchone()
+            cursor_synced_at = str(dict(cursor_row).get("updated_at_utc")) if cursor_row else None
         except Exception:
             epoch = None
+            cursor_synced_at = None
         try:
             combined_hwm = conn.execute(
                 "SELECT started_at_utc,high_water_gbp,high_water_at_utc FROM metals_combined_live_pnl_observed_hwm WHERE id=1"
@@ -175,7 +178,10 @@ def build_bundle(core, xag_reader=None, now=None):
         xag_error = type(exc).__name__ + ": " + str(exc)
         xag, xag_proof = [], None
 
-    xau_good = not invalid_xau and bool(epoch) and _dt(epoch) is not None
+    cursor_dt = _dt(cursor_synced_at)
+    cursor_age = (now-cursor_dt).total_seconds() if cursor_dt is not None else None
+    xau_fresh = bool(cursor_age is not None and 0 <= cursor_age <= 900)
+    xau_good = not invalid_xau and bool(epoch) and _dt(epoch) is not None and xau_fresh
     xag_good = xag_proof is not None
     complete = bool(xau_good and xag_good)
     net_xau = _cash(sum(r["net_realized_gbp"] for r in xau)) if xau_good else None
@@ -198,6 +204,9 @@ def build_bundle(core, xag_reader=None, now=None):
         "xau": {"scope": "LIVE_XAU_LONG_PLUS_SHORT_AGGREGATE",
                 "source": "metals_xau_live_broker_transactions (owned XAU broker transactions only)",
                 "accounting_epoch_utc": epoch, "event_count": len(xau),
+                "broker_cursor_last_synced_at_utc": cursor_synced_at,
+                "broker_cursor_age_seconds": round(cursor_age,1) if cursor_age is not None else None,
+                "transaction_sync_fresh_within_15_minutes": xau_fresh,
                 "invalid_transaction_ids": invalid_xau[:25], "accounting_epoch_valid": xau_good,
                 "all_time_since_epoch_gbp": net_xau,
                 "historical_broker_backfill_before_epoch_verified": False,
