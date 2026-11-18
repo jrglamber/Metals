@@ -24,6 +24,7 @@ FAIL_CACHE_SECONDS = 30  # Retry a first transient failure within 30 seconds.
 MAX_FAIL_CACHE_SECONDS = 300  # Back off during an extended OANDA outage.
 MAX_VERIFIED_PROOF_AGE_SECONDS = 480  # Never serve an older full-history result.
 _cache = None
+_export_events = None  # Private, timestamp-bound; excluded from existing public audit API.
 _at = 0.0
 _consecutive_failures = 0
 _refreshing = False
@@ -65,6 +66,9 @@ def transaction_financials(transactions, links, broker_trades, now=None):
     if len(ids)!=len(links) or len(owned)!=len(ids):
         issues.add("broker_trade_ownership_incomplete")
     seen_tx = set()
+    # Retain only attributed, verified cash movements for the private export.
+    # No trade IDs, account identifiers or raw OANDA payloads are exported.
+    cash_events = []
     daily = defaultdict(lambda:Decimal("0"))
     components = defaultdict(lambda:Decimal("0"))
     event_count = defaultdict(int)
@@ -216,6 +220,8 @@ def transaction_financials(transactions, links, broker_trades, now=None):
             continue
 
         if amount:
+            cash_events.append({"transaction_time_utc": event_time.isoformat(),
+                                "transaction_type": kind, "net_realized_gbp": round(float(amount), 6)})
             net+=amount
             components["net_gbp"]+=amount
             # Transaction timestamp gives correct week/month for partial and
@@ -244,6 +250,7 @@ def transaction_financials(transactions, links, broker_trades, now=None):
         "transaction_count":len(seen_tx),
         "relevant_events":dict(event_count),
         "reconciliation_issues":sorted(issues),
+        "cash_events": cash_events if not issues else [],
         "broker_trade_cumulative_pl_verified": "order_fill_pl_mismatch_broker_trade_history" not in issues and len(cumulative)==len(ids),
         "financial_components_gbp":{k:round(float(v),4) for k,v in components.items()},
         "realised_today_gbp":round(float(daily["today"]),4) if not issues else None,
@@ -350,7 +357,7 @@ def audit_live(core):
 
 def _refresh_snapshot(core):
     """Perform all expensive OANDA broker GETs outside the API request/lock."""
-    global _cache, _at, _consecutive_failures, _refreshing
+    global _cache, _at, _consecutive_failures, _refreshing, _export_events
     try:
         try:
             result = audit_live(core)
@@ -364,8 +371,10 @@ def _refresh_snapshot(core):
             result = {"ok": False, "version": VERSION,
                       "error_type": "InvalidAuditResult"}
         result = dict(result)
+        events = result.pop("cash_events", None)
         result["time_utc"] = datetime.now(timezone.utc).isoformat()
         with _lock:
+            _export_events = (result["time_utc"], list(events)) if result.get("ok") is True and isinstance(events,list) else None
             if result.get("ok") is True:
                 _consecutive_failures = 0
             else:
@@ -425,3 +434,24 @@ def snapshot(core):
                                     if (cache or {}).get("ok") is True else None,
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
+
+
+
+def export_verified_cash_events(core):
+    """Return only the current auditor-certified event rows for download.
+
+    The normal audit endpoints keep returning aggregates, with no transaction IDs.
+    An expired/refreshing proof is NEVER treated as an empty XAG history.
+    """
+    import copy
+    from metals_xag_realised_verified import verify
+    proof = verify(snapshot(core))
+    with _lock:
+        pair = _export_events
+        if pair is None or pair[0] != proof.get("time_utc"):
+            raise ValueError("XAG verified cash detail is unavailable or stale")
+        events = copy.deepcopy(pair[1])
+    if abs(sum(float(r["net_realized_gbp"]) for r in events)
+           - float(proof["realised_all_time_gbp"])) > 0.02:
+        raise ValueError("XAG cash detail does not reconcile with verified all-time P&L")
+    return {"proof": proof, "events": events}
