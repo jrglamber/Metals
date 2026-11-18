@@ -94,7 +94,7 @@ def start(core):
     global _thread
     with _lock:
         if _thread is not None and _thread.is_alive():
-            return health()
+            return dict(_last, thread_alive=True, version=VERSION)
         if os.getenv("METALS_XAG_RECONCILE_WATCHDOG_ENABLED","true").strip().lower() in ("0","false","off","no"):
             _last["reason"] = "disabled_by_operator"
             return dict(_last)
