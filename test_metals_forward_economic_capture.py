@@ -137,7 +137,7 @@ class StudyTests(unittest.TestCase):
 
     def test_incomplete_closed_trade_financing_never_promoted_to_exact_r(self):
         self.core.conn.execute(
-            "INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO metals_xag_live_trade_links VALUES(?,?,?,?,?,?)",
             ("S0",self.t.isoformat(),self.t.isoformat(),"CLOSED",None,2))
         self.core.conn.commit()
         capture._capture(self.core,report(self.t),now=self.t)
