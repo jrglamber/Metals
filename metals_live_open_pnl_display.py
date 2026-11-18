@@ -221,6 +221,22 @@ def rewrite_dashboard_html(html):
         "function money(v){if(v==null||v==='')return '—';const n=Number(v);",
         1,
     )
+    # Add one stable two-line tile in the *existing* top-card renderer. Avoid
+    # post-render DOM patches which can race the 20-second refresh.
+    broker_card = "card('Broker P&L · LIVE XAU + XAG SHORT',money(s.headline_pnl),"
+    if broker_card not in result:
+        raise ValueError("Live Metals broker card anchor missing")
+    lane_card = (
+        "card('Open basket by metal · R / P&L',"
+        "'<div style=\"font-size:14px;line-height:1.7;text-align:left\">XAU <b>'+"
+        "(s.xau_only_current_r==null?'—':Number(s.xau_only_current_r).toFixed(2)+'R')+"
+        "'</b> · '+money(s.xau_only_open_pnl_gbp)+'<br>XAG SHORT <b>'+"
+        "(s.xag_short_current_r==null?'—':Number(s.xag_short_current_r).toFixed(2)+'R')+"
+        "'</b> · '+money(s.xag_short_open_pnl_gbp)+'</div>',"
+        "'Open positions only · XAG R uses each trade initial GBP risk'"
+        "+(s.xag_short_r_status==='BROKER_LEDGER_VERIFIED'?'':' · XAG R unverified'))+"
+    )
+    result = result.replace(broker_card, lane_card + broker_card, 1)
     return result
 
 

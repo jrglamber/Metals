@@ -139,6 +139,21 @@ class XagLiveWordingMiddleware:
                         report = authoritative_reporting.snapshot(core)
                         broker_proof = report["combined"]
                         top_payload = combined_open_pnl.project_dashboard_top(top_payload, broker_proof)
+                        # Separate live-lane open P&L from the same authoritative
+                        # combined broker snapshot. R has its own ledger proof.
+                        lane_r = report.get("xag_short_open_basket") or {}
+                        strategy = top_payload.get("strategy") or {}
+                        xau_original = top_payload.get("xau_only_strategy") or {}
+                        strategy["xau_only_current_r"] = xau_original.get("basket_r")
+                        strategy["xau_only_open_pnl_gbp"] = (
+                            broker_proof.get("xau_open_pnl_gbp") if broker_proof.get("ok") else None)
+                        strategy["xag_short_current_r"] = (
+                            lane_r.get("current_r") if lane_r.get("ok") is True else None)
+                        strategy["xag_short_open_pnl_gbp"] = (
+                            broker_proof.get("xag_short_open_pnl_gbp") if broker_proof.get("ok") else None)
+                        strategy["xag_short_r_status"] = (
+                            "BROKER_LEDGER_VERIFIED" if lane_r.get("ok") is True
+                            else "UNVERIFIED")
                         from metals_xag_realised_verified import apply_top
                         cash = report["cash"]
                         top_payload = apply_top(top_payload, cash["proof"] if cash["ok"]
