@@ -1,0 +1,21 @@
+name: Research-only Metals XAG stacking, harvest and family-lock challengers
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'research/metals_three_challengers_20261118.py'
+      - '.github/workflows/metals-three-challengers-replay.yml'
+  workflow_dispatch:
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Evaluate verified live data against demo shadow outcomes (no broker writes)
+        run: |
+          python -m py_compile research/metals_three_challengers_20261118.py
+          python research/metals_three_challengers_20261118.py
