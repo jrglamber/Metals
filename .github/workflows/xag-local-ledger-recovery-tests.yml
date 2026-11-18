@@ -1,0 +1,27 @@
+name: XAG broker-authoritative local ledger recovery tests
+on:
+  push:
+    branches: [recovery-pre-analysis-contract-20261010]
+    paths:
+      - 'xag_local_reconciliation_watchdog.py'
+      - 'test_xag_local_reconciliation_watchdog.py'
+      - 'metals_xag_live_independent_override.py'
+      - 'metals_xag_realised_verified.py'
+      - 'test_metals_xag_realised_verified.py'
+      - 'metals_live_open_pnl_display.py'
+      - '.github/workflows/xag-local-ledger-recovery-tests.yml'
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile and test read-only broker ownership and cash-display fail-closed contracts
+        run: |
+          python -m py_compile xag_local_reconciliation_watchdog.py metals_xag_live_independent_override.py metals_live_open_pnl_display.py metals_xag_realised_verified.py
+          python -m unittest -v test_xag_local_reconciliation_watchdog test_metals_xag_realised_verified
