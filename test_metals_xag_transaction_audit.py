@@ -106,5 +106,50 @@ class TransactionAuditTests(unittest.TestCase):
         self.assertEqual(d["realised_month_gbp"],3.0)
         self.assertEqual(d["realised_week_gbp"],3.0)
 
+
+class AuditCacheRecoveryTests(unittest.TestCase):
+    def test_transient_failed_audit_retries_without_five_minute_lockout(self):
+        import metals_xag_transaction_audit as audit
+        from unittest.mock import patch
+        saved=(audit._cache, audit._at, audit._consecutive_failures)
+        try:
+            audit._cache=None
+            audit._at=0.0
+            audit._consecutive_failures=0
+            with patch.object(audit, "audit_live", side_effect=[
+                {"ok":False, "error_type":"BrokerUnavailable"},
+                {"ok":True, "version":audit.VERSION},
+            ]) as read:
+                first=audit.snapshot(None)
+                self.assertFalse(first["ok"])
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(first["retry_delay_seconds"], 30)
+                audit.snapshot(None)
+                self.assertEqual(read.call_count, 1)
+                audit._at -= 31.0
+                fixed=audit.snapshot(None)
+                self.assertTrue(fixed["ok"])
+                self.assertEqual(read.call_count, 2)
+                self.assertEqual(audit._consecutive_failures, 0)
+        finally:
+            audit._cache,audit._at,audit._consecutive_failures=saved
+
+    def test_repeated_failure_has_bounded_backoff(self):
+        import metals_xag_transaction_audit as audit
+        from unittest.mock import patch
+        saved=(audit._cache, audit._at, audit._consecutive_failures)
+        try:
+            audit._cache=None
+            audit._at=0.0
+            audit._consecutive_failures=0
+            with patch.object(audit, "audit_live", return_value={"ok":False}):
+                expected=[30,60,120,240,300,300]
+                for delay in expected:
+                    out=audit.snapshot(None)
+                    self.assertEqual(out["retry_delay_seconds"], delay)
+                    audit._at -= delay + 1
+        finally:
+            audit._cache,audit._at,audit._consecutive_failures=saved
+
 if __name__=="__main__":
     unittest.main()
