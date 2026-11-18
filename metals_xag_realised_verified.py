@@ -88,6 +88,17 @@ def apply_top(payload, proof):
     strat["xag_realised_verified"]=False
     strat["realised_scope"]="XAU_ONLY_XAG_LEDGER_PENDING"
     if not isinstance(proof,dict) or proof.get("ok") is not True:
+        # The top cards advertise combined LIVE Metals. Do not show XAU-only
+        # figures as the whole portfolio while the XAG cash proof is missing.
+        # The untouched XAU baseline remains available separately for audit.
+        out.setdefault("xau_only_strategy",copy.deepcopy(strat))
+        strat["xau_only_realized_pnl"]=strat.get("realized_pnl")
+        strat["realized_pnl"]=None
+        for key in ("week_pnl","month_pnl","today_pnl","realized_today_pnl"):
+            if key in accounting:
+                accounting[key]=None
+        strat["realised_scope"]="COMBINED_METALS_CASH_UNVERIFIED"
+        strat["realised_reporting_status"]="XAG_BROKER_AUDIT_PENDING"
         return out
     fields=(
         ("realized_pnl","realised_all_time_gbp",strat),
