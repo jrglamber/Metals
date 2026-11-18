@@ -1,0 +1,53 @@
+name: Metals challenger research inventory 2026-11-18
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/metals-challenger-data-inventory-20261118.yml"]
+  workflow_dispatch:
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Assess real trade history and counterfactual replay coverage
+        run: |
+          python - <<'PY'
+          import urllib.request,zipfile,csv,io,json,collections,datetime
+          ROOT='https://metals-production-bb81.up.railway.app'
+          paths=['/export/metals-live-analysis.zip','/analysis/metals-monetisation-research.zip','/export/metals-research.zip']
+          for path in paths:
+            try:
+              with urllib.request.urlopen(urllib.request.Request(ROOT+path,headers={'User-Agent':'read-only-challenger-inventory'}),timeout=45) as r:
+                payload=r.read(35_000_000)
+              if not zipfile.is_zipfile(io.BytesIO(payload)):
+                print('SOURCE',path,'NOT_ZIP',len(payload));continue
+              z=zipfile.ZipFile(io.BytesIO(payload))
+              print('SOURCE',path,'bytes',len(payload),'entries',len(z.namelist()))
+              for name in z.namelist():
+                info=z.getinfo(name)
+                if name.endswith('.csv') and info.file_size<10_000_000:
+                  text=io.TextIOWrapper(z.open(name),encoding='utf-8-sig')
+                  reader=csv.DictReader(text)
+                  count=0; fields=list(reader.fieldnames or [])
+                  counters=collections.defaultdict(lambda:collections.Counter())
+                  date_cols=[f for f in fields if ('time' in f.lower() or 'at_utc' in f.lower()) and f.lower() not in ('age_hours','timeframe','time_in_trade')]
+                  dates={f:[] for f in date_cols[:3]}
+                  preview=[]
+                  for row in reader:
+                    count+=1
+                    for k in ('status','side','asset','instrument','close_reason','event_type','policy','trade_status','candidate_state','manager_decision'):
+                      if k in row and count<20000:counters[k][str(row[k])[:35]]+=1
+                    for k in dates:
+                      if row[k]:dates[k].append(row[k])
+                    if count<=2:
+                      preview.append({k:row.get(k) for k in fields if k in ('side','instrument','status','closed_at_utc','opened_at_utc','realized_pl','financing','estimated_risk_amount','requested_risk_amount','created_at_utc','current_r','high_water_r','event_type','threshold_r','close_reason')})
+                  bounds={k:[min(v),max(v)] for k,v in dates.items() if v}
+                  print('CSV',name,'rows',count,'columns',','.join(fields[:45]),'date_bounds',json.dumps(bounds)[:380],'status_counts',json.dumps({k:dict(v.most_common(8)) for k,v in counters.items()})[:600],'sample',json.dumps(preview)[:540])
+                elif name.endswith('.json') and info.file_size<300000:
+                  obj=json.loads(z.read(name))
+                  if isinstance(obj,dict):
+                    print('JSON',name,'keys',list(obj)[:40],'summaries',json.dumps({k:v for k,v in obj.items() if k in ('version','status','generated_at_utc','complete','all_time_net_gbp','xag','xau','combined_cash_totals_available','this_week_net_gbp')},default=str)[:1300])
+                  else: print('JSON',name,'type',type(obj).__name__)
+                else: print('ENTRY',name,'bytes',info.file_size)
+            except Exception as e: print('SOURCE_ERROR',path,type(e).__name__,str(e)[:140])
+          PY
