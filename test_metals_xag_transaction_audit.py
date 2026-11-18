@@ -50,6 +50,14 @@ class TransactionAuditTests(unittest.TestCase):
         self.assertEqual(d["broker_commission_gbp"],0.05)
         self.assertEqual(d["broker_fill_realised_pl_gbp"],4.2)
 
+    def test_verified_event_export_matches_net_without_trade_ids(self):
+        d=transaction_financials(self.rows(),LINKS,TRADES,now=NOW)
+        self.assertTrue(d["ok"],d["reconciliation_issues"])
+        rows=d["cash_events"]
+        self.assertEqual(len(rows),2)
+        self.assertAlmostEqual(sum(r["net_realized_gbp"] for r in rows),4.05)
+        self.assertEqual(set(rows[0]),{"transaction_time_utc","transaction_type","net_realized_gbp"})
+
     def test_unlinked_xag_fill_fails_all_totals(self):
         rows=self.rows()+[{"id":"21","type":"ORDER_FILL","time":"2026-11-17T10:00:00Z",
                            "instrument":"XAG_USD","pl":"1.0","tradeOpened":{"tradeID":"999"}}]
