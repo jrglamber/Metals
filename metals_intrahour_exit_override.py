@@ -55,6 +55,29 @@ def _broker_stop_price(core: Any, trade: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _safe_stop_write_failure_detail(written: Dict[str, Any]) -> Dict[str, str]:
+    """Only emit broker rejection codes and messages, never raw account/API data."""
+    detail: Dict[str, str] = {}
+    visit = [("write", written)]
+    allowed_values = ("reason", "error", "message", "errorMessage", "errorCode", "rejectReason", "status_code", "status")
+    allowed_children = ("response", "data", "result", "orderRejectTransaction",
+                        "stopLossOrderRejectTransaction", "orderCancelRejectTransaction",
+                        "orderCreateRejectTransaction", "broker")
+    while visit:
+        prefix, obj = visit.pop(0)
+        if not isinstance(obj, dict):
+            continue
+        for name in allowed_values:
+            value = obj.get(name)
+            if isinstance(value, (str, int, float, bool)) and value != "":
+                detail[f"{prefix}.{name}"] = str(value)[:180]
+        for name in allowed_children:
+            child = obj.get(name)
+            if isinstance(child, dict):
+                visit.append((f"{prefix}.{name}", child))
+    return detail
+
+
 def install(core: Any, app: Any) -> Dict[str, Any]:
     if getattr(core, "_METALS_XAU_INTRAHOUR_EXITS_INSTALLED", False):
         return dict(getattr(core, "_METALS_XAU_INTRAHOUR_EXIT_STATUS", {"installed": True, "version": VERSION}))
@@ -222,7 +245,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         if callable(recon_fn):
             try:
                 recon = dict(recon_fn(broker) or {})
-                summary["reconciliation"] = {"execution_safe": recon.get("execution_safe"), "matched": recon.get("matched")}
+                summary["reconciliation"] = {"execution_safe": recon.get("execution_safe"), "matched_count": len(recon.get("matched") or [])}
                 if recon.get("execution_safe") is not True:
                     summary["skipped"] = "reconciliation_not_execution_safe"
                     return summary
@@ -317,7 +340,8 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                     summary["errors"] += 1
                     integrity(
                         "broker_stop_write_failed", link_id=link.get("id"), broker_trade_id=broker_id,
-                        side=side, stop_price=stop_price, status=written.get("status"),
+                        side=side, stop_price=stop_price, broker_current_stop=actual_stop,
+                        status=written.get("status"), writer_failure=_safe_stop_write_failure_detail(written),
                     )
             except Exception as exc:
                 summary["errors"] += 1
