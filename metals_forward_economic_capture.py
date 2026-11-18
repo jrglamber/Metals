@@ -364,16 +364,21 @@ def _loop(core):
     # preflight, startup reconciliation or synchronised broker audits.
     time.sleep(20)
     while True:
+        delay=INTERVAL_SECONDS
         try:
             result=capture_once(core)
             if not result["ok"]:
+                # Broker cash audit may still be warming up after deployment.
+                # Retry research-only reads sooner, never alter live execution.
+                delay=60
                 print("METALS_FORWARD_CAPTURE incomplete "+str(result["status"]),flush=True)
         except Exception as exc:
+            delay=60
             with _lock:
                 _state["last_error_class"]=type(exc).__name__
                 _state["last_status"]="CAPTURE_ERROR"
             print("METALS_FORWARD_CAPTURE ERROR "+type(exc).__name__,flush=True)
-        time.sleep(INTERVAL_SECONDS)
+        time.sleep(delay)
 
 
 def start(core):
