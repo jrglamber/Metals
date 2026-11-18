@@ -19,10 +19,12 @@ from metals_xag_ledger_audit import _id, _utc, audit_links
 VERSION = "xag_short_net_cash_ledger_shadow_v1_2026_11_17"
 MAX_TX_PAGES = 60
 TX_RANGE_SIZE = 300
-CACHE_SECONDS = 90  # Verified cash proof is refreshed within roughly 1-2 minutes.
-FAIL_CACHE_SECONDS = 30  # A transient failed audit must never remain cached for 5 minutes.
+CACHE_SECONDS = 180  # Successful full-history proof is expensive (many broker pages).
+FAIL_CACHE_SECONDS = 30  # Retry a first transient failure within 30 seconds.
+MAX_FAIL_CACHE_SECONDS = 300  # Back off during an extended OANDA outage.
 _cache = None
 _at = 0.0
+_consecutive_failures = 0
 _lock = threading.Lock()
 
 
@@ -345,20 +347,30 @@ def audit_live(core):
 
 
 def snapshot(core):
-    global _cache,_at
+    global _cache, _at, _consecutive_failures
     with _lock:
         cache_age = time.monotonic() - _at
-        limit = CACHE_SECONDS if (_cache or {}).get('ok') is True else FAIL_CACHE_SECONDS
+        retry_delay = min(MAX_FAIL_CACHE_SECONDS,
+                          FAIL_CACHE_SECONDS * (2 ** max(0, _consecutive_failures - 1)))
+        limit = CACHE_SECONDS if (_cache or {}).get("ok") is True else retry_delay
         if _cache is not None and cache_age < limit:
             return dict(_cache)
-        try:result=audit_live(core)
+        try:
+            result = audit_live(core)
         except Exception as exc:
-            result={"ok":False,"version":VERSION,
-                    "net_realised_gbp_verified":False,
-                    "transaction_history_complete":False,
-                    "reconciliation_issues":["producer_unavailable"],
-                    "error_type":type(exc).__name__}
-        result["time_utc"]=datetime.now(timezone.utc).isoformat()
-        _cache=dict(result)
-        _at=time.monotonic()
+            result = {"ok":False, "version":VERSION,
+                      "net_realised_gbp_verified":False,
+                      "transaction_history_complete":False,
+                      "reconciliation_issues":["producer_unavailable"],
+                      "error_type":type(exc).__name__}
+        if result.get("ok") is True:
+            _consecutive_failures = 0
+        else:
+            _consecutive_failures += 1
+            result["retry_delay_seconds"] = min(
+                MAX_FAIL_CACHE_SECONDS,
+                FAIL_CACHE_SECONDS * (2 ** max(0, _consecutive_failures - 1)))
+        result["time_utc"] = datetime.now(timezone.utc).isoformat()
+        _cache = dict(result)
+        _at = time.monotonic()
         return result
