@@ -19,7 +19,8 @@ from metals_xag_ledger_audit import _id, _utc, audit_links
 VERSION = "xag_short_net_cash_ledger_shadow_v1_2026_11_17"
 MAX_TX_PAGES = 60
 TX_RANGE_SIZE = 300
-CACHE_SECONDS = 300
+CACHE_SECONDS = 90  # Verified cash proof is refreshed within roughly 1-2 minutes.
+FAIL_CACHE_SECONDS = 30  # A transient failed audit must never remain cached for 5 minutes.
 _cache = None
 _at = 0.0
 _lock = threading.Lock()
@@ -346,7 +347,9 @@ def audit_live(core):
 def snapshot(core):
     global _cache,_at
     with _lock:
-        if _cache is not None and time.monotonic()-_at<CACHE_SECONDS:
+        cache_age = time.monotonic() - _at
+        limit = CACHE_SECONDS if (_cache or {}).get('ok') is True else FAIL_CACHE_SECONDS
+        if _cache is not None and cache_age < limit:
             return dict(_cache)
         try:result=audit_live(core)
         except Exception as exc:
