@@ -1,0 +1,36 @@
+name: Both Metals live harvest screenshot ladder
+on:
+  pull_request:
+    paths:
+      - metals_harvest_ladder_override.py
+      - metals_harvest_ladder_override_v3.py
+      - metals_xag_live_harvest.py
+      - metals_xag_harvest_dashboard.py
+      - metals_governance_entrypoint.py
+      - test_metals_live_harvest_ladder_contract.py
+      - test_metals_xag_live_harvest.py
+      - test_metals_xag_harvest_dashboard.py
+      - .github/workflows/metals-live-harvest-ladder-contract.yml
+  push:
+    paths:
+      - metals_harvest_ladder_override.py
+      - metals_harvest_ladder_override_v3.py
+      - metals_xag_live_harvest.py
+      - metals_xag_harvest_dashboard.py
+      - metals_governance_entrypoint.py
+      - test_metals_live_harvest_ladder_contract.py
+      - test_metals_xag_live_harvest.py
+      - test_metals_xag_harvest_dashboard.py
+      - .github/workflows/metals-live-harvest-ladder-contract.yml
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile live workers and displays
+        run: python -m py_compile metals_harvest_ladder_override.py metals_harvest_ladder_override_v3.py metals_xag_live_harvest.py metals_xag_harvest_dashboard.py metals_governance_entrypoint.py
+      - name: Check exact ladder + broker fail-closed + dashboard syntax
+        run: python -m unittest -v test_metals_live_harvest_ladder_contract.py test_metals_xag_live_harvest.py test_metals_xag_harvest_dashboard.py
