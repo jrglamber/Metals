@@ -324,8 +324,17 @@ def tick(core: Any) -> Dict[str, Any]:
                                "current_gbp": round(snapshot["current_gbp"], 2)})
                 stages = _stages(core, cycle)
                 pending = next((s for s in stages if s["status"] == "EXECUTING"), None)
-                if any(s["status"] == "REVIEW_REQUIRED" for s in stages):
-                    result.update({"status": "REVIEW_REQUIRED", "reason": "prior stage needs broker audit"})
+                prior = next((st for st in stages if st["status"] == "REVIEW_REQUIRED"), None)
+                if prior:
+                    with core.get_conn() as conn:
+                        event_rows = conn.execute("""SELECT status, COUNT(*) AS n FROM metals_xag_live_harvest_events
+                            WHERE cycle_id=? AND threshold_r=? GROUP BY status""",
+                            (cycle, float(prior["threshold_r"]))).fetchall()
+                    result.update({"status": "REVIEW_REQUIRED",
+                                   "reason": str(prior.get("reason") or "prior stage needs broker audit"),
+                                   "stage_level_r": float(prior["threshold_r"]),
+                                   "stage_bank_gbp": float(prior.get("executed_bank_gbp") or 0),
+                                   "events_by_status": {str(row["status"]): int(row["n"]) for row in event_rows}})
                     return result
                 if not pending:
                     executed = [float(s["threshold_r"]) for s in stages if s["status"] == "EXECUTED"]
