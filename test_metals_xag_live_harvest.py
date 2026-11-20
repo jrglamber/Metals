@@ -28,10 +28,12 @@ class _Core:
 class HarvestRules(unittest.TestCase):
     def test_ladder_matches_xau_without_sharing_state(self):
         self.assertEqual(h._next_level([]), 30.0)
-        self.assertEqual(h._next_level([30.0]), 80.0)
-        self.assertEqual(h._next_level([30.0, 80.0]), 130.0)
-        self.assertEqual([h._fraction(x) for x in (30, 80, 130, 180)],
-                         [0.2, 0.2, 0.25, 0.25])
+        self.assertEqual(h._next_level([30.0]), 50.0)
+        self.assertEqual(h._next_level([30.0, 50.0]), 100.0)
+        self.assertEqual(h._next_level([30.0, 50.0, 100.0]), 150.0)
+        self.assertEqual(h._next_level([30.0, 80.0]), 100.0)
+        self.assertEqual([h._fraction(x) for x in (30, 50, 100, 150, 200)],
+                         [0.2, 0.2, 0.2, 0.25, 0.25])
 
     def test_nonpositive_trade_never_closed(self):
         stage = {"id": 1, "cycle_id": "xag_test", "threshold_r": 30,
