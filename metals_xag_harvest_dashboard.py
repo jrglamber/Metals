@@ -109,4 +109,4 @@ DASHBOARD_SNIPPET = r"""
   }
 })();
 </script>
-""
+"""
