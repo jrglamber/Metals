@@ -1,0 +1,24 @@
+name: XAG cash-banking dashboard UI
+on:
+  pull_request:
+    paths:
+      - metals_xag_harvest_dashboard.py
+      - metals_xag_live_wording_entrypoint.py
+      - test_metals_xag_harvest_dashboard.py
+      - .github/workflows/xag-harvest-dashboard.yml
+  push:
+    paths:
+      - metals_xag_harvest_dashboard.py
+      - metals_xag_live_wording_entrypoint.py
+      - test_metals_xag_harvest_dashboard.py
+      - .github/workflows/xag-harvest-dashboard.yml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile metals_xag_harvest_dashboard.py metals_xag_live_wording_entrypoint.py
+      - run: python -m unittest -v test_metals_xag_harvest_dashboard.py
