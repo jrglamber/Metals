@@ -290,6 +290,43 @@ def _execute_stage(core: Any, stage: Dict[str, Any]) -> Dict[str, Any]:
             "closed_count": len(selected), "target_gbp": stage["target_bank_gbp"]}
 
 
+def _review_diagnostics(core: Any, stage: Dict[str, Any]) -> Dict[str, Any]:
+    """GET-only explanation of why an unsubmitted harvest selection was blocked."""
+    try:
+        selected = json.loads(stage.get("selected_json") or "[]")
+        if not selected:
+            return {"has_selection": False}
+        bid = str(selected[0].get("id") or "")
+        r = xag._request(core, f"/v3/accounts/{xag._account_id(core)}/trades/{bid}", "GET")
+        t = (r.get("data") or {}).get("trade") if r.get("ok") else None
+        t = t if isinstance(t, dict) else {}
+        sid = str(t.get("stopLossOrderID") or "")
+        embedded = t.get("stopLossOrder") if isinstance(t.get("stopLossOrder"), dict) else {}
+        order = {}
+        if sid:
+            sr = xag._request(core, f"/v3/accounts/{xag._account_id(core)}/orders/{sid}", "GET")
+            order = (sr.get("data") or {}).get("order") if sr.get("ok") else None
+            order = order if isinstance(order, dict) else {}
+        return {
+            "has_selection": True, "detail_get_ok": bool(r.get("ok")),
+            "state": str(t.get("state") or ""), "instrument": str(t.get("instrument") or ""),
+            "units": _f(t.get("currentUnits")),
+            "unrealized_present": _f(t.get("unrealizedPL")) is not None,
+            "unrealized_positive": (_f(t.get("unrealizedPL")) or 0) > 0,
+            "trade_stop_id_present": bool(sid),
+            "embedded_stop_present": bool(embedded),
+            "embedded_stop_state": str(embedded.get("state") or ""),
+            "order_detail_found": bool(order),
+            "order_state": str(order.get("state") or ""),
+            "order_price_present": _f(order.get("price")) is not None,
+            "order_trade_link_present": bool(order.get("tradeID")),
+            "order_trade_link_matches": str(order.get("tradeID") or "") == bid,
+            "stop_proof_passed": _has_live_attached_stop(core, t, bid),
+        }
+    except Exception as exc:
+        return {"diagnostics_error_class": type(exc).__name__}
+
+
 def tick(core: Any) -> Dict[str, Any]:
     """Single active XAG harvest worker across processes, via Postgres advisory lock."""
     global _last
@@ -334,7 +371,8 @@ def tick(core: Any) -> Dict[str, Any]:
                                    "reason": str(prior.get("reason") or "prior stage needs broker audit"),
                                    "stage_level_r": float(prior["threshold_r"]),
                                    "stage_bank_gbp": float(prior.get("executed_bank_gbp") or 0),
-                                   "events_by_status": {str(row["status"]): int(row["n"]) for row in event_rows}})
+                                   "events_by_status": {str(row["status"]): int(row["n"]) for row in event_rows},
+                                   "selected_trade_proof": _review_diagnostics(core, prior)})
                     return result
                 if not pending:
                     executed = [float(s["threshold_r"]) for s in stages if s["status"] == "EXECUTED"]
