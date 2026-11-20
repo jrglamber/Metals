@@ -377,10 +377,12 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     app.router.routes.remove(routes[-1])
     app.router.routes.insert(0, routes[-1])
     def loop() -> None:
+        checks = 0
         while True:
             out = tick(core)
-            if out.get("status") != "MONITORING" or out.get("count") == 0:
+            if checks % 10 == 0 or out.get("status") != "MONITORING" or out.get("count") == 0:
                 print("METALS_XAG_LIVE_HARVEST " + json.dumps(out, default=str), flush=True)
+            checks += 1
             threading.Event().wait(_POLL_SECONDS)
     _thread = threading.Thread(target=loop, daemon=True, name="xag-live-harvest")
     _thread.start()
