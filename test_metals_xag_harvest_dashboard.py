@@ -25,7 +25,6 @@ class XagLadderDisplayTests(unittest.TestCase):
         self.assertIn("cycle_id", DASHBOARD_SNIPPET)
         self.assertIn("30", DASHBOARD_SNIPPET)
         self.assertIn("80", DASHBOARD_SNIPPET)
-        self.assertIn("130", DASHBOARD_SNIPPET) if "130" in DASHBOARD_SNIPPET else None
         self.assertNotIn("method:'POST'", DASHBOARD_SNIPPET)
         self.assertNotIn("method:'PUT'", DASHBOARD_SNIPPET)
         self.assertNotIn("/trades/", DASHBOARD_SNIPPET)
