@@ -103,7 +103,7 @@ def _live_snapshot(core: Any) -> Dict[str, Any]:
                 or pnl is None or risk is None or risk <= 0
                 or str(link.get("side") or "").lower() != "short"
                 or str(link.get("status") or "").upper() != "OPEN"
-                or not t.get("stopLossOrderID")):
+                ):
             return {"ok": False, "reason": "missing_or_unverified_live_trade_risk_or_stop", "trade_id": bid, "checks": {"side": str(link.get("side")), "local_status": str(link.get("status")), "units": units, "pnl_present": pnl is not None, "risk_present": risk is not None and risk > 0, "stop_order_id_present": bool(t.get("stopLossOrderID"))}}
         rows.append({"link": link, "id": bid, "pnl": pnl, "risk": risk})
     return {
@@ -197,6 +197,26 @@ def _start_stage(core: Any, cycle: str, level: float, snapshot: Dict[str, Any]) 
     return next((s for s in _stages(core, cycle) if float(s["threshold_r"]) == level), None)
 
 
+def _has_live_attached_stop(core: Any, trade: Dict[str, Any], bid: str) -> bool:
+    """Verify the actual pending OANDA stop, including stops tightened below entry."""
+    stop_id = str(trade.get("stopLossOrderID") or "")
+    if not stop_id:
+        return False
+    order = trade.get("stopLossOrder") or {}
+    if not isinstance(order, dict) or not order.get("price"):
+        reply = xag._request(
+            core, f"/v3/accounts/{xag._account_id(core)}/orders/{stop_id}", "GET")
+        order = (reply.get("data") or {}).get("order") if reply.get("ok") else {}
+    if not isinstance(order, dict):
+        return False
+    price = _f(order.get("price"))
+    return bool(
+        price is not None and price > 0
+        and str(order.get("state") or "").upper() == "PENDING"
+        and str(order.get("tradeID") or "") == bid
+    )
+
+
 def _execute_stage(core: Any, stage: Dict[str, Any]) -> Dict[str, Any]:
     cycle, level = stage["cycle_id"], float(stage["threshold_r"])
     selected = json.loads(stage["selected_json"])
@@ -234,7 +254,8 @@ def _execute_stage(core: Any, stage: Dict[str, Any]) -> Dict[str, Any]:
         if (broker_state != "OPEN" or str(t.get("instrument") or "") != "XAG_USD"
                 or _f(t.get("currentUnits")) != -xag.PILOT_UNITS
                 or _f(t.get("unrealizedPL")) is None
-                or float(t["unrealizedPL"]) <= 0):
+                or float(t["unrealizedPL"]) <= 0
+                or not _has_live_attached_stop(core, t, bid)):
             _stage_status(core, stage, "REVIEW_REQUIRED", total, "trade no longer a verified profitable XAG Short")
             return {"status": "REVIEW_REQUIRED", "level_r": level, "banked_gbp": total}
         if previous and previous.get("status") == "SUBMITTING":

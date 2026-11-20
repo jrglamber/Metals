@@ -58,6 +58,7 @@ class HarvestRules(unittest.TestCase):
              patch.object(h.xag, "_request", return_value={"ok": True, "data": {"trade": trade}}), \
              patch.object(h, "_record_event") as events, \
              patch.object(h, "_stage_status") as mark, \
+             patch.object(h, "_has_live_attached_stop", return_value=True), \
              patch.object(h.xag, "_close_link", return_value={"ok": True, "realized_pl": 2.93}) as close:
             out = h._execute_stage(_Core(), stage)
         self.assertEqual(out["status"], "EXECUTED")
@@ -78,10 +79,21 @@ class HarvestRules(unittest.TestCase):
              patch.object(h.xag, "_request", return_value={"ok": True, "data": {"trade": trade}}), \
              patch.object(h, "_record_event"), \
              patch.object(h, "_stage_status") as mark, \
+             patch.object(h, "_has_live_attached_stop", return_value=True), \
              patch.object(h.xag, "_close_link", return_value={"ok": False, "retry": True}):
             out = h._execute_stage(_Core(), stage)
         self.assertEqual(out["status"], "REVIEW_REQUIRED")
         self.assertEqual(mark.call_args.args[2], "REVIEW_REQUIRED")
+
+    def test_stop_detail_must_be_broker_pending_and_same_trade(self):
+        core = _Core()
+        trade = {"stopLossOrderID": "731"}
+        order = {"state": "PENDING", "price": "49.123", "tradeID": "321"}
+        with patch.object(h.xag, "_request", return_value={"ok": True, "data": {"order": order}}):
+            self.assertTrue(h._has_live_attached_stop(core, trade, "321"))
+            self.assertFalse(h._has_live_attached_stop(core, trade, "wrong"))
+        with patch.object(h.xag, "_request", return_value={"ok": True, "data": {"order": {**order, "state": "CANCELLED"}}}):
+            self.assertFalse(h._has_live_attached_stop(core, trade, "321"))
 
     def test_resolved_event_is_idempotent(self):
         stage = {"id": 1, "cycle_id": "xag_test", "threshold_r": 30,
