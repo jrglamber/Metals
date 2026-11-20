@@ -79,7 +79,7 @@ DASHBOARD_SNIPPET = r"""
     var tbody=byId('pep-xag-ladder-body');tbody.replaceChildren();
     ordered.forEach(function(level){
       var s=stageByLevel[level]||{},tr=document.createElement('tr');
-      var pct=s.bank_fraction==null?(level<=80?20:25):Math.round(Number(s.bank_fraction)*100);
+      var pct=s.bank_fraction==null?(level<=100?20:25):Math.round(Number(s.bank_fraction)*100);
       var status=String(s.status||'NOT_ARMED');
       cell(tr,level+'R');cell(tr,status,status==='EXECUTED'?'done':'');
       cell(tr,pct+'%');cell(tr,s.id?formatMoney(s.target_bank_gbp):'—');
@@ -90,7 +90,8 @@ DASHBOARD_SNIPPET = r"""
     var tick=data.last_tick||{};
     byId('pep-xag-ladder-r').textContent=formatR(tick.current_r)+' / '+formatR(data.cycle.high_water_r);
     var executed=stages.filter(function(s){return s.status==='EXECUTED';});
-    var next=executed.length?Math.max.apply(null,executed.map(function(s){return Number(s.threshold_r);})) + 50:30;
+    var last=executed.length?Math.max.apply(null,executed.map(function(s){return Number(s.threshold_r);})) : 0;
+    var next=!last?30:last<50?50:(Math.floor(last/50)+1)*50;
     byId('pep-xag-ladder-next').textContent=next+'R';
     warning(/BLOCKED|REVIEW_REQUIRED/.test(String(tick.status||''))?
       'Harvest requires review: '+String(tick.reason||tick.status):'');
