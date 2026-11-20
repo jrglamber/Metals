@@ -1,7 +1,8 @@
 """Fail-closed live-XAU harvest ladder overlay.
 
-Changes only the live-XAU harvest worker to 30R first, then +50R (80/130/...)
-with 20% / 20% / 25%+ banking. Practice/XAG ladder constants remain untouched.
+Changes only the live-XAU harvest worker to 30R, 50R, 100R, 150R, ...
+with 20% at 30/50/100R then 25% thereafter. Practice ladder is untouched;
+XAG has its own independent but identically spaced live ladder.
 """
 from __future__ import annotations
 
@@ -69,9 +70,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     checks = {
         "first_30r": common.FIRST_LEVEL_R == 30.0,
         "step_50r": common.STEP_R == 50.0,
-        "fractions_20_20_25": [common._fraction_for_level(30), common._fraction_for_level(80), common._fraction_for_level(130)] == [0.20, 0.20, 0.25],
-        "next_30_to_80": common._next_level(30) == 80.0,
-        "next_80_to_130": common._next_level(80) == 130.0,
+        "fractions_20_20_20_25": [common._fraction_for_level(x) for x in (30, 50, 100, 150)] == [0.20, 0.20, 0.20, 0.25],
+        "next_30_to_50": common._next_level(30) == 50.0,
+        "next_50_to_100": common._next_level(50) == 100.0,
+        "next_100_to_150": common._next_level(100) == 150.0,
+        "exact_ladder": common._level_sequence(300) == [30, 50, 100, 150, 200, 250, 300],
         "practice_first_still_50": float(getattr(core, "METALS_HARVEST_FIRST_LEVEL_R", 50.0)) == 50.0,
         "practice_step_still_50": float(getattr(core, "METALS_HARVEST_STEP_R", 50.0)) == 50.0,
         "xau_long_atr2": str(core._metals_demo_new_trade_exit_policy("XAUUSD", "long").get("policy")) == "ATR2_CHANDELIER",
@@ -86,9 +89,9 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "installed": True,
         "version": VERSION,
         "scope": "LIVE_XAU_ONLY",
-        "levels": [30, 80, 130, 180, 230, 280],
+        "levels": [30, 50, 100, 150, 200, 250, 300],
         "continues_every_r": 50,
-        "fractions": [0.20, 0.20, 0.25],
+        "fractions": [0.20, 0.20, 0.20, 0.25],
         "non_retroactive_baseline": baseline,
         "practice_harvest_unchanged": True,
         "individual_exit_managers_unchanged": True,
