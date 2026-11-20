@@ -1,7 +1,7 @@
 """LIVE XAG SHORT basket harvest, independently broker-authoritative.
 
-Copies the LIVE XAU harvest ladder: 30R, then +50R; banks approximately
-20%, 20%, then 25% of the profitable open-trade pool. XAG only. No writes
+Copies the live XAU ladder: 30R, 50R, 100R, 150R, then +50R; banks about
+20% at the first three and 25% thereafter. XAG only. No writes
 to XAU tables, no changes to MFE25, emergency stops, entries or sizing.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import xag_short_live_override as xag
 
-VERSION = "metals_xag_live_harvest_v1_2026_11_20"
+VERSION = "metals_xag_live_harvest_v2_30_50_100_2026_11_20"
 FIRST_R, STEP_R = 30.0, 50.0
 LOCK_KEY = 2026112030
 _POLL_SECONDS = 60
@@ -37,11 +37,16 @@ def _f(value: Any) -> Optional[float]:
 
 
 def _fraction(level: float) -> float:
-    return 0.20 if level <= 80.000001 else 0.25
+    return 0.20 if level <= 100.000001 else 0.25
 
 
 def _next_level(executed: List[float]) -> float:
-    return FIRST_R if not executed else max(executed) + STEP_R
+    if not executed:
+        return FIRST_R
+    last = max(float(v) for v in executed)
+    if last < STEP_R - 1e-9:
+        return STEP_R
+    return (int(last // STEP_R) + 1) * STEP_R
 
 
 def _init(core: Any) -> None:
@@ -473,8 +478,8 @@ def status(core: Any) -> Dict[str, Any]:
         state = _get_state(core)
         stages = _stages(core, str(state["cycle_id"] or ""))
         return {"ok": True, "version": VERSION, "scope": "LIVE_XAG_SHORT_ONLY",
-                "ladder_r": [30, 80, 130, 180, 230, 280],
-                "fractions": [0.20, 0.20, 0.25],
+                "ladder_r": [30, 50, 100, 150, 200, 250, 300],
+                "fractions": [0.20, 0.20, 0.20, 0.25],
                 "cycle": state, "stages": stages[-10:], "last_tick": dict(_last),
                 "xau_unchanged": True, "entry_sizing_unchanged": True}
     except Exception as exc:
