@@ -55,6 +55,55 @@ def _unresolved_recent_errors(rows, now):
         })
     return active
 
+def _safe_error_kind(row):
+    """Classify stored provider errors without exposing raw error bodies or secrets."""
+    value = str(row.get("error") or "").lower()
+    http = str(row.get("last_http_status") or "")
+    if "insufficient_quota" in value or "exceeded your current quota" in value or "billing_hard_limit" in value:
+        return "OPENAI_BILLING_OR_QUOTA_EXHAUSTED"
+    if "rate_limit_exceeded" in value or "rate limit" in value or "tokens per min" in value:
+        return "OPENAI_RATE_LIMIT"
+    if http == "429" or "429" in value:
+        return "OPENAI_HTTP_429_UNCLASSIFIED"
+    if "jsondecodeerror" in value or "missing required fields" in value:
+        return "MODEL_JSON_PARSE_FAILURE"
+    if http in ("401", "403"):
+        return "AUTHORIZATION_REJECTED"
+    if http in ("500", "502", "503", "504"):
+        return "UPSTREAM_SERVER_ERROR"
+    return "OTHER_ERROR" if value or http else "NO_ERROR_DETAIL"
+
+
+def _safe_pipeline_diagnostics(core, rows, now):
+    from collections import Counter
+    statuses = Counter(str(r.get("status") or "UNKNOWN").upper() for r in rows)
+    outstanding = [r for r in rows if _eligible(r)
+                   and str(r.get("status") or "").upper() not in ("COMPLETE", "ERROR")]
+    by_status = Counter(str(r.get("status") or "UNKNOWN").upper() for r in outstanding)
+    faults = [r for r in rows[:100] if _eligible(r) and
+              str(r.get("status") or "").upper() in ("ERROR", "RETRY_WAIT")]
+    kinds = Counter(_safe_error_kind(r) for r in faults)
+    thread = getattr(core, "_ai_regime_worker_thread", None)
+    return {
+        "status_counts_last_500": dict(statuses),
+        "outstanding_eligible_by_status": dict(by_status),
+        "recent_error_categories": dict(kinds),
+        "recent_eligible_records": [
+            {"status": str(r.get("status") or ""),
+             "age_hours": (round((now - _date(r.get("created_at_utc"))).total_seconds()/3600, 2)
+                           if _date(r.get("created_at_utc")) else None),
+             "attempt_count": r.get("attempt_count"),
+             "http_status": r.get("last_http_status"),
+             "error_category": _safe_error_kind(r)}
+            for r in rows if _eligible(r)
+        ][:8],
+        "runtime_enabled": bool(getattr(core, "AI_SHADOW_ENABLED", False)),
+        "runtime_key_present": bool(getattr(core, "AI_SHADOW_OPENAI_API_KEY", "")),
+        "observer_worker_thread_present": thread is not None,
+        "observer_worker_thread_alive": bool(thread and thread.is_alive()),
+    }
+
+
 def audit(core, table):
     now=datetime.now(timezone.utc)
     try:
@@ -115,5 +164,6 @@ def audit(core, table):
             "active_ai_error_count":len(active_errors),
             "active_ai_errors":active_errors[:5],
             "overdue_eligible_count":len(pending),"captured_rows":len(rows),
+            "pipeline_diagnostics":_safe_pipeline_diagnostics(core, rows, now),
             "forward_24h":{"metric":"market_price_not_broker_trade_pnl",
                            "settled_count":len(outcomes),"recent":outcomes[-50:]}}
