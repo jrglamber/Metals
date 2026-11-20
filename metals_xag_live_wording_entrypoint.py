@@ -16,6 +16,7 @@ import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
 import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
+import metals_xag_harvest_dashboard as live_xag_harvest_dashboard
 import metals_live_open_pnl_display as combined_open_pnl
 import metals_reporting_snapshot as authoritative_reporting
 import metals_live_analysis_export as live_analysis_export
@@ -200,6 +201,8 @@ class XagLiveWordingMiddleware:
                             add += manual_campaign_reset.DASHBOARD_SNIPPET
                         if "pep-xag-live-health" not in text:
                             add += live_xag_health.DASHBOARD_SNIPPET
+                        if "pep-xag-ladder-js" not in text:
+                            add += live_xag_harvest_dashboard.DASHBOARD_SNIPPET
                         if add:
                             anchor = "<h2>Details</h2>"
                             if anchor in text:
