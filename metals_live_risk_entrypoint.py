@@ -15,6 +15,7 @@ import metals_xag_execution_reporting_patch as xag_reporting
 import xag_short_live_probe as xag_live_probe
 import xag_short_live_override as xag_live_execution
 import metals_xag_live_independent_override as xag_independent
+import metals_xag_live_harvest as xag_harvest
 
 app = base.app
 core = base.base.base.core
@@ -22,6 +23,12 @@ VERSION = "metals_live_risk_entrypoint_v8_2026_10_31"
 
 XAG_SHORT_LIVE_INSTALL = xag_live_execution.install(core, app)
 XAG_INDEPENDENT_STATUS = xag_independent.install(core, app)
+try:
+    XAG_LIVE_HARVEST_STATUS = xag_harvest.install(core, app)
+except Exception as _xag_harvest_exc:
+    # Trading remains on the existing MFE25 manager if harvest startup fails.
+    XAG_LIVE_HARVEST_STATUS = {"installed": False, "reason": f"{type(_xag_harvest_exc).__name__}: {_xag_harvest_exc}"}
+print("METALS_XAG_LIVE_HARVEST_INSTALL", XAG_LIVE_HARVEST_STATUS, flush=True)
 XAG_REPORTING_INSTALL = xag_reporting.install(execution_contract, core)
 EXECUTION_CONTRACT_STATUS = execution_contract.install(core, app)
 
