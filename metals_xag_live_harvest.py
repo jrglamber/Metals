@@ -199,21 +199,29 @@ def _start_stage(core: Any, cycle: str, level: float, snapshot: Dict[str, Any]) 
 
 def _has_live_attached_stop(core: Any, trade: Dict[str, Any], bid: str) -> bool:
     """Verify the actual pending OANDA stop, including stops tightened below entry."""
+    embedded = trade.get("stopLossOrder")
+    # This object is part of the authenticated GET /trades/{bid} response.
+    # OANDA does not always include a separate stopLossOrderID.
+    if isinstance(embedded, dict):
+        price = _f(embedded.get("price"))
+        if (price is not None and price > 0
+                and str(embedded.get("state") or "").upper() == "PENDING"
+                and (not embedded.get("tradeID") or str(embedded["tradeID"]) == bid)):
+            return True
     stop_id = str(trade.get("stopLossOrderID") or "")
     if not stop_id:
         return False
-    order = trade.get("stopLossOrder") or {}
-    if not isinstance(order, dict) or not order.get("price"):
-        reply = xag._request(
-            core, f"/v3/accounts/{xag._account_id(core)}/orders/{stop_id}", "GET")
-        order = (reply.get("data") or {}).get("order") if reply.get("ok") else {}
+    reply = xag._request(
+        core, f"/v3/accounts/{xag._account_id(core)}/orders/{stop_id}", "GET")
+    order = (reply.get("data") or {}).get("order") if reply.get("ok") else {}
     if not isinstance(order, dict):
         return False
     price = _f(order.get("price"))
     return bool(
         price is not None and price > 0
         and str(order.get("state") or "").upper() == "PENDING"
-        and str(order.get("tradeID") or "") == bid
+        and (not order.get("tradeID") or str(order["tradeID"]) == bid)
+        and (not order.get("id") or str(order["id"]) == stop_id)
     )
 
 
@@ -327,6 +335,57 @@ def _review_diagnostics(core: Any, stage: Dict[str, Any]) -> Dict[str, Any]:
         return {"diagnostics_error_class": type(exc).__name__}
 
 
+def _safe_rearm_zero_intent_stage(core: Any, prior: Dict[str, Any],
+                                  snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Replan an armed stage ONLY when no close was ever submitted or banked."""
+    level = float(prior["threshold_r"])
+    fraction = _fraction(level)
+    target = float(snapshot["profitable_pool_gbp"]) * fraction
+    if target <= 0 or snapshot["current_gbp"] <= 0:
+        return None
+    winners = sorted((r for r in snapshot["rows"] if r["pnl"] > 0),
+                     key=lambda r: (-r["pnl"], r["id"]))
+    selected, expected = [], 0.0
+    for winner in winners:
+        if expected >= target - 1e-9:
+            break
+        selected.append({"id": winner["id"], "expected_gbp": winner["pnl"]})
+        expected += winner["pnl"]
+    if not selected:
+        return None
+    # Prove every intended broker trade + attached pending stop BEFORE the
+    # first close; do not start a stage that could only partially execute.
+    for item in selected:
+        bid = str(item["id"])
+        detail = xag._request(
+            core, f"/v3/accounts/{xag._account_id(core)}/trades/{bid}", "GET")
+        trade = (detail.get("data") or {}).get("trade") if detail.get("ok") else None
+        t = trade if isinstance(trade, dict) else {}
+        if (str(t.get("state") or "").upper() != "OPEN"
+                or str(t.get("instrument") or "") != "XAG_USD"
+                or _f(t.get("currentUnits")) != -xag.PILOT_UNITS
+                or (_f(t.get("unrealizedPL")) or 0) <= 0
+                or not _has_live_attached_stop(core, t, bid)):
+            return None
+    with core.get_conn() as conn:
+        # The caller already verified ZERO harvest event rows under an advisory
+        # lock, and no previously banked amount. This only updates an unsubmitted
+        # plan. It never repeats a previously attempted OANDA close.
+        conn.execute("""UPDATE metals_xag_live_harvest_stages SET
+            status='EXECUTING', selected_json=?, updated_at_utc=?,
+            trigger_current_r=?,trigger_current_gbp=?,
+            trigger_profitable_pool_gbp=?,target_bank_gbp=?,
+            reason='zero-intent preflight recovery: fresh broker-verified winners'
+            WHERE id=? AND status='REVIEW_REQUIRED' AND executed_bank_gbp=0""",
+            (json.dumps(selected), _now(), snapshot["current_r"],
+             snapshot["current_gbp"], snapshot["profitable_pool_gbp"], target,
+             int(prior["id"])))
+        conn.commit()
+    return next((row for row in _stages(core, prior["cycle_id"])
+                 if int(row["id"]) == int(prior["id"])
+                 and row["status"] == "EXECUTING"), None)
+
+
 def tick(core: Any) -> Dict[str, Any]:
     """Single active XAG harvest worker across processes, via Postgres advisory lock."""
     global _last
@@ -367,13 +426,23 @@ def tick(core: Any) -> Dict[str, Any]:
                         event_rows = conn.execute("""SELECT status, COUNT(*) AS n FROM metals_xag_live_harvest_events
                             WHERE cycle_id=? AND threshold_r=? GROUP BY status""",
                             (cycle, float(prior["threshold_r"]))).fetchall()
-                    result.update({"status": "REVIEW_REQUIRED",
-                                   "reason": str(prior.get("reason") or "prior stage needs broker audit"),
-                                   "stage_level_r": float(prior["threshold_r"]),
-                                   "stage_bank_gbp": float(prior.get("executed_bank_gbp") or 0),
-                                   "events_by_status": {str(row["status"]): int(row["n"]) for row in event_rows},
-                                   "selected_trade_proof": _review_diagnostics(core, prior)})
-                    return result
+                    can_retry = (
+                        str(prior.get("reason") or "") == "trade no longer a verified profitable XAG Short"
+                        and not event_rows
+                        and float(prior.get("executed_bank_gbp") or 0) == 0
+                        and high_r >= float(prior["threshold_r"])
+                        and xag.config_status(core).get("management_writes_allowed")
+                    )
+                    if can_retry:
+                        pending = _safe_rearm_zero_intent_stage(core, prior, snapshot)
+                    if not pending:
+                        result.update({"status": "REVIEW_REQUIRED",
+                                       "reason": str(prior.get("reason") or "prior stage needs broker audit"),
+                                       "stage_level_r": float(prior["threshold_r"]),
+                                       "stage_bank_gbp": float(prior.get("executed_bank_gbp") or 0),
+                                       "events_by_status": {str(row["status"]): int(row["n"]) for row in event_rows},
+                                       "selected_trade_proof": _review_diagnostics(core, prior)})
+                        return result
                 if not pending:
                     executed = [float(s["threshold_r"]) for s in stages if s["status"] == "EXECUTED"]
                     next_r = _next_level(executed)
