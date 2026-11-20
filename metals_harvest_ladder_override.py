@@ -1,9 +1,9 @@
-"""Live-XAU harvest ladder v2 for Project Exit Plan Metals.
+"""Live-XAU screenshot-aligned harvest ladder for Project Exit Plan Metals.
 
-Approved 2026-10-14:
+Approved 2026-11-20:
 - first live-XAU harvest at 30R;
-- subsequent stages every +50R: 80R, 130R, 180R, ...;
-- bank 20% at the first two stages and 25% from the third onward;
+- next at 50R, then every +50R: 100R, 150R, 200R, ...;
+- bank 20% at 30R, 50R and 100R; 25% from 150R onward;
 - preserve the current active campaign without retroactive broker closes;
 - do not change practice/XAG harvest policy or individual ATR2/MFE25 managers.
 
@@ -18,7 +18,7 @@ import json
 import textwrap
 from typing import Any, Dict, List
 
-VERSION = "metals_xau_live_harvest_v2_30r_first_50r_step_20_20_25_2026_10_14"
+VERSION = "metals_xau_live_harvest_30_50_100_then_50_20_20_20_25_2026_11_20"
 FIRST_LEVEL_R = 30.0
 STEP_R = 50.0
 FIRST_FRACTION = 0.20
@@ -46,7 +46,7 @@ def _level_sequence(up_to_r: Any, extra_levels: int = 0) -> List[float]:
     # Preserve the core's practical 5000R ceiling without sharing its ladder start.
     while level <= min(top, 5000.0) + 1e-9:
         levels.append(float(level))
-        level += STEP_R
+        level = STEP_R if level == FIRST_LEVEL_R else level + STEP_R
     return levels
 
 
@@ -54,7 +54,7 @@ def _fraction_for_level(level_r: Any) -> float:
     level = float(level_r or 0.0)
     if level <= FIRST_LEVEL_R + 1e-9:
         return FIRST_FRACTION
-    if level <= FIRST_LEVEL_R + STEP_R + 1e-9:
+    if level <= 2 * STEP_R + 1e-9:
         return SECOND_FRACTION
     return LATER_FRACTION
 
@@ -63,8 +63,9 @@ def _next_level(high_r: Any) -> float:
     high = max(0.0, float(high_r or 0.0))
     if high < FIRST_LEVEL_R - 1e-9:
         return FIRST_LEVEL_R
-    steps = int((high - FIRST_LEVEL_R) // STEP_R) + 1
-    return FIRST_LEVEL_R + steps * STEP_R
+    if high < STEP_R - 1e-9:
+        return STEP_R
+    return (int(high // STEP_R) + 1) * STEP_R
 
 
 def _replace_once(src: str, old: str, new: str, label: str) -> str:
@@ -247,7 +248,7 @@ def _replace_dashboard_route(core: Any, app: Any) -> Dict[str, Any]:
         by_level: Dict[int, Dict[str, Any]] = {}
         for row in stages:
             by_level.setdefault(int(round(_f(core, row.get("threshold_r"), -1.0))), row)
-        levels = [FIRST_LEVEL_R + i * STEP_R for i in range(6)]
+        levels = [FIRST_LEVEL_R] + [i * STEP_R for i in range(1, 7)]
         levels = sorted(set(levels + [float(k) for k in by_level if k >= 0]))
         ladder = []
         for serial, level in enumerate(levels, 1):
@@ -274,7 +275,7 @@ def _replace_dashboard_route(core: Any, app: Any) -> Dict[str, Any]:
                 "first_stage_fraction": FIRST_FRACTION,
                 "second_stage_fraction": SECOND_FRACTION,
                 "later_stage_fraction": LATER_FRACTION,
-                "levels_example": [30, 80, 130, 180, 230, 280],
+                "levels_example": [30, 50, 100, 150, 200, 250, 300],
             },
         }
     return {"route": path, "replaced_old_routes": len(old)}
@@ -297,10 +298,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "first_30r": FIRST_LEVEL_R == 30.0,
         "step_50r": STEP_R == 50.0,
         "fractions_20_20_25": [
-            _fraction_for_level(30), _fraction_for_level(80), _fraction_for_level(130)
-        ] == [0.20, 0.20, 0.25],
-        "next_after_30_is_80": _next_level(30) == 80.0,
-        "next_after_80_is_130": _next_level(80) == 130.0,
+            _fraction_for_level(30), _fraction_for_level(50),
+            _fraction_for_level(100), _fraction_for_level(150)
+        ] == [0.20, 0.20, 0.20, 0.25],
+        "next_after_30_is_50": _next_level(30) == 50.0,
+        "next_after_50_is_100": _next_level(50) == 100.0,
         "practice_first_level_unchanged": _f(core, getattr(core, "METALS_HARVEST_FIRST_LEVEL_R", 50.0), 50.0) == 50.0,
         "practice_step_unchanged": _f(core, getattr(core, "METALS_HARVEST_STEP_R", 50.0), 50.0) == 50.0,
         "xau_long_atr2_unchanged": str(core._metals_demo_new_trade_exit_policy("XAUUSD", "long").get("policy")) == "ATR2_CHANDELIER",
@@ -315,7 +317,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "installed": True,
         "version": VERSION,
         "scope": "LIVE_XAU_ONLY",
-        "levels": "30,80,130,+50R",
+        "levels": "30,50,100,150,+50R",
         "first_level_r": FIRST_LEVEL_R,
         "step_r": STEP_R,
         "fractions": [FIRST_FRACTION, SECOND_FRACTION, LATER_FRACTION],
