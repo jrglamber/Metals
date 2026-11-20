@@ -1,0 +1,26 @@
+name: XAG live harvest fail-closed tests
+on:
+  push:
+    paths:
+      - metals_xag_live_harvest.py
+      - metals_live_risk_entrypoint.py
+      - test_metals_xag_live_harvest.py
+      - .github/workflows/xag-live-harvest.yml
+  pull_request:
+    paths:
+      - metals_xag_live_harvest.py
+      - metals_live_risk_entrypoint.py
+      - test_metals_xag_live_harvest.py
+      - .github/workflows/xag-live-harvest.yml
+jobs:
+  harvest-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile files
+        run: python -m py_compile metals_xag_live_harvest.py metals_live_risk_entrypoint.py test_metals_xag_live_harvest.py
+      - name: Test live harvest controls
+        run: python -m unittest -v test_metals_xag_live_harvest.py
