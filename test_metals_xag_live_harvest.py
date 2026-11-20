@@ -95,6 +95,17 @@ class HarvestRules(unittest.TestCase):
         with patch.object(h.xag, "_request", return_value={"ok": True, "data": {"order": {**order, "state": "CANCELLED"}}}):
             self.assertFalse(h._has_live_attached_stop(core, trade, "321"))
 
+    def test_embedded_pending_stop_is_authoritative_without_order_id(self):
+        core = _Core()
+        trade = {"stopLossOrder": {"price": "48.765", "state": "PENDING",
+                                   "tradeID": "321"}}
+        with patch.object(h.xag, "_request") as request:
+            self.assertTrue(h._has_live_attached_stop(core, trade, "321"))
+            request.assert_not_called()
+            self.assertFalse(h._has_live_attached_stop(core, trade, "other"))
+            self.assertFalse(h._has_live_attached_stop(
+                core, {"stopLossOrder": {**trade["stopLossOrder"], "state": "CANCELLED"}}, "321"))
+
     def test_resolved_event_is_idempotent(self):
         stage = {"id": 1, "cycle_id": "xag_test", "threshold_r": 30,
                  "selected_json": '[{"id":"321","expected_gbp":3}]',
