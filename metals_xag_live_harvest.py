@@ -104,7 +104,7 @@ def _live_snapshot(core: Any) -> Dict[str, Any]:
                 or str(link.get("side") or "").lower() != "short"
                 or str(link.get("status") or "").upper() != "OPEN"
                 or not t.get("stopLossOrderID")):
-            return {"ok": False, "reason": "missing_or_unverified_live_trade_risk_or_stop", "trade_id": bid}
+            return {"ok": False, "reason": "missing_or_unverified_live_trade_risk_or_stop", "trade_id": bid, "checks": {"side": str(link.get("side")), "local_status": str(link.get("status")), "units": units, "pnl_present": pnl is not None, "risk_present": risk is not None and risk > 0, "stop_order_id_present": bool(t.get("stopLossOrderID"))}}
         rows.append({"link": link, "id": bid, "pnl": pnl, "risk": risk})
     return {
         "ok": True, "rows": rows, "count": len(rows),
@@ -282,7 +282,7 @@ def tick(core: Any) -> Dict[str, Any]:
             try:
                 snapshot = _live_snapshot(core)
                 if not snapshot.get("ok"):
-                    result["reason"] = snapshot.get("reason")
+                    result.update({k: v for k, v in snapshot.items() if k in {"reason", "trade_id", "checks"}})
                     return result
                 state = _get_state(core)
                 count = snapshot["count"]
