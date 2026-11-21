@@ -277,6 +277,8 @@ def live_metals_lane_accounting():
         result["time_utc"] = datetime.now(timezone.utc).isoformat()
         from metals_xau_direction_coverage import diagnose_xau_coverage
         result["xau_direction_coverage"] = diagnose_xau_coverage(txs, links)
+        from metals_xau_broker_direction_audit import snapshot as xau_direction_snapshot
+        result["xau_account_direction_broker_proof"] = xau_direction_snapshot(core)
         result["xau_ledger_audit"] = {
             "broker_transaction_rows": len(txs),
             "trade_link_rows": len(links),
