@@ -178,8 +178,11 @@ def _refresh(core):
     global _cache,_at,_running
     try:
         r=audit(core)
-    except Exception:
-        r={"ok":False,"version":VERSION,"issues":["broker_history_proof_unavailable"]}
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, RuntimeError) and str(exc).replace("_","").isalnum() else type(exc).__name__
+        r={"ok":False,"version":VERSION,"issues":["broker_history_proof_unavailable",reason]}
+    import json
+    print("METALS_XAU_DIRECTION_PROOF "+json.dumps(r,default=str),flush=True)
     with _lock:
         _cache=r
         _at=time.monotonic()
