@@ -419,3 +419,10 @@ print(
     f"reset_routes={MANUAL_XAU_RESET_INSTALL.get('route_count')}",
     flush=True,
 )
+
+# Start nonblocking directional audit on production startup, independent of Hub polling.
+try:
+    from metals_xau_broker_direction_audit import snapshot as _start_xau_proof
+    _start_xau_proof(core)
+except Exception as exc:
+    print("METALS_XAU_DIRECTION_START_ERROR "+type(exc).__name__,flush=True)
