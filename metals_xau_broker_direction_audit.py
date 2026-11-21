@@ -162,11 +162,11 @@ def audit(core):
     earliest=min(_id(t.get("id")) or 0 for t in trades)
     if earliest<=0 or earliest>last:
         raise RuntimeError("invalid_earliest_xau_trade")
-    if last-earliest+1>100000:
+    if last-earliest+1>500000:
         raise RuntimeError("xau_transaction_range_cap")
     txs=[]
-    for start in range(earliest,last+1,500):
-        end=min(last,start+499)
+    for start in range(earliest,last+1,1000):
+        end=min(last,start+999)
         batch=read("/transactions/idrange?"+urlencode({"from":start,"to":end})).get("transactions")
         if not isinstance(batch,list) or sorted(_id(t.get("id")) or 0 for t in batch)!=list(range(start,end+1)):
             raise RuntimeError("transaction_range_incomplete")
