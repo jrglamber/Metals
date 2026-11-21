@@ -306,6 +306,8 @@ def live_metals_lane_accounting():
         try:
             xag_cash = verify_xag_cash(xag_cash_snapshot(core))
             result["xag_short_verified_realised"] = xag_cash
+            from metals_xag_realised_verified import apply_verified_xag_lane
+            result = apply_verified_xag_lane(result, xag_cash)
             result["xag_short_net_gbp_verified"] = True
             result["xag_short_ledger_audit"]["net_gbp_broker_transactions_verified"] = True
             result["missing_reconciliation_requirements"] = [
