@@ -126,3 +126,28 @@ def apply_top(payload, proof):
     strat["realised_scope"]="XAU_LEGACY_PLUS_XAG_SHORT_NET_BROKER_VERIFIED"
     out["xag_short_verified_realised"]=dict(proof)
     return out
+
+
+def apply_verified_xag_lane(report, proof):
+    """Populate only independently broker-verified XAG SHORT cash fields.
+
+    The full three-lane reconciliation remains false while XAU direction
+    attribution is unverified. Never turn a missing proof into zero P&L.
+    """
+    import copy
+    out = copy.deepcopy(report)
+    if not isinstance(out, dict) or not isinstance(proof, dict) or proof.get("ok") is not True:
+        raise ValueError("Verified XAG lane cash proof missing")
+    lanes = out.get("live_lanes")
+    if not isinstance(lanes, dict) or not isinstance(lanes.get("xag_short"), dict):
+        raise ValueError("XAG SHORT reporting lane missing")
+    lane = lanes["xag_short"]
+    for field in ("realised_week_gbp", "realised_month_gbp", "realised_all_time_gbp"):
+        amount = finite(proof.get(field))
+        if amount is None:
+            raise ValueError("Verified XAG cash field missing: " + field)
+        lane[field] = amount
+    lane["reporting_status"] = "broker_verified_realised_only"
+    lane["unrealised_gbp"] = None  # Separate open-position proof required.
+    out["reconciled"] = False
+    return out

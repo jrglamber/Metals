@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime,timezone,timedelta
-from metals_xag_realised_verified import verify,apply_top
+from metals_xag_realised_verified import verify,apply_top,apply_verified_xag_lane
 
 NOW=datetime(2026,11,17,21,4,tzinfo=timezone.utc)
 
@@ -27,6 +27,24 @@ def top():
                                  "high_water_gbp":60.0}}
 
 class VerifiedRealisedTests(unittest.TestCase):
+    def test_verified_xag_cash_populates_only_xag_lane(self):
+        report={"reconciled":False,"live_lanes":{
+            "xau_long":{"realised_week_gbp":None},
+            "xau_short":{"realised_week_gbp":None},
+            "xag_short":{"realised_week_gbp":None,"unrealised_gbp":None}}}
+        result=apply_verified_xag_lane(report,verify(audit(),now=NOW))
+        self.assertFalse(result["reconciled"])
+        self.assertIsNone(result["live_lanes"]["xau_long"]["realised_week_gbp"])
+        self.assertIsNone(result["live_lanes"]["xau_short"]["realised_week_gbp"])
+        self.assertAlmostEqual(result["live_lanes"]["xag_short"]["realised_week_gbp"],12.8748)
+        self.assertEqual(result["live_lanes"]["xag_short"]["reporting_status"],"broker_verified_realised_only")
+        self.assertIsNone(result["live_lanes"]["xag_short"]["unrealised_gbp"])
+        self.assertIsNone(report["live_lanes"]["xag_short"]["realised_week_gbp"])
+
+    def test_unverified_xag_proof_never_populates_lane(self):
+        with self.assertRaises(ValueError):
+            apply_verified_xag_lane({"live_lanes":{"xag_short":{}}},{"ok":False})
+
     def test_promote_only_proven_transaction_cash(self):
         proof=verify(audit(),now=NOW)
         t=apply_top(top(),proof)
