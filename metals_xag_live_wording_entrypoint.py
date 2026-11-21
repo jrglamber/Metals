@@ -275,6 +275,8 @@ def live_metals_lane_accounting():
         # dependencies so the Hub can distinguish stale and incomplete data.
         from datetime import datetime, timezone
         result["time_utc"] = datetime.now(timezone.utc).isoformat()
+        from metals_xau_direction_coverage import diagnose_xau_coverage
+        result["xau_direction_coverage"] = diagnose_xau_coverage(txs, links)
         result["xau_ledger_audit"] = {
             "broker_transaction_rows": len(txs),
             "trade_link_rows": len(links),

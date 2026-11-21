@@ -1,0 +1,22 @@
+name: XAU direction coverage diagnostic tests
+on:
+  pull_request:
+    paths:
+      - 'metals_xau_direction_coverage.py'
+      - 'test_metals_xau_direction_coverage.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - '.github/workflows/xau-direction-coverage.yml'
+  push:
+    paths:
+      - 'metals_xau_direction_coverage.py'
+      - 'test_metals_xau_direction_coverage.py'
+      - '.github/workflows/xau-direction-coverage.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest -v test_metals_xau_direction_coverage
