@@ -79,7 +79,7 @@ def live_xau_broker_accounting() -> Dict[str, Any]:
                         collect(path, v, depth + 1)
 
         collect("", snap)
-        return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "owned_open_count": len(snap.get("owned_open_trades") or []), "metrics": metrics}
+        return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "account_metrics_scope": "ACCOUNT_WIDE_ALL_INSTRUMENTS_NOT_STRATEGY_PNL", "owned_open_count": len(snap.get("owned_open_trades") or []), "metrics": metrics}
     except Exception as exc:
         return {"ok": False, "scope": "LIVE_XAU_ONLY", "owned_open_count": 0, "metrics": {}, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -224,14 +224,15 @@ _STANDARD_LAYOUT = r'''
     body.appendChild(live);
     fetch('/api/live-xau-broker-accounting',{cache:'no-store'}).then(function(r){return r.json();}).then(function(data){
       var b=live.querySelector('.pep-nested-body'), metrics=(data&&data.metrics)||{}, keys=Object.keys(metrics);
-      var html='<div class="pep-empty">Live owned open trades: '+((data&&data.owned_open_count)||0)+'</div>';
-      if(keys.length){ html+='<table><tbody>'; keys.forEach(function(k){ html+='<tr><th>'+k+'</th><td>'+metrics[k]+'</td></tr>'; }); html+='</tbody></table>'; }
+      var html='<div class="pep-empty"><strong>Owned live XAU open trades: '+((data&&data.owned_open_count)||0)+'</strong></div>'+
+        '<div class="pep-empty">The account-level balance, P/L, NAV and margin below include other instruments. They are NOT XAU strategy P&L. Use the Metals accounting panel above for verified XAU / XAG / combined cash totals.</div>';
+      if(keys.length){ html+='<details class="pep-nested"><summary>Raw OANDA account metrics · all instruments</summary><table><tbody>'; keys.forEach(function(k){ html+='<tr><th>'+k+'</th><td>'+metrics[k]+'</td></tr>'; }); html+='</tbody></table></details>'; }
       b.innerHTML=html;
     }).catch(function(){ var b=live.querySelector('.pep-nested-body'); if(b) b.innerHTML='<div class="pep-empty">Live broker/accounting view unavailable.</div>'; });
 
     var demo=document.createElement('details');
     demo.className='pep-nested';
-    demo.innerHTML='<summary>DEMO / RESEARCH — XAG + legacy practice positions</summary><div class="pep-nested-body"></div>';
+    demo.innerHTML='<summary>DEMO / RESEARCH — XAG LONG + legacy practice positions</summary><div class="pep-nested-body"></div>';
     var db=demo.querySelector('.pep-nested-body');
     if(demoOpen){
       var candidates=demoOpen.querySelectorAll ? demoOpen.querySelectorAll('summary,h1,h2,h3,h4,h5,strong,b,div,span') : [];
