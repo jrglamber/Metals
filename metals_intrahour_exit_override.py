@@ -2,8 +2,9 @@
 
 Strategy rules:
 * XAU long: 48 completed 1h candles, then ATR2 Chandelier.
-* XAU short: 48 completed 1h candles, then MFE25 (retain 75% MFE),
-  with early activation at 2R for the live broker lane only.
+* XAU short: 48 completed 1h candles, then MFE25 (retain 75% MFE).
+* Proposed 2R early-protection overlay for both live XAU sides, disabled
+  by default and only activated via explicit environment feature gate.
 
 The completed-hour research/strategy logic remains the source of the stop
 candidate.  This wrapper independently synchronises the candidate to an OANDA
@@ -24,6 +25,8 @@ VERSION = "metals_xau_intrahour_broker_stops_v4_early2r_2026_11_21"
 EARLY_MFE_THRESHOLD_R = 2.0
 EARLY_MFE_RETENTION = 0.75
 EARLY_MFE_POLICY = "MFE_GIVEBACK_25"
+EARLY_LONG_POLICY = "ATR2_CHANDELIER"
+EARLY_2R_ENABLE_ENV = "METALS_XAU_EARLY_2R_ENABLED"
 DEFAULT_POLL_SECONDS = 5.0
 MIN_HOLD_CANDLES = 48
 
@@ -147,6 +150,73 @@ def _early_short_candidate(core: Any, link: Dict[str, Any], metrics: Dict[str, A
             "early_2r": True}
 
 
+def _early_long_candidate(core: Any, link: Dict[str, Any], metrics: Dict[str, Any],
+                          actual_stop: Optional[float]) -> Dict[str, Any]:
+    """Live XAU ATR2 longs before candle 48; retain 75% of peak after 2R.
+
+    Does not replace the ATR2 policy after candle 48 and never loosens a broker stop.
+    The risk unit comes from the immutable opening emergency stop.
+    """
+    if (_s(core, link.get("side")).lower() != "long"
+            or _s(core, metrics.get("side")).lower() != "long"
+            or _s(core, link.get("active_exit_policy")).upper() != EARLY_LONG_POLICY):
+        return {"eligible": False, "reason": "not_live_xau_atr2_long"}
+    h = _f(core, metrics.get("hold_candles"))
+    entry = _f(core, link.get("entry_price"))
+    hard = _f(core, link.get("stop_price"))
+    mfe = _f(core, metrics.get("mfe_r"))
+    current = _f(core, metrics.get("current_price"))
+    if (h is None or h < 0 or h >= MIN_HOLD_CANDLES
+            or any(x is None or not math.isfinite(x) for x in (entry, hard, mfe, current))
+            or entry <= 0 or hard <= 0 or hard >= entry or current <= 0):
+        return {"eligible": False, "reason": "early_long_missing_or_invalid_metrics"}
+    risk = entry - hard
+    arm_stop = _xau_broker_stop_price(entry + EARLY_MFE_THRESHOLD_R * EARLY_MFE_RETENTION * risk, "long")
+    if arm_stop is None:
+        return {"eligible": False, "reason": "early_long_invalid_activation_stop"}
+    activated = actual_stop is not None and actual_stop > 0 and actual_stop >= arm_stop
+    if mfe < EARLY_MFE_THRESHOLD_R and not activated:
+        return {"eligible": False, "reason": "early_long_below_2r"}
+    peak = max(mfe, EARLY_MFE_THRESHOLD_R)
+    floor_r = peak * EARLY_MFE_RETENTION
+    price = _xau_broker_stop_price(entry + floor_r * risk, "long")
+    if price is None:
+        return {"eligible": False, "reason": "early_long_invalid_stop"}
+    step_pct = _f(core, getattr(core, "METALS_DEMO_MANAGER_MIN_STOP_STEP_PCT", 0.02)) or 0.02
+    previous = actual_stop if actual_stop is not None else hard
+    if price <= previous + max(0.0, entry * step_pct / 100.0):
+        return {"eligible": False, "reason": "early_long_already_protected_or_step", "activated": activated}
+    return {"eligible": True, "stop_price": price, "mfe_r": peak,
+            "mfe_floor_r": floor_r, "giveback_fraction": 0.25,
+            "reason": f"XAU LONG early 2R MFE25 retains 75% of {peak:.4f}R peak; ATR2 resumes at candle 48",
+            "early_2r": True}
+
+
+def _early_long_selftest() -> Dict[str, Any]:
+    class Core:
+        safe_float = staticmethod(lambda x: float(x) if x is not None else None)
+        safe_str = staticmethod(lambda x: str(x or ""))
+    c = Core()
+    link = {"side": "long", "active_exit_policy": EARLY_LONG_POLICY,
+            "entry_price": 100.0, "stop_price": 98.0}
+    m = {"side": "long", "hold_candles": 12, "mfe_r": 2.0, "current_price": 104.0}
+    def candidate(l=link, metrics=m, stop=98.0):
+        return _early_long_candidate(c, l, metrics, stop)
+    assert not candidate(metrics={**m, "mfe_r": 1.999})["eligible"]
+    assert candidate()["stop_price"] == 103.0
+    assert candidate(metrics={**m, "mfe_r": 3.0})["stop_price"] == 104.5
+    assert not candidate(stop=103.5)["eligible"]
+    assert not candidate(stop=103.0)["eligible"]
+    assert not candidate(metrics={**m, "hold_candles": 48})["eligible"]
+    assert not candidate(l={**link, "side": "short"}, metrics={**m, "side": "short"})["eligible"]
+    assert not candidate(l={**link, "active_exit_policy": "MFE_GIVEBACK_25"})["eligible"]
+    assert not candidate(l={**link, "stop_price": None})["eligible"]
+    assert not candidate(metrics={**m, "mfe_r": float("nan")})["eligible"]
+    assert not candidate(metrics={**m, "mfe_r": 1.0}, stop=103.0)["eligible"]
+    assert candidate(metrics={**m, "mfe_r": 2.5}, stop=103.0)["stop_price"] == 103.75
+    return {"ok": True, "cases": 12, "version": VERSION}
+
+
 def _early_short_selftest() -> Dict[str, Any]:
     class Core:
         safe_float = staticmethod(lambda x: float(x) if x is not None else None)
@@ -176,8 +246,9 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     if getattr(core, "_METALS_XAU_INTRAHOUR_EXITS_INSTALLED", False):
         return dict(getattr(core, "_METALS_XAU_INTRAHOUR_EXIT_STATUS", {"installed": True, "version": VERSION}))
 
-    selftest = _early_short_selftest()
-    print(f"METALS_XAU_EARLY2R_SELFTEST {selftest}", flush=True)
+    selftest = {"short": _early_short_selftest(), "long": _early_long_selftest()}
+    early_2r_enabled = str(os.getenv(EARLY_2R_ENABLE_ENV, "false")).strip().lower() in {"1", "true", "yes", "on"}
+    print(f"METALS_XAU_EARLY2R_SELFTEST {selftest} enabled={early_2r_enabled}", flush=True)
     original_metrics = core._metals_xau_live_trade_metrics
     original_manager = core.metals_xau_live_manager_tick
     poll_seconds = max(2.0, float(os.getenv("METALS_XAU_INTRAHOUR_POLL_SECONDS", str(DEFAULT_POLL_SECONDS)) or DEFAULT_POLL_SECONDS))
@@ -207,8 +278,8 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "poll_seconds": poll_seconds,
         "policies": {"XAUUSD_LONG": "ATR2_CHANDELIER", "XAUUSD_SHORT": "MFE_GIVEBACK_25"},
         "minimum_hold_candles": MIN_HOLD_CANDLES,
-        "strategy_rules_changed": True,
-        "early_mfe_policy": {"scope": "LIVE_XAU_SHORT_ONLY", "threshold_r": EARLY_MFE_THRESHOLD_R, "retention": EARLY_MFE_RETENTION, "normal_hold_candles": MIN_HOLD_CANDLES, "selftest": selftest},
+        "strategy_rules_changed": bool(early_2r_enabled),
+        "early_mfe_policy": {"scope": "LIVE_XAU_LONG_AND_SHORT", "threshold_r": EARLY_MFE_THRESHOLD_R, "retention": EARLY_MFE_RETENTION, "normal_hold_candles": MIN_HOLD_CANDLES, "enabled": early_2r_enabled, "enable_env": EARLY_2R_ENABLE_ENV, "selftest": selftest},
         "live_price_used_for_mfe": True,
         "broker_hosted_stop_execution": True,
         "broker_stop_writer": "_metals_xau_live_update_stop",
@@ -397,15 +468,31 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 hold = int(_f(core, metrics.get("hold_candles")) or 0)
                 early = hold < MIN_HOLD_CANDLES
                 if early:
+                    # The feature is deliberately disabled unless explicitly enabled.
+                    # A merge must not silently turn on new stop behaviour.
+                    if not early_2r_enabled:
+                        continue
                     with price_lock:
                         early_quote_ok = price_cache.get("early_quote_ok") is True
-                    if not early_quote_ok:
+                        quote_time = price_cache.get("broker_quote_time")
+                    try:
+                        quote_age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(quote_time).replace("Z", "+00:00"))).total_seconds()
+                    except (ValueError, TypeError):
+                        quote_age = None
+                    if not early_quote_ok or quote_age is None or not -5 <= quote_age <= 30:
                         continue
-                    # Require authoritative broker side, instrument and matched link.
+                    # Require an exact matched XAU broker trade and consistent signed units.
+                    side_hint = _s(core, work.get("side")).lower()
+                    units = _f(core, bt.get("currentUnits"))
                     if (_s(core, bt.get("instrument")).upper() != "XAU_USD"
-                            or (_f(core, bt.get("currentUnits")) or 0.0) >= 0):
+                            or units is None or units == 0
+                            or (side_hint == "short" and units >= 0)
+                            or (side_hint == "long" and units <= 0)
+                            or side_hint not in {"long", "short"}):
                         continue
-                    cand = _early_short_candidate(core, work, metrics, actual_stop)
+                    cand = (_early_short_candidate(core, work, metrics, actual_stop)
+                            if side_hint == "short"
+                            else _early_long_candidate(core, work, metrics, actual_stop))
                     if cand.get("eligible"):
                         summary["early_2r_eligible"] += 1
                 else:
@@ -438,7 +525,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 # audited live-close path immediately instead.
                 breached = (side == "long" and current_price <= stop_price) or (side == "short" and current_price >= stop_price)
                 if breached:
-                    reason = "intrahour_broker_stop_catchup_early2r_mfe25" if early else f"intrahour_broker_stop_catchup_{'mfe25' if side == 'short' else 'atr2'}"
+                    reason = f"intrahour_broker_stop_catchup_early2r_{side}" if early else f"intrahour_broker_stop_catchup_{'mfe25' if side == 'short' else 'atr2'}"
                     raw_id = int(_f(core, metrics.get("latest_signal_id")) or _f(core, link.get("raw_signal_id")) or 0)
                     qid = core._metals_xau_live_queue_close(link, reason, raw_id)
                     closed = dict(core._metals_xau_live_close(link, qid) or {})
@@ -518,7 +605,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         status["started"] = True
         print(
             "METALS_XAU_INTRAHOUR_EXITS_STARTED "
-            f"version={VERSION} poll={poll_seconds:.1f}s broker_hosted=True hold={MIN_HOLD_CANDLES} early_xau_short_mfe_r={EARLY_MFE_THRESHOLD_R}",
+            f"version={VERSION} poll={poll_seconds:.1f}s broker_hosted=True hold={MIN_HOLD_CANDLES} early2r_enabled={early_2r_enabled} early2r_threshold_r={EARLY_MFE_THRESHOLD_R}",
             flush=True,
         )
         while not stop_event.is_set():
