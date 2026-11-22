@@ -154,6 +154,29 @@ def _capture(core):
             "reason_type": type(exc).__name__,
         }
 
+    # Account-wide broker cash is NOT proof of strategy ownership.
+    try:
+        from metals_xau_broker_direction_audit import snapshot as xau_snapshot
+        proof = xau_snapshot(core)
+        valid = (proof.get("ok") is True
+                 and proof.get("scope") == "OANDA_ACCOUNT_ALL_XAU_NOT_STRATEGY_OWNERSHIP"
+                 and proof.get("transaction_history_complete") is True
+                 and proof.get("trade_history_complete") is True)
+        report["xau_account_cash"] = {
+            "ok": bool(valid),
+            "status": "BROKER_ACCOUNT_VERIFIED_NOT_STRATEGY_ATTRIBUTED" if valid else "UNVERIFIED",
+            "scope": "OANDA_ACCOUNT_ALL_XAU_NOT_STRATEGY_OWNERSHIP",
+            "directions": proof.get("directions") if valid else None,
+            "trade_counts": proof.get("trade_counts") if valid else None,
+            "account_currency": proof.get("account_currency") if valid else None,
+        }
+    except Exception as exc:
+        report["xau_account_cash"] = {
+            "ok": False, "status": "UNVERIFIED",
+            "scope": "OANDA_ACCOUNT_ALL_XAU_NOT_STRATEGY_OWNERSHIP",
+            "directions": None, "reason_type": type(exc).__name__,
+        }
+
     try:
         risk = portfolio_live_risk._read("metals")
         # A cached risk calculation can precede a newly closed trade.
