@@ -7,6 +7,10 @@ import unittest
 
 from metals_intrahour_exit_override import (
     EARLY_MFE_POLICY,
+    EARLY_LONG_POLICY,
+    EARLY_2R_ENABLE_ENV,
+    _early_long_candidate,
+    _early_long_selftest,
     _early_short_candidate,
     _early_short_selftest,
 )
@@ -90,6 +94,77 @@ class XauEarlyTwoRTests(unittest.TestCase):
         self.assertFalse(
             self.candidate(metrics={**self.metrics, "mfe_r": float("nan")})["eligible"]
         )
+
+
+class XauLongEarlyTwoRTests(unittest.TestCase):
+    def setUp(self):
+        self.core = FakeCore()
+        self.link = {
+            "side": "long", "active_exit_policy": EARLY_LONG_POLICY,
+            "entry_price": 100.0, "stop_price": 98.0,
+        }
+        self.metrics = {
+            "side": "long", "hold_candles": 12,
+            "mfe_r": 2.0, "current_price": 104.0,
+        }
+
+    def candidate(self, *, link=None, metrics=None, actual_stop=98.0):
+        return _early_long_candidate(
+            self.core,
+            self.link if link is None else link,
+            self.metrics if metrics is None else metrics,
+            actual_stop,
+        )
+
+    def test_builtin_long_selftest(self):
+        self.assertTrue(_early_long_selftest()["ok"])
+
+    def test_two_r_arm_and_three_r_ratchet(self):
+        self.assertFalse(self.candidate(metrics={**self.metrics, "mfe_r": 1.99})["eligible"])
+        self.assertEqual(self.candidate()["stop_price"], 103.0)
+        self.assertEqual(
+            self.candidate(metrics={**self.metrics, "mfe_r": 3.0})["stop_price"], 104.5
+        )
+
+    def test_early_long_stop_never_loosened(self):
+        for broker_stop in (103.0, 103.5, 105.0):
+            self.assertFalse(self.candidate(actual_stop=broker_stop)["eligible"])
+        self.assertEqual(
+            self.candidate(
+                metrics={**self.metrics, "mfe_r": 2.5}, actual_stop=103.0
+            )["stop_price"],
+            103.75,
+        )
+
+    def test_atr2_takes_over_at_48_candles(self):
+        for completed in (48, 49, 100):
+            self.assertFalse(
+                self.candidate(
+                    metrics={**self.metrics, "hold_candles": completed}
+                )["eligible"]
+            )
+
+    def test_short_side_and_unrecognised_policy_excluded(self):
+        self.assertFalse(
+            self.candidate(
+                link={**self.link, "side": "short"},
+                metrics={**self.metrics, "side": "short"},
+            )["eligible"]
+        )
+        self.assertFalse(
+            self.candidate(
+                link={**self.link, "active_exit_policy": EARLY_MFE_POLICY}
+            )["eligible"]
+        )
+
+    def test_invalid_original_stop_never_arms(self):
+        for stop in (None, 100.0, 103.0):
+            self.assertFalse(
+                self.candidate(link={**self.link, "stop_price": stop})["eligible"]
+            )
+
+    def test_feature_gate_name_is_explicit(self):
+        self.assertEqual(EARLY_2R_ENABLE_ENV, "METALS_XAU_EARLY_2R_ENABLED")
 
 
 if __name__ == "__main__":
