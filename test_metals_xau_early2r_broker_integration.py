@@ -50,6 +50,7 @@ class BrokerCore:
         self.closes = []
         self.fail_writer = False
         self.mature_candidates = 0
+        self.base_mfe = 0
 
     def get_conn(self):
         conn = sqlite3.connect(self.filename)
@@ -81,7 +82,7 @@ class BrokerCore:
     def _metals_xau_live_trade_metrics(self, link):
         return {
             "ok": True, "side": self.side,
-            "hold_candles": self.hold, "mfe_r": 0,
+            "hold_candles": self.hold, "mfe_r": self.base_mfe,
             "current_price": self.price, "current_r": 0, "latest_signal_id": 20,
         }
 
@@ -115,6 +116,8 @@ class BrokerCore:
         return 11
 
     def _metals_xau_live_close(self, link, queue_id):
+        with self.get_conn() as conn:
+            conn.execute("UPDATE metals_xau_live_trade_links SET status='CLOSED' WHERE id=?", (link["id"],))
         return {"ok": True, "status": "CLOSED"}
 
 
@@ -193,6 +196,28 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(result["intrahour_stop_sync"]["errors"], 1)
         self.assertEqual(core.writes, [])
         self.assertEqual(core.live_broker_trade["stopLossOrder"]["price"], "102")
+
+    def test_reversal_catchup_closes_once_short(self):
+        core, _ = self.make_manager(enabled=True, price=97.5)
+        core.base_mfe = 2.2
+        first = core.metals_xau_live_manager_tick()
+        self.assertEqual(first["intrahour_stop_sync"]["early_2r_catchup_closed"], 1)
+        self.assertEqual(core.writes, [])
+        self.assertEqual(core.closes, ["intrahour_broker_stop_catchup_early2r_short"])
+        second = core.metals_xau_live_manager_tick()
+        self.assertEqual(second["intrahour_stop_sync"]["catchup_closed"], 0)
+        self.assertEqual(len(core.closes), 1)
+
+    def test_reversal_catchup_closes_once_long(self):
+        core, _ = self.make_manager(side="long", enabled=True, price=102.0)
+        core.base_mfe = 2.2
+        first = core.metals_xau_live_manager_tick()
+        self.assertEqual(first["intrahour_stop_sync"]["early_2r_catchup_closed"], 1)
+        self.assertEqual(core.writes, [])
+        self.assertEqual(core.closes, ["intrahour_broker_stop_catchup_early2r_long"])
+        second = core.metals_xau_live_manager_tick()
+        self.assertEqual(second["intrahour_stop_sync"]["catchup_closed"], 0)
+        self.assertEqual(len(core.closes), 1)
 
     def test_48_hour_transition_delegates_to_old_manager(self):
         core, _ = self.make_manager(side="long", hold=48, enabled=True)
