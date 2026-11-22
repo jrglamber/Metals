@@ -205,7 +205,13 @@ class XagLiveWordingMiddleware:
                         if "pep-xag-ladder-js" not in text:
                             add += live_xag_harvest_dashboard.DASHBOARD_SNIPPET
                         if "pep-metals-period-accounting-script" not in text:
-                            add += period_accounting_dashboard.DASHBOARD_SNIPPET
+                            # Financial summary goes ABOVE legacy diagnostics.
+                            anchor = "<h2>Details</h2>"
+                            panel = period_accounting_dashboard.DASHBOARD_SNIPPET
+                            if anchor in text:
+                                text = text.replace(anchor, panel + anchor, 1)
+                            else:
+                                text = text.replace("</body>", panel + "</body>", 1)
                         if add:
                             anchor = "<h2>Details</h2>"
                             if anchor in text:
