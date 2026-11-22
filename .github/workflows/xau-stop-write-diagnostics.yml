@@ -5,6 +5,7 @@ on:
       - 'metals_intrahour_exit_override.py'
       - 'test_metals_xau_stop_write_diagnostics.py'
       - 'test_metals_xau_stop_rounding.py'
+      - 'test_metals_xau_early2r.py'
   push:
     branches: [fix/xau-short-stop-price-precision-20261118]
 jobs:
@@ -17,4 +18,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m py_compile metals_intrahour_exit_override.py
-      - run: python -m unittest -v test_metals_xau_stop_write_diagnostics test_metals_xau_stop_rounding
+      - run: python -m unittest -v test_metals_xau_stop_write_diagnostics test_metals_xau_stop_rounding test_metals_xau_early2r
