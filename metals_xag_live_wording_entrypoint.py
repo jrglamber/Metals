@@ -20,6 +20,7 @@ import metals_xag_harvest_dashboard as live_xag_harvest_dashboard
 import metals_live_open_pnl_display as combined_open_pnl
 import metals_reporting_snapshot as authoritative_reporting
 import metals_live_analysis_export as live_analysis_export
+import metals_period_accounting_dashboard as period_accounting_dashboard
 import metals_forward_economic_capture as forward_capture
 from metals_route_priority import promote_read_only_route
 from metals_live_risk_entrypoint import app as app
@@ -203,6 +204,8 @@ class XagLiveWordingMiddleware:
                             add += live_xag_health.DASHBOARD_SNIPPET
                         if "pep-xag-ladder-js" not in text:
                             add += live_xag_harvest_dashboard.DASHBOARD_SNIPPET
+                        if "pep-metals-period-accounting-script" not in text:
+                            add += period_accounting_dashboard.DASHBOARD_SNIPPET
                         if add:
                             anchor = "<h2>Details</h2>"
                             if anchor in text:
@@ -397,6 +400,9 @@ except Exception as exc:
                                 "error_class":type(exc).__name__}
     print("METALS_FORWARD_RESEARCH_START_ERROR "+
           type(exc).__name__,flush=True)
+
+PERIOD_ACCOUNTING_ROUTE = period_accounting_dashboard.install(app, core, promote_read_only_route)
+print("METALS_PERIOD_ACCOUNTING_ROUTE " + str(PERIOD_ACCOUNTING_ROUTE), flush=True)
 
 app.add_middleware(XagLiveWordingMiddleware)
 
