@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import urlencode
 import threading
+import json
+import hashlib
 import time
 from metals_xag_transaction_audit import dec, _items
 from metals_xag_ledger_audit import _id, _utc
@@ -162,15 +164,33 @@ def audit(core):
     earliest=min(_id(t.get("id")) or 0 for t in trades)
     if earliest<=0 or earliest>last:
         raise RuntimeError("invalid_earliest_xau_trade")
-    if last-earliest+1>500000:
-        raise RuntimeError("xau_transaction_range_cap")
+    # Retain only XAU and account financing events, after validating every ID.
+    # A single atomic checkpoint ties the retained records to contiguous coverage.
+    key=hashlib.sha256(account.encode()).hexdigest()
+    with core.get_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS metals_xau_direction_checkpoint (account_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        row=conn.execute("SELECT payload FROM metals_xau_direction_checkpoint WHERE account_key = ?",(key,)).fetchone()
+        conn.commit()
     txs=[]
-    for start in range(earliest,last+1,1000):
+    cursor=earliest-1
+    if row:
+        saved=json.loads(row["payload"])
+        if saved.get("version")==VERSION and saved.get("earliest")==earliest and earliest-1<=saved.get("cursor",0)<=last:
+            txs=saved["events"]
+            cursor=saved["cursor"]
+    if last-cursor>500000:
+        raise RuntimeError("xau_transaction_range_cap")
+    for start in range(cursor+1,last+1,1000):
         end=min(last,start+999)
         batch=read("/transactions/idrange?"+urlencode({"from":start,"to":end})).get("transactions")
         if not isinstance(batch,list) or sorted(_id(t.get("id")) or 0 for t in batch)!=list(range(start,end+1)):
             raise RuntimeError("transaction_range_incomplete")
-        txs.extend(batch)
+        txs.extend(t for t in batch if t.get("instrument")=="XAU_USD" or t.get("type") in ("DAILY_FINANCING","DIVIDEND_ADJUSTMENT"))
+        # Persist validated pages even if a later page fails; never publish partial proof.
+        payload=json.dumps(dict(version=VERSION,earliest=earliest,cursor=end,events=txs))
+        with core.get_conn() as conn:
+            conn.execute("INSERT INTO metals_xau_direction_checkpoint(account_key,payload) VALUES (?,?) ON CONFLICT(account_key) DO UPDATE SET payload=excluded.payload",(key,payload))
+            conn.commit()
     end_summary=read("/summary")
     if _id(end_summary.get("lastTransactionID") or end_summary.get("account",{}).get("lastTransactionID"))!=last:
         raise RuntimeError("broker_checkpoint_changed")
