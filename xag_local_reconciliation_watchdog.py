@@ -50,7 +50,8 @@ def _retry_confirmed_xag_close_requests(core, live, reconciliation):
     """Reattempt ONLY existing failed protective exits; never submit new entries."""
     state = {"attempted": 0, "confirmed": 0, "pending": 0, "reason": "none"}
     pending = [link for link in live._local_open(core)
-               if str(link.get("status") or "").upper() == "CLOSE_RETRY"]
+               if isinstance(link, dict)
+               and str(link.get("status") or "").upper() == "CLOSE_RETRY"]
     state["pending"] = len(pending)
     if not pending:
         return state
