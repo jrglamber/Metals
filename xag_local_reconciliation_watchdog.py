@@ -92,6 +92,15 @@ def _retry_confirmed_xag_close_requests(core, live, reconciliation, current_link
             state["reason"] = str(
                 result.get("reason") or result.get("error") or
                 "broker_close_retry_pending")[:120]
+            response = result.get("response") or {}
+            payload = response.get("data") or {}
+            reject = payload.get("orderRejectTransaction") or {}
+            state["http_status"] = response.get("status_code")
+            state["broker_error_code"] = str(
+                payload.get("errorCode") or reject.get("rejectReason") or
+                payload.get("errorMessage") or
+                ("response_success_without_broker_closed" if response.get("ok")
+                 else "broker_error_unclassified"))[:96]
     if state["confirmed"]:
         _invalidate_local_ownership_caches()
     return state
@@ -133,7 +142,9 @@ def once(core):
     if retries["pending"]:
         print("XAG_PROTECTIVE_CLOSE_RETRY " + str({
             "pending": retries["pending"], "attempted": retries["attempted"],
-            "confirmed": retries["confirmed"], "reason": retries["reason"]
+            "confirmed": retries["confirmed"], "reason": retries["reason"],
+            "http_status": retries.get("http_status"),
+            "broker_error_code": retries.get("broker_error_code")
         }), flush=True)
     return {"ok": result.get("ok") is True, "changed_local_links": changed,
             "reason": _last["reason"], "close_retries": retries}
