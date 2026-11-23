@@ -447,3 +447,18 @@ import metals_xau_nav_risk_override as _xau_nav_budget
 XAU_NAV_ENTRY_BUDGET_INSTALL = _xau_nav_budget.install(core, app)
 print("METALS_XAU_NAV_ENTRY_BUDGET " +
       json.dumps(XAU_NAV_ENTRY_BUDGET_INSTALL, default=str), flush=True)
+
+# The entry gate can only admit orders if these fresh broker proofs are present.
+# Report a single read-only startup check; never send orders or change stops here.
+try:
+    _xau_budget_proof = _xau_nav_budget.broker_snapshot(core)
+    print("METALS_XAU_NAV_BUDGET_BROKER_PROOF " +
+          json.dumps({"ok": True, "reconciled": True,
+                      "nav_gbp": round(_xau_budget_proof["nav"], 2),
+                      "open_xau": _xau_budget_proof["open"],
+                      "mark_to_stop_gbp": round(_xau_budget_proof["used"], 2),
+                      "cap_gbp": round(_xau_budget_proof["cap"], 2)}), flush=True)
+except Exception as _xau_budget_probe_error:
+    print("METALS_XAU_NAV_BUDGET_BROKER_PROOF " +
+          json.dumps({"ok": False, "new_entries_fail_closed": True,
+                      "reason": f"{type(_xau_budget_probe_error).__name__}: {_xau_budget_probe_error}"}), flush=True)
