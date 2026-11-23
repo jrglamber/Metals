@@ -46,10 +46,10 @@ def _invalidate_local_ownership_caches():
         pass
 
 
-def _retry_confirmed_xag_close_requests(core, live, reconciliation):
+def _retry_confirmed_xag_close_requests(core, live, reconciliation, current_links):
     """Reattempt ONLY existing failed protective exits; never submit new entries."""
     state = {"attempted": 0, "confirmed": 0, "pending": 0, "reason": "none"}
-    pending = [link for link in live._local_open(core)
+    pending = [link for link in current_links
                if isinstance(link, dict)
                and str(link.get("status") or "").upper() == "CLOSE_RETRY"]
     state["pending"] = len(pending)
@@ -104,8 +104,10 @@ def once(core):
     with live._ENTRY_LOCK:
         before = len(live._local_open(core))
         result = live._reconcile(core)
-        retries = _retry_confirmed_xag_close_requests(core, live, result)
-        after = len(live._local_open(core))
+        current_links = live._local_open(core)
+        retries = _retry_confirmed_xag_close_requests(core, live, result, current_links)
+        after = (len(live._local_open(core)) if retries["confirmed"]
+                 else len(current_links))
     changed = abs(before-after) + int(result.get("recovered_historical_live_count") or 0)
     if changed:
         _invalidate_local_ownership_caches()
