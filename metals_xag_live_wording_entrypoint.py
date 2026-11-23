@@ -438,3 +438,12 @@ try:
     _start_xau_proof(core)
 except Exception as exc:
     print("METALS_XAU_DIRECTION_START_ERROR "+type(exc).__name__,flush=True)
+
+
+# Final XAU entry-policy layer: NAV mark-to-stop budget replaces the cumulative
+# +2R funding and half-frequency vetoes. Installed after every other live
+# execution wrapper; does not modify MFE25, ATR2, harvest or XAG entry routing.
+import metals_xau_nav_risk_override as _xau_nav_budget
+XAU_NAV_ENTRY_BUDGET_INSTALL = _xau_nav_budget.install(core, app)
+print("METALS_XAU_NAV_ENTRY_BUDGET " +
+      json.dumps(XAU_NAV_ENTRY_BUDGET_INSTALL, default=str), flush=True)
