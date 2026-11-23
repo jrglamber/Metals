@@ -1,0 +1,25 @@
+name: XAU NAV Entry Risk Budget
+on:
+  push:
+    paths:
+      - metals_xau_nav_risk_override.py
+      - metals_xag_live_wording_entrypoint.py
+      - tests/test_xau_nav_risk_budget.py
+      - .github/workflows/xau-nav-budget-tests.yml
+  pull_request:
+    paths:
+      - metals_xau_nav_risk_override.py
+      - metals_xag_live_wording_entrypoint.py
+      - tests/test_xau_nav_risk_budget.py
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax verification
+        run: python -m py_compile metals_xau_nav_risk_override.py metals_xag_live_wording_entrypoint.py
+      - name: Broker stop and entry-budget tests
+        run: python -m unittest discover -s tests -p 'test_xau_nav_risk_budget.py' -v
