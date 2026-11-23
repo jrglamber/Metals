@@ -1,10 +1,9 @@
 """Broker-authoritative XAG Short local-ledger reconciliation watchdog.
 
-Only OANDA GET endpoints are used by xag_short_live_override._reconcile.
-Local ledger rows may be updated ONLY when broker trade details explicitly
-prove OPEN with a protective stop or CLOSED. No trade submission, stop change,
-or broker close. A stale local OPEN row must not disable combined reporting
-indefinitely when the original broker trade has closed.
+Broker-authoritative reconciliation uses OANDA GET endpoints. A separate,
+bounded safety path retries ONLY a preexisting protective CLOSE_RETRY after
+fresh identity/size and broker-state verification. New entries, stops and
+strategy are unaffected; broker CLOSED confirmation is mandatory.
 """
 from __future__ import annotations
 
@@ -13,14 +12,17 @@ import os
 import threading
 import time
 
-VERSION = "xag_local_broker_reconcile_watchdog_v1_2026_11_18"
+VERSION = "xag_local_broker_reconcile_watchdog_v2_close_retry_2026_11_23"
 INTERVAL_SECONDS = 60
+MAX_RETRIES_PER_POLL = 2
 _lock = threading.Lock()
 _thread = None
 _last = {
     "installed": False, "thread_alive": False, "last_run_utc": None,
     "last_ok": None, "reason": "not_started",
     "last_changed_count": 0, "consecutive_errors": 0,
+    "last_close_retry_attempted": 0, "last_close_retry_confirmed": 0,
+    "last_close_retry_pending": 0, "last_close_retry_reason": "not_checked",
 }
 
 
@@ -44,6 +46,56 @@ def _invalidate_local_ownership_caches():
         pass
 
 
+def _retry_confirmed_xag_close_requests(core, live, reconciliation):
+    """Reattempt ONLY existing failed protective exits; never submit new entries."""
+    state = {"attempted": 0, "confirmed": 0, "pending": 0, "reason": "none"}
+    pending = [link for link in live._local_open(core)
+               if str(link.get("status") or "").upper() == "CLOSE_RETRY"]
+    state["pending"] = len(pending)
+    if not pending:
+        return state
+    if not (reconciliation.get("ok") is True
+            and reconciliation.get("exact_live_ownership") is True):
+        state["reason"] = "broker_ownership_unverified"
+        return state
+    if not live.config_status(core).get("management_writes_allowed"):
+        state["reason"] = "management_writes_disabled"
+        return state
+    for link in pending[:MAX_RETRIES_PER_POLL]:
+        bid = str(link.get("broker_trade_id") or "").strip()
+        if not bid or str(link.get("side") or "").lower() != "short":
+            state["reason"] = "local_short_ownership_unverified"
+            continue
+        response = live._request(
+            core, f"/v3/accounts/{live._account_id(core)}/trades/{bid}", "GET")
+        trade = (response.get("data") or {}).get("trade") if response.get("ok") else None
+        if not isinstance(trade, dict):
+            state["reason"] = "broker_trade_detail_unavailable"
+            continue
+        broker_state = str(trade.get("state") or "").upper()
+        units = live._num(core, trade.get("currentUnits"))
+        if (str(trade.get("id") or "") != bid
+                or str(trade.get("instrument") or "").upper() != "XAG_USD"
+                or broker_state not in ("OPEN", "CLOSED")
+                or (broker_state == "OPEN" and
+                    (units is None or abs(units + live.PILOT_UNITS) > 1e-8))):
+            state["reason"] = "broker_short_identity_or_units_unverified"
+            continue
+        state["attempted"] += 1
+        result = live._close_link(
+            core, link, str(link.get("close_reason") or "MFE25_CLOSE_RETRY"))
+        if result.get("ok") is True:
+            state["confirmed"] += 1
+            state["reason"] = "broker_closed_confirmed"
+        else:
+            state["reason"] = str(
+                result.get("reason") or result.get("error") or
+                "broker_close_retry_pending")[:120]
+    if state["confirmed"]:
+        _invalidate_local_ownership_caches()
+    return state
+
+
 def once(core):
     import xag_short_live_override as live
     # Use the same lock as new XAG entry preflight and manager actions.
@@ -51,6 +103,7 @@ def once(core):
     with live._ENTRY_LOCK:
         before = len(live._local_open(core))
         result = live._reconcile(core)
+        retries = _retry_confirmed_xag_close_requests(core, live, result)
         after = len(live._local_open(core))
     changed = abs(before-after) + int(result.get("recovered_historical_live_count") or 0)
     if changed:
@@ -61,6 +114,10 @@ def once(core):
         _last["reason"] = str(result.get("reason") or
                               ("reconciled" if result.get("ok") is True else "broker_reconciliation_unavailable"))[:140]
         _last["last_changed_count"] = changed
+        _last["last_close_retry_attempted"] = retries["attempted"]
+        _last["last_close_retry_confirmed"] = retries["confirmed"]
+        _last["last_close_retry_pending"] = retries["pending"]
+        _last["last_close_retry_reason"] = retries["reason"]
         _last["consecutive_errors"] = (0 if result.get("ok") is True
                                        else _last["consecutive_errors"]+1)
     if changed or result.get("ok") is not True:
@@ -70,8 +127,13 @@ def once(core):
                    "broker_open_count": result.get("broker_xag_open_count"),
                    "local_open_count": result.get("local_xag_open_count")}),
               flush=True)
+    if retries["pending"]:
+        print("XAG_PROTECTIVE_CLOSE_RETRY " + str({
+            "pending": retries["pending"], "attempted": retries["attempted"],
+            "confirmed": retries["confirmed"], "reason": retries["reason"]
+        }), flush=True)
     return {"ok": result.get("ok") is True, "changed_local_links": changed,
-            "reason": _last["reason"]}
+            "reason": _last["reason"], "close_retries": retries}
 
 
 def _worker(core):
