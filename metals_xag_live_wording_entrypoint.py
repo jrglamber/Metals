@@ -462,3 +462,23 @@ except Exception as _xau_budget_probe_error:
     print("METALS_XAU_NAV_BUDGET_BROKER_PROOF " +
           json.dumps({"ok": False, "new_entries_fail_closed": True,
                       "reason": f"{type(_xau_budget_probe_error).__name__}: {_xau_budget_probe_error}"}), flush=True)
+
+
+# XAG entry-only NAV cap: install after all XAG ownership, manager and XAU
+# overlays. Existing one-unit sizing and MFE25/harvesting are unchanged.
+import metals_xag_nav_risk_override as _xag_nav_budget
+XAG_NAV_ENTRY_BUDGET_INSTALL = _xag_nav_budget.install(core, app)
+print("METALS_XAG_NAV_ENTRY_BUDGET " +
+      json.dumps(XAG_NAV_ENTRY_BUDGET_INSTALL, default=str), flush=True)
+try:
+    _xag_nav_proof = _xag_nav_budget.snapshot(core)
+    print("METALS_XAG_NAV_BUDGET_BROKER_PROOF " +
+          json.dumps({"ok":True,"reconciled":True,
+                      "nav_gbp":round(_xag_nav_proof["nav"],2),
+                      "open_xag":_xag_nav_proof["open"],
+                      "mark_to_stop_gbp":round(_xag_nav_proof["used"],2),
+                      "cap_gbp":round(_xag_nav_proof["cap"],2)}), flush=True)
+except Exception as _xag_nav_probe_error:
+    print("METALS_XAG_NAV_BUDGET_BROKER_PROOF " +
+          json.dumps({"ok":False,"new_entries_fail_closed":True,
+                      "reason":f"{type(_xag_nav_probe_error).__name__}: {_xag_nav_probe_error}"}),flush=True)
