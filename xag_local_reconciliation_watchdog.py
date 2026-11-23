@@ -95,11 +95,17 @@ def _retry_confirmed_xag_close_requests(core, live, reconciliation, current_link
             response = result.get("response") or {}
             payload = response.get("data") or {}
             reject = payload.get("orderRejectTransaction") or {}
+            cancelled = payload.get("orderCancelTransaction") or {}
+            filled = payload.get("orderFillTransaction") or {}
             state["http_status"] = response.get("status_code")
+            state["broker_reply_type"] = (
+                "cancelled" if cancelled else "filled" if filled else
+                "rejected" if reject else "other")
             state["broker_error_code"] = str(
                 payload.get("errorCode") or reject.get("rejectReason") or
-                payload.get("errorMessage") or
-                ("response_success_without_broker_closed" if response.get("ok")
+                cancelled.get("reason") or payload.get("errorMessage") or
+                ("fill_not_reflected_in_trade_state" if filled else
+                 "response_success_without_broker_closed" if response.get("ok")
                  else "broker_error_unclassified"))[:96]
     if state["confirmed"]:
         _invalidate_local_ownership_caches()
@@ -144,6 +150,7 @@ def once(core):
             "pending": retries["pending"], "attempted": retries["attempted"],
             "confirmed": retries["confirmed"], "reason": retries["reason"],
             "http_status": retries.get("http_status"),
+            "broker_reply_type": retries.get("broker_reply_type"),
             "broker_error_code": retries.get("broker_error_code")
         }), flush=True)
     return {"ok": result.get("ok") is True, "changed_local_links": changed,
