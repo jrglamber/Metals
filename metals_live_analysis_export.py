@@ -111,6 +111,79 @@ def _link_records(core, table, fields):
     return [{f: row.get(f) for f in fields} for row in items]
 
 
+_BUDGET_BLOCK_FIELDS = [
+    "recorded_at_utc", "raw_signal_id", "asset", "side", "reason",
+    "proof_valid", "nav_gbp", "risk_used_gbp", "cap_gbp",
+    "new_risk_buffered_gbp", "cap_pct_nav", "open_count",
+]
+
+
+def _budget_blocks(core, lane):
+    """Read persisted NAV budget rejects. Never consult/write OANDA or alter orders.
+
+    Both source tables already exist and are populated by the currently installed
+    entry gates. Parse only allow-listed numerical proof, never raw audit JSON:
+    the full raw JSON can include broker responses or other sensitive material.
+    """
+    if lane == "XAU":
+        table = "metals_demo_execution_audit"
+        columns = "created_at_utc,raw_signal_id,message,raw_json"
+        where = "action='xau_nav_budget' AND status='BLOCKED' AND message='xau_nav_budget_exhausted'"
+        instrument,side = "XAUUSD", "UNKNOWN_MATCH_VIA_SIGNAL"
+    elif lane == "XAG":
+        table = "metals_xag_live_execution_audit"
+        columns = "created_at_utc,raw_signal_id,reason,raw_json"
+        where = "action='entry_governance' AND status='BLOCKED' AND reason='xag_nav_risk_budget_exhausted'"
+        instrument,side = "XAGUSD", "SHORT"
+    else:
+        raise ValueError("unexpected_budget_lane")
+    with core.get_conn() as conn:
+        c = conn.execute("SELECT COUNT(*) AS n FROM " + table + " WHERE " + where).fetchone()
+        count = int(dict(c).get("n") or 0) if c else 0
+        if count > _MAX_ROWS:
+            raise ValueError("budget_reject_export_exceeds_safe_cap")
+        items = [dict(row) for row in conn.execute(
+            "SELECT " + columns + " FROM " + table + " WHERE " + where
+            + " ORDER BY id ASC"
+        ).fetchall()]
+    out = []
+    for item in items:
+        raw = {}
+        try:
+            raw = json.loads(item.get("raw_json") or "{}")
+            if not isinstance(raw, dict):
+                raw = {}
+            if lane == "XAU":
+                raw = raw.get("response") or {}
+        except (TypeError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        def safe(field):
+            return _num(raw.get(field))
+        newrisk = safe("new_risk_with_buffer_gbp") if lane == "XAU" else safe("candidate_risk_buffered_gbp")
+        used = safe("risk_used_gbp") if lane == "XAU" else safe("current_risk_gbp")
+        cap = safe("cap_gbp") if lane == "XAU" else safe("budget_gbp")
+        nav = safe("nav_gbp")
+        cap_pct = safe("cap_pct_nav")
+        open_count = safe("open_xau") if lane == "XAU" else safe("open_xag")
+        valid = all(v is not None and math.isfinite(v) for v in (used,cap,nav,newrisk,cap_pct))
+        out.append({
+            "recorded_at_utc": item.get("created_at_utc"),
+            "raw_signal_id": item.get("raw_signal_id"),
+            "asset": instrument, "side": side,
+            "reason": item.get("message") if lane == "XAU" else item.get("reason"),
+            "proof_valid": valid,
+            "nav_gbp": nav if valid else None,
+            "risk_used_gbp": used if valid else None,
+            "cap_gbp": cap if valid else None,
+            "new_risk_buffered_gbp": newrisk if valid else None,
+            "cap_pct_nav": cap_pct if valid else None,
+            "open_count": open_count if valid else None,
+        })
+    return out
+
+
 def build_bundle(core, xag_reader=None, now=None):
     now = now or datetime.now(timezone.utc)
     if xag_reader is None:
@@ -247,6 +320,40 @@ def build_bundle(core, xag_reader=None, now=None):
         _csv(zf,"live-xau-harvest-events.csv",
              _optional_records(core,"metals_xau_live_harvest_events"),
              ["created_at_utc","cycle_id","threshold_r","status","broker_trade_id","expected_upl_gbp","realized_pl_gbp","reason"])
+        # Research-only entry-admission evidence, collected from existing
+        # persisted gate audits. Never changes strategies or broker settings.
+        budget_meta = {}
+        for lane, name in [
+            ("XAU", "live-xau-nav-budget-blocks.csv"),
+            ("XAG", "live-xag-nav-budget-blocks.csv"),
+        ]:
+            try:
+                blocks = _budget_blocks(core, lane)
+                _csv(zf, name, blocks, _BUDGET_BLOCK_FIELDS)
+                budget_meta[lane] = {
+                    "status": "COMPLETE_FROM_RECORDED_AUDIT",
+                    "count": len(blocks), "with_valid_proof": sum(
+                        bool(row["proof_valid"]) for row in blocks),
+                    "first_recorded_at_utc": blocks[0]["recorded_at_utc"] if blocks else None,
+                    "last_recorded_at_utc": blocks[-1]["recorded_at_utc"] if blocks else None,
+                }
+            except Exception as exc:
+                zf.writestr(name.replace(".csv", "-unavailable.json"),
+                    json.dumps({"reason_type": type(exc).__name__, "records_not_exported": True}))
+                budget_meta[lane] = {"status": "UNAVAILABLE",
+                    "reason_type": type(exc).__name__}
+        manifest["budget_block_research"] = {
+            "scope": "ACTUAL_LIVE_NAV_GATE_REJECTIONS_ONLY",
+            "generated_at_utc": now.isoformat(),
+            "shadow_only": True, "broker_order_writes": False,
+            "admission_or_management_logic_changed": False,
+            "xau_side_requires_directional_signal_join": True,
+            "lanes": budget_meta,
+            "notes": "Historical rejects are only as complete as persisted audit records. "
+                     "Rejected trades have no broker P&L. Join by raw_signal_id and "
+                     "asset/direction to prospective research outcomes; no actual "
+                     "counterfactual execution is claimed.",
+        }
         # Forward-only research recorder: timestamped economic-equity path and
         # all underlying LIVE broker marks, independent of demo history.
         # A failed/empty capture is explicitly disclosed, never silently
