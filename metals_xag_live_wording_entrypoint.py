@@ -14,7 +14,6 @@ import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
 import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
-import metals_xag_live_signal_status_panel as live_xag_signal_panel
 import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_xag_harvest_dashboard as live_xag_harvest_dashboard
 import metals_live_open_pnl_display as combined_open_pnl
@@ -183,11 +182,6 @@ class XagLiveWordingMiddleware:
                     text = body.decode("utf-8")
                     for old, new in _HTML_REPLACEMENTS:
                         text = text.replace(old, new)
-                    if scope.get("path") == "/dashboard/section/latest-signals" and 'pep-xag-live-signal-status' not in text:
-                        # Read-only authoritative LIVE XAG Short status. Keep
-                        # existing practice guard table for research, but make
-                        # its lack of live-execution authority explicit.
-                        text = live_xag_signal_panel.render(core) + text
                     if scope.get("path") == "/dashboard/section/open-trades" and 'pep-live-xag-open-positions' not in text:
                         # Broker-authoritative XAG SHORT positions, separately
                         # from the legacy XAU-only open-trades view.
