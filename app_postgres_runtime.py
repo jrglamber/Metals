@@ -31439,24 +31439,45 @@ def export_indices_research_zip(limit: int = EXPORT_BUNDLE_DEFAULT_LIMIT, table_
 
 @app.get("/export/metals-xag-entry-decisions.csv")
 def export_metals_xag_entry_decisions_csv(limit: int = 50000):
-    """All XAG execution decisions, including signals rejected before confirmation."""
+    """Practice guard and independent live XAG SHORT decisions, with reasons."""
     init_db()
     limit = max(1, min(int(limit), 100000))
     with get_conn() as conn:
         rows = [dict(r) for r in conn.execute("""
-            SELECT a.created_at_utc, a.raw_signal_id, a.asset, a.action,
-                   a.status, a.candidate_state, a.message,
-                   g.decision AS confirmation_decision,
-                   g.reason AS confirmation_reason, g.campaign_entry_count_before,
-                   g.xau_confirmation_found, g.xau_confirmation_time
-            FROM metals_demo_execution_audit a
-            LEFT JOIN metals_demo_xag_confirmation_guard g
-              ON g.raw_signal_id = a.raw_signal_id
-            WHERE a.asset = 'XAGUSD'
-            ORDER BY a.id DESC LIMIT ?
+            SELECT created_at_utc, raw_signal_id, asset, lane, action, status,
+                   candidate_state, message, confirmation_decision,
+                   confirmation_reason, campaign_entry_count_before,
+                   xau_confirmation_found, xau_confirmation_time
+            FROM (
+                SELECT a.created_at_utc, a.raw_signal_id, a.asset,
+                       'PRACTICE' AS lane, a.action, a.status,
+                       a.candidate_state, a.message,
+                       g.decision AS confirmation_decision,
+                       g.reason AS confirmation_reason,
+                       g.campaign_entry_count_before,
+                       g.xau_confirmation_found, g.xau_confirmation_time,
+                       a.id AS sort_id
+                FROM metals_demo_execution_audit a
+                LEFT JOIN metals_demo_xag_confirmation_guard g
+                  ON g.raw_signal_id = a.raw_signal_id
+                WHERE a.asset = 'XAGUSD'
+                UNION ALL
+                SELECT l.created_at_utc, l.raw_signal_id, 'XAGUSD' AS asset,
+                       'LIVE' AS lane, l.action, l.status,
+                       'LIVE' AS candidate_state, l.reason AS message,
+                       CASE WHEN l.action = 'entry_governance'
+                            THEN l.status ELSE NULL END AS confirmation_decision,
+                       l.reason AS confirmation_reason,
+                       NULL AS campaign_entry_count_before,
+                       NULL AS xau_confirmation_found,
+                       NULL AS xau_confirmation_time,
+                       l.id AS sort_id
+                FROM metals_xag_live_execution_audit l
+            ) decisions
+            ORDER BY created_at_utc DESC, sort_id DESC LIMIT ?
         """, (limit,)).fetchall()]
     out = io.StringIO()
-    fields = ["created_at_utc", "raw_signal_id", "asset", "action", "status",
+    fields = ["created_at_utc", "raw_signal_id", "asset", "lane", "action", "status",
               "candidate_state", "message", "confirmation_decision",
               "confirmation_reason", "campaign_entry_count_before",
               "xau_confirmation_found", "xau_confirmation_time"]

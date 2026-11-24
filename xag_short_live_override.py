@@ -18,6 +18,7 @@ Safety:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import urllib.error
@@ -205,8 +206,11 @@ def _audit(core: Any, raw_signal_id: Optional[int], action: str, status: str, re
                  json.dumps(raw or {}, default=str)[:20000]),
             )
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).exception(
+            "METALS_XAG_LIVE_AUDIT_PERSIST_FAILED raw_signal_id=%s action=%s status=%s error=%s",
+            raw_signal_id, action, status, exc,
+        )
 
 
 def _request(core: Any, path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -639,6 +643,7 @@ def _manager_tick(core: Any, raw_signal_id: int) -> Dict[str, Any]:
 def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) -> Dict[str, Any]:
     cfg = config_status(core)
     if not cfg.get("orders_allowed"):
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "xag_live_not_armed", raw={"config": cfg})
         return {"ok": True, "blocked": True, "reason": "xag_live_not_armed", "config": cfg}
 
     if not (
@@ -646,6 +651,8 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         and str(demo_result.get("asset") or "").upper() == ASSET
         and str(demo_result.get("side") or "").lower() == SIDE
     ):
+        _audit(core, raw_signal_id, "entry", "SKIPPED", "governed_practice_entry_not_opened",
+               raw={"demo_result": demo_result})
         return {"ok": True, "skipped": True, "reason": "governed_practice_entry_not_opened"}
 
     pol = _d(demo_result.get("active_exit_policy"))
@@ -659,10 +666,13 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
             (int(raw_signal_id),),
         ).fetchone()
     if existing:
+        _audit(core, raw_signal_id, "entry", "DUPLICATE", "existing_live_xag_link_for_signal",
+               link_id=_d(existing).get("id"))
         return {"ok": True, "duplicate": True, "link_id": _d(existing).get("id")}
 
     rec = _reconcile(core)
     if not rec.get("ok"):
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "pre_entry_reconciliation_failed", raw=rec)
         return {"ok": False, "blocked": True, "reason": "pre_entry_reconciliation_failed", "reconcile": rec}
     if not rec.get("exact_live_ownership"):
         _audit(core, raw_signal_id, "entry", "BLOCKED", "unlinked_broker_xag_trade_present", raw=rec)
@@ -671,15 +681,19 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         _audit(core, raw_signal_id, "entry", "BLOCKED", "live_xag_long_present", raw=rec)
         return {"ok": False, "blocked": True, "reason": "live_xag_long_present", "reconcile": rec}
     if int(rec.get("local_xag_open_count") or 0) >= MAX_OPEN:
-        return {"ok": True, "blocked": True, "reason": "live_xag_short_cap_24", "count": rec.get("local_xag_open_count")}
+        reason = f"live_xag_short_cap_{MAX_OPEN}"
+        _audit(core, raw_signal_id, "entry", "BLOCKED", reason, raw={"count": rec.get("local_xag_open_count")})
+        return {"ok": True, "blocked": True, "reason": reason, "count": rec.get("local_xag_open_count")}
 
     probe = sizing_probe.snapshot(core)
     if not probe.get("ok"):
         _audit(core, raw_signal_id, "entry", "BLOCKED", "xag_live_sizing_probe_failed", raw=probe)
         return {"ok": False, "blocked": True, "reason": "xag_live_sizing_probe_failed", "probe": probe}
     if str(probe.get("oanda_account_currency") or "").upper() != "GBP":
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "live_account_not_gbp", raw=probe)
         return {"ok": False, "blocked": True, "reason": "live_account_not_gbp"}
     if str(probe.get("price_status") or "").lower() != "tradeable":
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "xag_market_not_tradeable", raw=probe)
         return {"ok": True, "blocked": True, "reason": "xag_market_not_tradeable", "price_status": probe.get("price_status")}
     units = float(_num(core, probe.get("recommended_units")) or 0.0)
     min_units = float(_num(core, probe.get("minimum_trade_size")) or 0.0)
@@ -690,12 +704,16 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
         _audit(core, raw_signal_id, "entry", "BLOCKED", "pilot_requires_exactly_one_xag_unit", raw=probe)
         return {"ok": False, "blocked": True, "reason": "pilot_requires_exactly_one_xag_unit", "probe": probe}
     if effective_risk <= 0 or effective_risk > max_risk:
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "xag_effective_risk_outside_pilot_limit", raw={
+            "effective_risk_gbp": effective_risk, "max_risk_gbp": max_risk,
+        })
         return {"ok": False, "blocked": True, "reason": "xag_effective_risk_outside_pilot_limit",
                 "effective_risk_gbp": effective_risk, "max_risk_gbp": max_risk}
 
     entry = float(_num(core, probe.get("entry_price")) or 0.0)
     stop = float(_num(core, probe.get("emergency_stop_price")) or 0.0)
     if entry <= 0 or stop <= entry:
+        _audit(core, raw_signal_id, "entry", "BLOCKED", "short_stop_safety_invariant_failed", raw=probe)
         return {"ok": False, "blocked": True, "reason": "short_stop_safety_invariant_failed"}
     dp = int(probe.get("display_precision") or 3)
     body = {
@@ -717,6 +735,8 @@ def _execute_live(core: Any, raw_signal_id: int, demo_result: Dict[str, Any]) ->
             (int(raw_signal_id),),
         ).fetchone()
         if prior_intent:
+            _audit(core, raw_signal_id, "entry", "DUPLICATE", "xag_live_entry_intent_already_exists",
+                   raw={"intent_status": _d(prior_intent).get("status")})
             return {"ok": True, "blocked": True, "reason": "xag_live_entry_intent_already_exists",
                     "intent_status": _d(prior_intent).get("status")}
         conn.execute(

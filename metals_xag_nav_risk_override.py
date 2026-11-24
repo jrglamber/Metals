@@ -170,10 +170,16 @@ def install(core, app):
                 result["xag_nav_budget"] = detail
             return result
         except Exception as exc:
+            reason = "xag_nav_risk_budget_evidence_unavailable"
+            try:
+                live._audit(core_arg, int(raw_signal_id), "entry_governance", "BLOCKED",
+                            reason, raw={"error": f"{type(exc).__name__}: {exc}"})
+            except Exception:
+                pass
             print("XAG_NAV_BUDGET_PREFLIGHT_BLOCK "
                   + f"{type(exc).__name__}:{exc}", flush=True)
             return {"ok":True, "blocked":True,
-                    "reason":"xag_nav_risk_budget_evidence_unavailable",
+                    "reason":reason,
                     "version":VERSION, "fail_closed":True}
 
     def status():
