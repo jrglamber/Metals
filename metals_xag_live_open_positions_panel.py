@@ -29,7 +29,8 @@ def _float(value: Any) -> Optional[float]:
 
 def snapshot(core: Any) -> Dict[str, Any]:
     """Current open broker trades, joined by broker ID to XAG LIVE ledger."""
-    observed_at = datetime.now(timezone.utc).isoformat()
+    observed_now = datetime.now(timezone.utc)
+    observed_at = observed_now.isoformat()
     broker = live._open_trades(core)  # GET /openTrades; no order-capable function.
     if broker.get("ok") is not True:
         return {
@@ -70,6 +71,7 @@ def snapshot(core: Any) -> Dict[str, Any]:
             "asset": "XAG_USD", "side": side, "units": units,
             "broker_trade_id": bid, "entry_price": entry,
             "unrealized_gbp": pnl, "opened_at_utc": str(t.get("openTime") or ""),
+            "age_hours": _age_hours(t.get("openTime"), observed_now),
             "broker_stop_order_id": str(t.get("stopLossOrderID") or ""),
             "recorded_stop_price": stop,
             "recorded_stop_source": "LIVE_XAG_LINK" if local else None,
@@ -108,6 +110,19 @@ def snapshot(core: Any) -> Dict[str, Any]:
         "broker_writes": False, "practice_positions_excluded": True,
         "realized_pnl_included": False,
     }
+
+
+def _age_hours(opened_at: Any, now: datetime) -> Optional[int]:
+    raw = str(opened_at or "").strip()
+    if not raw:
+        return None
+    try:
+        opened = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        return max(0, int((now - opened.astimezone(timezone.utc)).total_seconds() / 3600.0))
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt(value: Any, decimals: int = 3, suffix: str = "") -> str:
@@ -163,6 +178,7 @@ def render(core: Any) -> str:
             '<td>'+escape(pnlcell)+'</td>'
             '<td>'+escape(x["broker_trade_id"])+'</td>'
             '<td>'+escape(x["opened_at_utc"])+'</td>'
+            '<td>'+_fmt(x["age_hours"], 0, "h")+'</td>'
             '<td>'+_fmt(x["recorded_stop_price"],3)+'</td>'
             '<td>'+escape(x["manager"] or "—")+'</td>'
             '<td class="'+css+'"><strong>'+escape(tracking)+'</strong></td>'
@@ -171,7 +187,7 @@ def render(core: Any) -> str:
     return summary+(
         '<div class="table-scroll"><table><thead><tr>'
         '<th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th>'
-        '<th>Unrealised P/L (GBP)</th><th>OANDA trade ID</th><th>Opened (UTC)</th>'
+        '<th>Unrealised P/L (GBP)</th><th>OANDA trade ID</th><th>Opened (UTC)</th><th>Trade Age</th>'
         '<th>Recorded SL</th><th>Live manager</th><th>Tracking</th>'
         '</tr></thead><tbody>'+"".join(rows)+'</tbody></table></div>'
         '<div class="section-note small">LIVE XAG SHORT broker snapshot at '+
