@@ -98,6 +98,76 @@ _HTML_REPLACEMENTS = (
 )
 
 
+
+_LATEST_OPENED_TILE_SCRIPT = r"""
+<script id="pep-latest-live-trades-opened">
+(function(){
+  var outcome=null, busy=false;
+  function render(){
+    var top=document.getElementById('topTiles');
+    if(!top)return;
+    var cards=Array.from(top.querySelectorAll('.card'));
+    var support=cards.find(function(c){
+      var l=c.querySelector('.label');
+      return l&&String(l.textContent||'').trim()==='Candidate Support';
+    });
+    if(support){
+      var label=support.querySelector('.label');
+      if(label)label.textContent='Model Candidate Support';
+      var detail=support.querySelector('.small');
+      if(detail&&!detail.textContent.includes('eligibility only')){
+        detail.textContent=(detail.textContent?detail.textContent+' · ':'')+'model/guard eligibility only; not a trade-open count';
+      }
+    }
+    var card=top.querySelector('[data-pep-latest-live-trades-opened="1"]');
+    if(!card&&support){
+      var grid=support.parentElement;
+      if(!grid)return;
+      if(grid.classList.contains('three')){grid.classList.remove('three');grid.classList.add('four');}
+      card=document.createElement('div');
+      card.className='card';
+      card.setAttribute('data-pep-latest-live-trades-opened','1');
+      card.innerHTML='<div class="label">Latest Trades Opened</div><div class="value">—/2</div><div class="small">Checking broker-linked outcomes…</div>';
+      grid.insertBefore(card,support);
+    }
+    if(card&&outcome){
+      var value=card.querySelector('.value'), small=card.querySelector('.small');
+      var count=outcome.opened_count;
+      var expected=outcome.expected_count||2;
+      var label=outcome.verified?String(count)+'/'+String(expected):'—/'+String(expected);
+      var statuses=(outcome.by_asset||{}), detail;
+      if(outcome.verified){
+        detail=(outcome.candle_display||'Latest signal candle')+' · XAU '+(statuses.XAUUSD?'YES':'NO')+' · XAG '+(statuses.XAGUSD?'YES':'NO');
+      }else{
+        detail='Latest XAU/XAG signal outcomes are incomplete or unavailable';
+      }
+      if(value&&value.textContent!==label)value.textContent=label;
+      if(value){
+        value.classList.remove('pos','warn','neg','flat');
+        value.classList.add(outcome.verified?(count===expected?'pos':count>0?'warn':'neg'):'flat');
+      }
+      if(small&&small.textContent!==detail)small.textContent=detail;
+    }
+  }
+  async function refresh(){
+    if(busy)return;
+    busy=true;
+    try{
+      var r=await fetch('/api/metals-latest-trade-outcomes',{cache:'no-store'});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      outcome=await r.json();
+    }catch(e){outcome={verified:false,expected_count:2};}
+    finally{busy=false;render();}
+  }
+  var top=document.getElementById('topTiles');
+  if(top)new MutationObserver(render).observe(top,{childList:true,subtree:true});
+  render();
+  refresh();
+  setInterval(refresh,60000);
+})();
+</script>
+"""
+
 class XagLiveWordingMiddleware:
     def __init__(self, inner: Any):
         self.inner = inner
@@ -190,6 +260,8 @@ class XagLiveWordingMiddleware:
                         # Integrate at the existing top-card renderer; never
                         # mutate another KPI card after a legacy refresh.
                         text = combined_open_pnl.rewrite_dashboard_html(text)
+                        if 'pep-latest-live-trades-opened' not in text:
+                            text = text.replace('</body>', _LATEST_OPENED_TILE_SCRIPT + '</body>', 1)
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
                         if "pep-xau-campaign-reset" not in text:
@@ -403,6 +475,65 @@ except Exception as exc:
 
 PERIOD_ACCOUNTING_ROUTE = period_accounting_dashboard.install(app, core, promote_read_only_route)
 print("METALS_PERIOD_ACCOUNTING_ROUTE " + str(PERIOD_ACCOUNTING_ROUTE), flush=True)
+
+
+# Read-only latest-candle broker-link summary for the simple top-card outcome.
+# This is intentionally separate from model/guard candidate support.
+def latest_live_trade_outcomes():
+    from datetime import datetime
+    try:
+        core.init_db()
+        tables = {"XAUUSD": "metals_xau_live_trade_links", "XAGUSD": "metals_xag_live_trade_links"}
+        found = {}
+        with core.get_conn() as conn:
+            for asset, pair_names in (("XAUUSD", ("XAUUSD", "XAU")), ("XAGUSD", ("XAGUSD", "XAG"))):
+                placeholders = ",".join("?" for _ in pair_names)
+                signal = conn.execute(
+                    f"SELECT id, timestamp_readable FROM raw_signals WHERE UPPER(pair) IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                    pair_names,
+                ).fetchone()
+                if signal is None:
+                    continue
+                signal_row = dict(signal)
+                link = conn.execute(
+                    f"SELECT broker_trade_id FROM {tables[asset]} WHERE raw_signal_id=? ORDER BY id DESC LIMIT 1",
+                    (signal_row.get("id"),),
+                ).fetchone()
+                link_row = dict(link) if link is not None else {}
+                found[asset] = {
+                    "timestamp": str(signal_row.get("timestamp_readable") or ""),
+                    "opened": bool(str(link_row.get("broker_trade_id") or "").strip()),
+                }
+        complete = len(found) == 2 and found["XAUUSD"]["timestamp"] == found["XAGUSD"]["timestamp"]
+        candle = found.get("XAUUSD", {}).get("timestamp") or found.get("XAGUSD", {}).get("timestamp") or ""
+        display = core.display_candle_time(candle) if candle else ""
+        return {
+            "ok": True,
+            "verified": bool(complete),
+            "opened_count": sum(1 for item in found.values() if item.get("opened")) if complete else None,
+            "expected_count": 2,
+            "candle_display": str(display or ""),
+            "by_asset": {asset: bool(found[asset]["opened"]) for asset in found} if complete else {},
+            "execution_mutated": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False, "verified": False, "opened_count": None,
+            "expected_count": 2, "by_asset": {},
+            "error": type(exc).__name__, "execution_mutated": False,
+        }
+
+
+app.add_api_route(
+    "/api/metals-latest-trade-outcomes",
+    latest_live_trade_outcomes,
+    methods=["GET"],
+    include_in_schema=False,
+)
+LATEST_LIVE_TRADE_OUTCOMES_ROUTE = promote_read_only_route(
+    app, "/api/metals-latest-trade-outcomes", latest_live_trade_outcomes
+)
+print("METALS_LATEST_TRADE_OUTCOMES_ROUTE", LATEST_LIVE_TRADE_OUTCOMES_ROUTE, flush=True)
 
 app.add_middleware(XagLiveWordingMiddleware)
 
