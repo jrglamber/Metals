@@ -14,6 +14,7 @@ import metals_execution_contract_20261031 as execution_contract
 import metals_xau_manual_campaign_reset as manual_campaign_reset
 import metals_xau_manual_campaign_hwm_sync as campaign_hwm_sync
 import metals_xag_live_independent_override as live_xag_health
+import metals_xag_manual_highwater_reset as xag_highwater_reset
 import metals_xag_live_open_positions_panel as live_xag_open_positions
 import metals_xag_harvest_dashboard as live_xag_harvest_dashboard
 import metals_live_open_pnl_display as combined_open_pnl
@@ -36,6 +37,7 @@ except Exception as ai_observer_exc:
 
 MANUAL_XAU_RESET_INSTALL = manual_campaign_reset.install(core, app)
 MANUAL_XAU_HWM_SYNC_INSTALL = campaign_hwm_sync.install(core, app)
+XAG_HIGHWATER_RESET_INSTALL = xag_highwater_reset.install(core, app)
 COMBINED_OPEN_PNL_INSTALL = combined_open_pnl.install(app, core)
 
 VERSION = "metals_xag_live_wording_v1_2026_10_31"
@@ -261,6 +263,8 @@ class XagLiveWordingMiddleware:
                             add += live_xag_health.DASHBOARD_SNIPPET
                         if "pep-xag-ladder-js" not in text:
                             add += live_xag_harvest_dashboard.DASHBOARD_SNIPPET
+                        if "pep-xag-highwater-reset" not in text:
+                            add += xag_highwater_reset.DASHBOARD_SNIPPET
                         if "pep-metals-period-accounting-script" not in text:
                             # Financial summary goes ABOVE legacy diagnostics.
                             anchor = "<h2>Details</h2>"
