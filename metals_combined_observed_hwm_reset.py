@@ -202,7 +202,7 @@ DASHBOARD_SNIPPET = r"""
         allowed=!!(r.ok&&d.ok&&d.allowed);
         if(allowed){
           var b=d.baseline;
-          status.textContent='Verified current combined open P&amp;L: £'+Number(b.current_gbp).toFixed(2)+
+          status.textContent='Verified current combined open P&L: £'+Number(b.current_gbp).toFixed(2)+
             ' across '+Number(b.open_count)+' trade(s). Reset sets the reporting peak to this value.';
         }else status.textContent='Reset unavailable: '+((d.blockers||[]).join(', ')||'combined broker proof unavailable')+'.';
       }catch(e){allowed=false;status.textContent='Could not verify combined broker P&amp;L. No reset made.';}
