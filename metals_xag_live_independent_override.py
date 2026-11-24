@@ -138,6 +138,21 @@ def _preflight(core: Any, row: Any, candidate: Dict[str, Any]) -> Dict[str, Any]
                             {"campaign_count": campaign["count"], "reason": confirm.get("reason")})
     else:
         confirm = {"ok": True, "reason": "xag_live_independent_allowance"}
+    confirmation_reason = (
+        "xau_same_direction_confirmation_passed"
+        if campaign["count"] >= SOLO_ALLOWANCE
+        else "xag_live_independent_allowance"
+    )
+    live._audit(
+        core, rid, "entry_governance", "ALLOWED", confirmation_reason,
+        raw={
+            "version": VERSION,
+            "campaign_entry_count_before": campaign["count"],
+            "solo_allowance": SOLO_ALLOWANCE,
+            "xau_confirmation": confirm,
+            "signal_time": d.get("timestamp_readable"),
+        },
+    )
     return {
         "ok": True, "approved_for_live": True, "asset": "XAGUSD", "side": "short",
         "approved_model": candidate, "approval_version": VERSION,
