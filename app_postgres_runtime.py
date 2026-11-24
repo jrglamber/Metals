@@ -24358,9 +24358,13 @@ def _record_xag_guard_decision(conn: Any, signal_row: Any, result: Dict[str, Any
             safe_str(result.get("reason")), now_utc_iso()
         ))
         conn.commit()
-    except Exception:
-        # Guard logging must never break execution.
-        pass
+    except Exception as exc:
+        # Observability failures must be visible, without changing trade eligibility.
+        import logging
+        logging.getLogger(__name__).exception(
+            "METALS_XAG_GUARD_PERSIST_FAILED raw_signal_id=%s error=%s",
+            signal_row["id"], exc,
+        )
 
 
 def _metals_xag_guard_row(conn: Any, raw_signal_id: Any) -> Dict[str, Any]:
@@ -27148,6 +27152,13 @@ def execute_metals_demo_candidate(raw_signal_id: int, source: str = "signal_work
             "candidate": candidate,
         }
 
+    if asset == "XAGUSD":
+        _metals_demo_audit(
+            raw_signal_id, asset, instrument, "entry_confirmation_guard", "ALLOWED",
+            safe_str(confirmation_guard.get("reason")),
+            response={"guard": confirmation_guard},
+            candidate_state=safe_str(candidate.get("demo_state") or "CANDIDATE"),
+        )
     preview=metals_demo_sizing_preview(asset,side)
     if not METALS_DEMO_BROKER_ENABLED:
         _metals_demo_audit(raw_signal_id,asset,instrument,"entry_preview","DISABLED_PREVIEW_ONLY","METALS_DEMO_BROKER_ENABLED=false",preview,candidate_state="CANDIDATE")
@@ -40043,6 +40054,37 @@ def build_metals_focused_research_html():
       _mf_table("Basket Recovery / Red-State Outcomes",_mf_rows("metals_focused_recovery",100),["trigger_signal_time","trigger_status","trigger_action","trigger_open_count","trigger_r","trigger_hwm_r","trigger_giveback_pct","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _mf_table("XAG → XAU Confirmation Guard",_mf_rows("metals_demo_xag_confirmation_guard",150),["signal_time","xag_side","campaign_entry_count_before","xau_confirmation_found","xau_confirmation_time","xau_confirmation_age_hours","allow_entry","decision","reason","outcome_48h_r","outcome_72h_r","outcome_96h_r"]) + \
       '<details class="research-inner"><summary>Strategy Model Evidence</summary><div class="section-note small"><a href="/metals-short-shadow-v2">Short v2 JSON</a> · <a href="/export/metals-short-shadow-v2.csv">Short v2 CSV</a> · <a href="/metals-short-research">Short research JSON</a> · <a href="/export/metals-short-research.csv">Short research CSV</a> · <a href="/metals-research-outcomes">Long outcomes JSON</a> · <a href="/export/metals-research-outcomes.csv">Long outcomes CSV</a></div></details>'
+
+
+@app.get("/export/metals-xag-entry-decisions.csv")
+def export_metals_xag_entry_decisions_csv(limit: int = 50000):
+    """All XAG execution decisions, including signals rejected before confirmation."""
+    init_db()
+    limit = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT a.created_at_utc, a.raw_signal_id, a.asset, a.action,
+                   a.status, a.candidate_state, a.message,
+                   g.decision AS confirmation_decision,
+                   g.reason AS confirmation_reason, g.campaign_entry_count_before,
+                   g.xau_confirmation_found, g.xau_confirmation_time
+            FROM metals_demo_execution_audit a
+            LEFT JOIN metals_demo_xag_confirmation_guard g
+              ON g.raw_signal_id = a.raw_signal_id
+            WHERE a.asset = 'XAGUSD'
+            ORDER BY a.id DESC LIMIT ?
+        """, (limit,)).fetchall()]
+    out = io.StringIO()
+    fields = ["created_at_utc", "raw_signal_id", "asset", "action", "status",
+              "candidate_state", "message", "confirmation_decision",
+              "confirmation_reason", "campaign_entry_count_before",
+              "xau_confirmation_found", "xau_confirmation_time"]
+    writer = csv.DictWriter(out, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(content=out.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             'attachment; filename="metals-xag-entry-decisions.csv"'})
 
 
 @app.get("/export/metals-xag-confirmation-guard.csv")
