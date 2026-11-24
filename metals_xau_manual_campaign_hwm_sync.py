@@ -311,6 +311,7 @@ DASHBOARD_SNIPPET = r"""
  <button type="button" id="pep-xau-reset-refresh">Check eligibility</button>
  <div id="pep-xau-reset-preview" class="section-note" style="margin-top:10px">Check live XAU eligibility.</div>
  <button type="button" id="pep-xau-reset-apply" disabled style="padding:10px;margin-top:10px;background:#263e2b;color:#ecffed;border:1px solid #417a48;border-radius:7px">Reset campaign + high-water</button>
+ <button type="button" id="pep-xau-reset-hwm-only" disabled style="padding:10px;margin-top:10px;background:#1d3c32;color:#eafff4;border:1px solid #43956b;border-radius:7px;font-weight:700">Reset high-water + restart 30R ladder only</button>
  <button type="button" id="pep-xau-reset-align" disabled style="padding:10px;margin-top:10px;background:#24283e;color:#f1ecff;border:1px solid #6668a1;border-radius:7px">Align previous reset's high-water</button>
  <div id="pep-xau-reset-result" class="section-note" style="margin-top:10px;display:none"></div>
  </div>
@@ -323,6 +324,7 @@ DASHBOARD_SNIPPET = r"""
  const check=document.getElementById('pep-xau-reset-preview');
  const apply=document.getElementById('pep-xau-reset-apply');
  const align=document.getElementById('pep-xau-reset-align');
+ const hwmOnly=document.getElementById('pep-xau-reset-hwm-only');
  const result=document.getElementById('pep-xau-reset-result');
  let last=null;
  function show(el,txt){el.textContent=txt;el.style.display='block';el.style.whiteSpace='pre-wrap';}
@@ -331,7 +333,7 @@ DASHBOARD_SNIPPET = r"""
    try{return JSON.parse(body)}catch(_){throw Error('Server returned HTTP '+r.status+' without JSON: '+body.slice(0,140))}
  }
  async function refresh(){
-   apply.disabled=true;align.disabled=true;last=null;
+   apply.disabled=true;align.disabled=true;hwmOnly.disabled=true;last=null;
    if(side.value==='xag_short'){
      show(check,'Checking XAG SHORT live guard status…');
      try{
@@ -359,10 +361,17 @@ DASHBOARD_SNIPPET = r"""
        '.\nRebase HWM to '+(base.ok?'£'+Number(base.new_hwm_gbp).toFixed(2)+' / '+Number(base.new_hwm_r).toFixed(2)+'R':'UNAVAILABLE')+
        '. New XAU harvest from 30R.\nLast '+recent.days+' days known realised '+Number(recent.realized_r_known||0).toFixed(2)+'R'+(recent.complete?'':' (INCOMPLETE)')+'.\n';
      if(recent.warning)msg+='WARNING: recent losses or incomplete realised data.\n';
+     const hwmBase=d.highwater_only_baseline||{};
+     msg+='\nHigh-water-only reset: '+(d.highwater_only_allowed?'AVAILABLE':'BLOCKED')+
+       (hwmBase.ok?'; current XAU basket '+Number(hwmBase.current_r).toFixed(2)+'R / £'+Number(hwmBase.current_gbp).toFixed(2)+
+       ' across '+hwmBase.open_count+' live trades; new 30R ladder starts from this baseline.':'')+'.\n';
+     if(d.highwater_only_blockers&&d.highwater_only_blockers.length)
+       msg+='High-water reset blocked: '+d.highwater_only_blockers.join(', ')+'.\n';
      if(d.allowed)msg+='New combined reset available.\n';
      if(d.alignment_allowed)msg+='Previously completed stacking reset detected: one-time HWM alignment AVAILABLE.\n';
      if(!d.allowed&&!d.alignment_allowed)msg+='RESET BLOCKED: '+(d.blocking_reasons||[]).concat(d.extra_blockers||[]).join(', ');
      show(check,msg);apply.disabled=!d.allowed;align.disabled=!d.alignment_allowed;
+     hwmOnly.disabled=!d.highwater_only_allowed;
    }catch(e){show(check,'Preview unavailable: '+(e.message||e));}
  }
  async function submit(alignOnly){
@@ -375,7 +384,7 @@ DASHBOARD_SNIPPET = r"""
    if(!window.confirm(msg))return;
    const secret=window.prompt('Enter WEBHOOK_SECRET to authorize this XAU cycle reset:');
    if(!secret)return;
-   apply.disabled=true;align.disabled=true;show(result,'Checking broker exposure and saving the new cycle…');
+   apply.disabled=true;align.disabled=true;hwmOnly.disabled=true;show(result,'Checking broker exposure and saving the new cycle…');
    try{
      const r=await fetch('/api/xau/adaptive-campaign-reset/reset',{
        method:'POST',headers:{'content-type':'application/json','x-webhook-secret':secret},
@@ -391,11 +400,39 @@ DASHBOARD_SNIPPET = r"""
      await refresh();
    }catch(e){show(result,'RESET NOT APPLIED: '+(e.message||e));await refresh();}
  }
+ async function submitHighwaterOnly(){
+   if(side.value==='xag_short'||!last||!last.highwater_only_allowed)return;
+   const base=last.highwater_only_baseline||{};
+   const promptText='Reset only the LIVE XAU high-water to the current broker basket and restart its 30R harvest ladder?\n\n'+
+     'Current basket: '+Number(base.current_r||0).toFixed(2)+'R / £'+Number(base.current_gbp||0).toFixed(2)+
+     ' across '+base.open_count+' trades. New baseline: '+Number(base.new_hwm_r||0).toFixed(2)+'R / £'+Number(base.new_hwm_gbp||0).toFixed(2)+'.\n'+
+     'The XAU entry counters, open trades, stops, sizing, XAG basket/HWM, and already banked harvests stay unchanged.\nProceed?';
+   if(!window.confirm(promptText))return;
+   const secret=window.prompt('Enter WEBHOOK_SECRET to authorize the XAU high-water-only reset:');
+   if(!secret)return;
+   apply.disabled=true;align.disabled=true;hwmOnly.disabled=true;
+   show(result,'Rechecking broker reconciliation and starting the new XAU 30R harvest cycle…');
+   try{
+     const r=await fetch('/api/xau/adaptive-campaign-reset/highwater-only',{
+       method:'POST',headers:{'content-type':'application/json','x-webhook-secret':secret},
+       body:JSON.stringify({confirm:'RESET_XAU_HIGHWATER_ONLY',acknowledge_current_basket:true}),
+       cache:'no-store'
+     });
+     const d=await responseJson(r);
+     if(!r.ok||!d.ok)throw Error(JSON.stringify(d.detail||d));
+     show(result,'XAU high-water reset confirmed: '+Number(d.previous_hwm_r).toFixed(2)+'R → '+
+       Number(d.new_hwm_r).toFixed(2)+'R. New harvest ladder starts at 30R. Entry counters stayed '+
+       JSON.stringify(d.entry_counters_before)+' → '+JSON.stringify(d.entry_counters_after)+
+       '. Trades and stops unchanged; no broker orders sent.');
+     await refresh();
+   }catch(e){show(result,'HIGH-WATER RESET NOT APPLIED: '+(e.message||e));await refresh();}
+ }
  side.addEventListener('change',refresh);
  document.getElementById('pep-xau-reset-refresh').addEventListener('click',refresh);
  host.addEventListener('toggle',()=>{if(host.open)refresh()});
  apply.addEventListener('click',()=>submit(false));
  align.addEventListener('click',()=>submit(true));
+ hwmOnly.addEventListener('click',submitHighwaterOnly);
 })();
 </script>
 """;
