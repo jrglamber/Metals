@@ -7,8 +7,9 @@ import re
 from typing import Any, Dict
 
 import metals_execution_visibility_patch as visibility
+import metals_xag_live_signal_status_panel as xag_live_panel
 
-VERSION = "metals_signals_compact_authoritative_outcome_v1_2026_11_24"
+VERSION = "metals_signals_lane_separated_outcomes_v2_2026_11_24"
 
 
 def _label(state: str) -> tuple[str, str]:
@@ -43,7 +44,12 @@ def _plain_cell(value: str) -> str:
     return html.unescape(value).strip()
 
 
-def _compact_signals_table(rendered: str, outcomes: Dict[str, Dict[str, Any]], qualities: Dict[str, str]) -> str:
+def _compact_signals_table(
+    rendered: str,
+    outcomes: Dict[str, Dict[str, Any]],
+    qualities: Dict[str, str],
+    xag_live: Dict[str, Dict[str, Any]],
+) -> str:
     # The page can contain other signal tables (for example the independent
     # XAG live audit). Target only the model-candidate table this renderer owns.
     match = next((
@@ -58,7 +64,7 @@ def _compact_signals_table(rendered: str, outcomes: Dict[str, Dict[str, Any]], q
         return rendered
     headers = (
         "<th>Time</th><th>Asset</th><th>Candidate</th>"
-        "<th>Eligible</th><th>XAG Guard</th><th>Outcome</th><th>Reason</th>"
+        "<th>Candidate Gate</th><th>XAG Practice Guard</th><th>Live Outcome</th><th>Detail</th>"
     )
     compact_rows = []
     for row_html in rows[1:]:
@@ -73,17 +79,23 @@ def _compact_signals_table(rendered: str, outcomes: Dict[str, Dict[str, Any]], q
         candidate = values[7] if is_candidate else "—"
         eligibility = "Yes" if eligible else "No"
         guard = values[8] if asset == "XAGUSD" else "—"
-        outcome = outcomes.get(rid)
-        if outcome:
-            result, result_class, reason = _display_for(outcome, qualities.get(rid, ""))
-        elif asset == "XAGUSD":
-            if is_candidate and eligible:
-                result, result_class = "GUARD PASSED", "pos"
-            elif is_candidate:
-                result, result_class = "GUARD BLOCKED", "neg"
+        if asset == "XAGUSD":
+            if "XAG_GUARD_PENDING_FAIL_CLOSED" in guard:
+                guard = guard.replace("XAG_GUARD_PENDING_FAIL_CLOSED", "PENDING · fail-closed")
+            live = xag_live.get(rid) or {}
+            live_state = str(live.get("state") or "")
+            if live_state == "LIVE TRACKED":
+                result, result_class = "LIVE TRACKED", "pos"
+                reason = "broker-linked live position"
+            elif live_state and live_state != "NO LIVE EXECUTION AUDIT":
+                result = live_state
+                result_class = "warn" if "BLOCK" in live_state or "FAILED" in live_state else "flat"
+                reason = str(live.get("reason") or "live audit recorded")
             else:
-                result, result_class = "NO CANDIDATE", "flat"
-            reason = values[12] or "XAG live execution details are in the separate live audit"
+                result, result_class = "NO LIVE AUDIT", "flat"
+                reason = "No live XAG decision recorded for this signal"
+        elif (outcome := outcomes.get(rid)):
+            result, result_class, reason = _display_for(outcome, qualities.get(rid, ""))
         elif is_candidate and not eligible:
             result, result_class, reason = "BLOCKED", "neg", values[12]
         elif is_candidate:
@@ -172,11 +184,18 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         rendered = re.sub(
             r'<div class="section-note small"><strong>Latest 30 Metals Signals\.</strong>.*?</div>',
             '<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> '
-            'One row per signal. Outcome reflects the actual broker link when available; '
-            'eligibility alone does not mean a trade opened.</div>',
+            'The XAG Practice Guard is separate from the live lane. Live Outcome uses broker links/live audits; '
+            'Candidate Gate eligibility alone does not mean a trade opened.</div>',
             rendered, count=1, flags=re.DOTALL,
         )
-        return _compact_signals_table(rendered, outcomes, qualities)
+        try:
+            xag_live = {
+                str(r.get("signal_id")): r
+                for r in xag_live_panel.rows(core, limit=max(30, int(limit or 30)))
+            }
+        except Exception:
+            xag_live = {}
+        return _compact_signals_table(rendered, outcomes, qualities, xag_live)
 
     core._metals_latest_30_signals_html = patched
     core.METALS_XAU_EXECUTION_VISIBILITY_INLINE_VERSION = VERSION
@@ -204,7 +223,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     checks = {
         "compact_header_present": all(
             f"<th>{label}</th>" in probe
-            for label in ("Time", "Asset", "Candidate", "Eligible", "XAG Guard", "Outcome", "Reason")
+            for label in ("Time", "Asset", "Candidate", "Candidate Gate", "XAG Practice Guard", "Live Outcome", "Detail")
         ),
         "duplicate_outcomes_section_removed": "Live XAU Execution Outcomes" not in probe,
         "opened_overrides_watch_classification": opened_unit == (
