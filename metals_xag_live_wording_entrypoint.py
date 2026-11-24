@@ -102,46 +102,39 @@ _HTML_REPLACEMENTS = (
 _LATEST_OPENED_TILE_SCRIPT = r"""
 <script id="pep-latest-live-trades-opened">
 (function(){
-  var outcome=null, busy=false;
+  var outcome=null,busy=false;
   function render(){
     var top=document.getElementById('topTiles');
     if(!top)return;
     var cards=Array.from(top.querySelectorAll('.card'));
     var support=cards.find(function(c){
-      var l=c.querySelector('.label');
-      return l&&String(l.textContent||'').trim()==='Candidate Support';
+      var label=c.querySelector('.label');
+      return label&&/^(Model )?Candidate Support$/.test(String(label.textContent||'').trim());
     });
-    if(support){
-      var label=support.querySelector('.label');
-      if(label)label.textContent='Model Candidate Support';
-      var detail=support.querySelector('.small');
-      if(detail&&!detail.textContent.includes('eligibility only')){
-        detail.textContent=(detail.textContent?detail.textContent+' · ':'')+'model/guard eligibility only; not a trade-open count';
-      }
-    }
     var card=top.querySelector('[data-pep-latest-live-trades-opened="1"]');
-    if(!card&&support){
-      var grid=support.parentElement;
-      if(!grid)return;
-      if(grid.classList.contains('three')){grid.classList.remove('three');grid.classList.add('four');}
+    var grid=(support&&support.parentElement)||(card&&card.parentElement);
+    if(!grid)return;
+    if(support)support.remove();
+    if(grid.classList.contains('four'))grid.classList.remove('four');
+    grid.classList.add('three');
+    if(!card){
       card=document.createElement('div');
       card.className='card';
       card.setAttribute('data-pep-latest-live-trades-opened','1');
       card.innerHTML='<div class="label">Latest Trades Opened</div><div class="value">—/2</div><div class="small">Checking broker-linked outcomes…</div>';
-      grid.insertBefore(card,support);
+      grid.appendChild(card);
     }
     if(card&&outcome){
-      var value=card.querySelector('.value'), small=card.querySelector('.small');
-      var count=outcome.opened_count;
-      var expected=outcome.expected_count||2;
-      var label=outcome.verified?String(count)+'/'+String(expected):'—/'+String(expected);
-      var statuses=(outcome.by_asset||{}), detail;
+      var value=card.querySelector('.value'),small=card.querySelector('.small');
+      var count=outcome.opened_count,expected=outcome.expected_count||2;
+      var text=outcome.verified?String(count)+'/'+String(expected):'—/'+String(expected);
+      var statuses=outcome.by_asset||{},detail;
       if(outcome.verified){
         detail=(outcome.candle_display||'Latest signal candle')+' · XAU '+(statuses.XAUUSD?'YES':'NO')+' · XAG '+(statuses.XAGUSD?'YES':'NO');
       }else{
         detail='Latest XAU/XAG signal outcomes are incomplete or unavailable';
       }
-      if(value&&value.textContent!==label)value.textContent=label;
+      if(value&&value.textContent!==text)value.textContent=text;
       if(value){
         value.classList.remove('pos','warn','neg','flat');
         value.classList.add(outcome.verified?(count===expected?'pos':count>0?'warn':'neg'):'flat');
@@ -161,9 +154,7 @@ _LATEST_OPENED_TILE_SCRIPT = r"""
   }
   var top=document.getElementById('topTiles');
   if(top)new MutationObserver(render).observe(top,{childList:true,subtree:true});
-  render();
-  refresh();
-  setInterval(refresh,60000);
+  render();refresh();setInterval(refresh,60000);
 })();
 </script>
 """
