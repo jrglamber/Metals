@@ -295,13 +295,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
 
 DASHBOARD_SNIPPET = r"""
 <details id="pep-xau-campaign-reset" style="margin:10px 0">
- <summary>Manual XAU Campaign Reset — stacking + high-water</summary>
+ <summary>XAU Campaign &amp; High-Water Controls</summary>
  <div class="section-note">
- Start a fresh adaptive entry allowance, reset the <strong>live XAU basket high-water</strong> to the
- current OANDA P&amp;L baseline, and restart the <strong>30R XAU harvest ladder</strong>.
- Old HWM and banked harvest history are archived. Existing trades, stops,
- individual MFE/exit managers, realised P&amp;L, and practice/XAG HWM stay unchanged.
- Only 1–2 open positions in the selected direction, with exact OANDA reconciliation.
+ The combined campaign reset below also restarts the selected direction's entry allowance and remains limited to 1–2 open trades.
+ The separate <strong>high-water-only</strong> reset is available with any reconciled XAU basket size when no harvest close is pending.
+ It starts a fresh XAU 30R harvest cycle while preserving entry counters, open trades, stops, sizing, XAG HWM, and already banked history.
  </div>
  <div style="padding:12px">
  <label for="pep-xau-reset-side">Direction</label>
