@@ -189,64 +189,84 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
 
 
 DASHBOARD_SNIPPET = r"""
+<div id="pep-xag-hwm-reset-controls" style="display:grid;gap:10px;margin:14px 0;padding:12px;border:1px solid rgba(88,166,255,.45);border-radius:10px">
+  <strong>Reset XAG high-water only</strong>
+  <div id="pep-xag-reset-hwm-state" role="status" aria-live="polite">Checking the live XAG basket…</div>
+  <label for="pep-xag-reset-hwm-secret">WEBHOOK_SECRET (not the dashboard access token)</label>
+  <input id="pep-xag-reset-hwm-secret" type="password" autocomplete="off" placeholder="Enter WEBHOOK_SECRET"
+    style="max-width:420px;width:100%;padding:10px;border-radius:7px;border:1px solid #687386;background:#0d1117;color:#f3f4f6">
+  <label style="display:flex;gap:8px;align-items:flex-start">
+    <input id="pep-xag-reset-hwm-ack" type="checkbox">
+    <span>I confirm a new XAG 30R harvest cycle from the current basket. Existing XAG trades, stops, sizing, entry rules and all XAU settings stay unchanged.</span>
+  </label>
+  <button id="pep-xag-reset-hwm" type="button" disabled
+    style="justify-self:start;padding:9px 12px;border-radius:8px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700;cursor:pointer">
+    Reset XAG high-water + restart 30R ladder
+  </button>
+</div>
 <script id="pep-xag-highwater-reset">
 (function(){
   'use strict';
   if(window.__pepXagHwmResetInstalled)return;
   window.__pepXagHwmResetInstalled=true;
-  function add(){
-    var panel=document.getElementById('pep-xag-cash-ladder');
-    if(!panel||document.getElementById('pep-xag-reset-hwm'))return false;
-    var box=document.createElement('div');
-    box.style.cssText='display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0';
-    var button=document.createElement('button');
-    button.id='pep-xag-reset-hwm';button.type='button';
-    button.textContent='Reset XAG high-water + restart 30R ladder';
-    button.style.cssText='padding:9px 12px;border-radius:8px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700;cursor:pointer';
-    var state=document.createElement('span');state.id='pep-xag-reset-hwm-state';
-    box.appendChild(button);box.appendChild(state);panel.appendChild(box);
-    async function refresh(){
-      button.disabled=true;state.textContent='Checking live XAG basket…';
-      try{
-        var r=await fetch('/api/live-xag-harvest-reset/preview',{cache:'no-store'});
-        var d=await r.json();
-        if(!r.ok||d.ok!==true)throw Error('Preview unavailable');
-        var b=d.baseline||{};
-        button.disabled=!d.allowed;
-        state.textContent=d.allowed
-          ?('Current XAG basket '+Number(b.current_r).toFixed(2)+'R ('+
-            (Number(b.current_gbp)>=0?'+':'')+'£'+Number(b.current_gbp).toFixed(2)+
-            '); next harvest checkpoint 30R'+(Number(b.current_r)>=30?' — eligible now':''))
-          :('Reset unavailable: '+(d.blockers||[]).join(', '));
-      }catch(e){button.disabled=true;state.textContent='XAG reset preview unavailable.';}
-    }
-    button.addEventListener('click',async function(){
-      var secret=window.prompt('Enter WEBHOOK_SECRET to reset XAG high-water only');
-      if(!secret)return;
+  var state=document.getElementById('pep-xag-reset-hwm-state');
+  var secret=document.getElementById('pep-xag-reset-hwm-secret');
+  var ack=document.getElementById('pep-xag-reset-hwm-ack');
+  var button=document.getElementById('pep-xag-reset-hwm');
+  if(!state||!secret||!ack||!button)return;
+  var allowed=false,busy=false;
+  function updateButton(){button.disabled=busy||!allowed||!secret.value.trim()||!ack.checked;}
+  async function refresh(){
+    allowed=false;updateButton();state.textContent='Checking the live XAG basket…';
+    try{
       var r=await fetch('/api/live-xag-harvest-reset/preview',{cache:'no-store'});
       var d=await r.json();
-      if(!r.ok||!d.allowed){await refresh();window.alert('XAG high-water reset is not currently safe. No reset was applied.');return;}
-      var b=d.baseline||{};
-      var immediate=Number(b.current_r)>=30;
-      var msg='Reset XAG high-water now and start a new 30R harvest cycle?\n\n'+
-        'Open XAG shorts: '+b.open_count+'\nCurrent basket: '+Number(b.current_r).toFixed(2)+'R, £'+Number(b.current_gbp).toFixed(2)+
-        (immediate?'\nThe current basket is already at/above 30R; the next harvest check may bank immediately.':'\nOpen trades, stops, entry rules and sizing stay unchanged.');
-      if(!window.confirm(msg))return;
-      button.disabled=true;
-      try{
-        var out=await fetch('/api/live-xag-harvest-reset/reset',{
-          method:'POST',headers:{'Content-Type':'application/json','X-Webhook-Secret':secret},
-          body:JSON.stringify({confirm:'RESET_XAG_HIGHWATER_ONLY',acknowledge_current_basket:true})
-        });
-        var result=await out.json();
-        if(!out.ok)throw Error(typeof result.detail==='string'?result.detail:JSON.stringify(result.detail||result));
-        state.textContent='XAG high-water reset. New 30R cycle started; open trades and stops unchanged.';
-        await refresh();
-      }catch(e){state.textContent='Reset not applied: '+(e.message||'request failed');button.disabled=false;}
-    });
-    refresh();setInterval(refresh,30000);return true;
+      if(!r.ok||d.ok!==true)throw Error('Preview unavailable');
+      allowed=!!d.allowed;
+      if(!allowed){
+        state.textContent='Reset unavailable: '+(d.blockers||[]).join(', ')+'. No change made.';
+      }else{
+        var b=d.baseline||{};
+        state.textContent='Current XAG basket: '+Number(b.current_r).toFixed(2)+'R ('+
+          (Number(b.current_gbp)>=0?'+':'')+'£'+Number(b.current_gbp).toFixed(2)+
+          ') across '+Number(b.open_count)+' open trade(s). New cycle starts at this baseline; next checkpoint is 30R.'+
+          (Number(b.current_r)>=30?' The basket is already at/above 30R, so the next harvest check may bank immediately.':'');
+      }
+    }catch(e){
+      allowed=false;state.textContent='Could not check the live XAG basket. No reset made.';
+    }
+    updateButton();
   }
-  if(!add()){var tries=0;var timer=setInterval(function(){if(add()||++tries>40)clearInterval(timer);},250);}
+  secret.addEventListener('input',updateButton);
+  ack.addEventListener('change',updateButton);
+  button.addEventListener('click',async function(){
+    if(busy||!allowed||!secret.value.trim()||!ack.checked)return;
+    busy=true;updateButton();state.textContent='Submitting XAG-only high-water reset…';
+    try{
+      var response=await fetch('/api/live-xag-harvest-reset/reset',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-Webhook-Secret':secret.value},
+        body:JSON.stringify({confirm:'RESET_XAG_HIGHWATER_ONLY',acknowledge_current_basket:true})
+      });
+      var result=await response.json();
+      if(!response.ok){
+        var detail=result.detail;
+        var message=typeof detail==='string'?detail:
+          (detail&&detail.reason?detail.reason:JSON.stringify(detail||result));
+        if(response.status===401)message='WEBHOOK_SECRET was rejected. Use the same WEBHOOK_SECRET as the XAU high-water reset.';
+        throw Error(message);
+      }
+      secret.value='';ack.checked=false;
+      state.textContent='Reset applied. New XAG harvest cycle started at '+Number(result.new_hwm_r).toFixed(2)+'R; '+Number(result.open_count)+' open trades and their stops are unchanged.';
+      allowed=false;
+      await refresh();
+    }catch(e){
+      state.textContent='Reset failed: '+(e.message||'request failed')+'. No reset was confirmed.';
+    }finally{
+      busy=false;updateButton();
+    }
+  });
+  refresh();setInterval(refresh,30000);
 })();
 </script>
 """;
