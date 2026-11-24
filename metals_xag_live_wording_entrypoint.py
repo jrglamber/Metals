@@ -619,3 +619,11 @@ except Exception as _xag_nav_probe_error:
     print("METALS_XAG_NAV_BUDGET_BROKER_PROOF " +
           json.dumps({"ok":False,"new_entries_fail_closed":True,
                       "reason":f"{type(_xag_nav_probe_error).__name__}: {_xag_nav_probe_error}"}),flush=True)
+
+
+# Basket-full early-MFE25 challenger: GET-only shadow. Installs AFTER both NAV
+# budget gates, without wrapping entry/exit/stop execution or changing strategy.
+import metals_basket_full_early_exit_shadow as _basket_full_shadow
+BASKET_FULL_SHADOW_INSTALL = _basket_full_shadow.install(app, core)
+print("METALS_BASKET_FULL_EARLY_EXIT_SHADOW " +
+      json.dumps(BASKET_FULL_SHADOW_INSTALL, default=str), flush=True)
