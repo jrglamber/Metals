@@ -18,6 +18,7 @@ import metals_xau_manual_highwater_reset as hwm
 
 VERSION = "metals_xau_manual_campaign_hwm_sync_v2_2026_11_12"
 ROUTE = "/api/xau/adaptive-campaign-reset/reset"
+HIGHWATER_ONLY_ROUTE = "/api/xau/adaptive-campaign-reset/highwater-only"
 _INSTALLED = False
 
 
@@ -26,6 +27,7 @@ def preview(core: Any, side: str) -> Dict[str, Any]:
     rows = adaptive._open_links(core)
     broker = core.metals_xau_live_broker_snapshot(include_account_summary=False)
     proof = hwm.baseline(core, broker, rows, side)
+    highwater_only_proof = hwm.baseline_for_any_xau_basket(core, broker, rows)
     cycle = str(old_check.get("live_harvest_cycle_id") or "")
     with core.get_conn() as conn:
         last_at = str(core._metals_xau_live_runtime_get(conn, old._key(side, "reset_at"), "") or "")
@@ -49,12 +51,23 @@ def preview(core: Any, side: str) -> Dict[str, Any]:
         extra = ["xau_harvest_has_pending_closes_or_partial_stages"]
     else:
         extra = []
+    highwater_only_blockers = []
+    if not highwater_only_proof.get("ok"):
+        highwater_only_blockers.append(highwater_only_proof.get("reason") or "xau_highwater_not_reconcilable")
+    if not cycle:
+        highwater_only_blockers.append("live_xau_harvest_cycle_unavailable")
+    if not harvest.get("ok"):
+        highwater_only_blockers.append("xau_harvest_has_pending_closes_or_partial_stages")
     can_reset = bool(old_check.get("allowed") and not extra)
     return {
         **old_check, "allowed":can_reset,
         "alignment_allowed":align_allowed,"latest_reset_at":last_at if align_allowed else "",
         "baseline":proof if proof.get("ok") else None,
         "extra_blockers":extra,
+        "highwater_only_allowed":not highwater_only_blockers,
+        "highwater_only_baseline":highwater_only_proof if highwater_only_proof.get("ok") else None,
+        "highwater_only_blockers":highwater_only_blockers,
+        "highwater_only_changes_entry_counters":False,
         "new_harvest_checkpoint_r":30,
         "highwater_reset_included":True,"shared_hwm_needs_same_side_only":True,
         "scope":"XAU_LIVE_ADAPTIVE_ENTRY_COUNT_HIGHWATER_HARVEST",
@@ -79,10 +92,24 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         if not cycle or side not in ("short", "long"):
             return value
         with c.get_conn() as conn:
+            preserved_cycle = str(c._metals_xau_live_runtime_get(
+                conn, "xau_hwm_counter_preserved_cycle_id", "") or "")
+            preserved_offset = int(c._metals_xau_live_runtime_get(
+                conn, "xau_hwm_counter_preserved_"+side+"_count", "0") or 0)
             aligned_cycle = str(c._metals_xau_live_runtime_get(
                 conn, old._key(side, "hwm_aligned_cycle_id"), "") or "")
             reset_at = str(c._metals_xau_live_runtime_get(
                 conn, old._key(side, "reset_at"), "") or "")
+        if preserved_cycle == cycle:
+            cycle_start = adaptive._parse_cycle_start(cycle)
+            if cycle_start is None:
+                return value
+            new_entries = old._count_after_epoch(c,side,cycle,cycle_start)
+            value["count"] = preserved_offset + new_entries
+            value["exact"] = True
+            value["campaign_counters_preserved_across_hwm_reset"] = True
+            value["hwm_reset_entry_count_offset"] = preserved_offset
+            return value
         start = adaptive._parse_dt(reset_at)
         if aligned_cycle == cycle and start is not None:
             value["count"] = old._count_after_epoch(c,side,cycle,start)
@@ -98,6 +125,71 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         if side not in ("short","long"):
             raise HTTPException(status_code=400,detail="Invalid XAU direction")
         return preview(core,side)
+
+    async def highwater_only_reset(request: Request, x_webhook_secret: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        expected = str(getattr(core,"WEBHOOK_SECRET","") or "")
+        if not expected or not x_webhook_secret or not hmac.compare_digest(str(x_webhook_secret),expected):
+            raise HTTPException(status_code=401,detail="Invalid WEBHOOK_SECRET")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400,detail="Invalid JSON")
+        if not isinstance(body,dict) or body.get("confirm") != "RESET_XAU_HIGHWATER_ONLY":
+            raise HTTPException(status_code=400,detail="Explicit high-water-only confirmation required")
+        if body.get("acknowledge_current_basket") is not True:
+            raise HTTPException(status_code=400,detail="Acknowledge the current broker basket first")
+        harvest_lock = getattr(core,"_METALS_XAU_LIVE_HARVEST_LOCK",None)
+        if harvest_lock is None or not harvest_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409,detail="XAU harvest worker busy; no reset applied")
+        try:
+            with hwm._HWM_LOCK:
+                check = preview(core,"short")
+                if not check.get("highwater_only_allowed"):
+                    raise HTTPException(status_code=409,detail={
+                        "reason":"xau_highwater_only_reset_blocked",
+                        "blockers":check.get("highwater_only_blockers",[]),
+                    })
+                rows = adaptive._open_links(core)
+                cycle = str(check.get("live_harvest_cycle_id") or "")
+                offsets = {}
+                for counter_side in ("long","short"):
+                    state = adaptive._campaign_entry_count(core,counter_side,rows)
+                    if state.get("exact") is False:
+                        raise HTTPException(status_code=409,detail={
+                            "reason":"xau_campaign_counter_not_exact","side":counter_side,
+                        })
+                    offsets[counter_side] = int(state.get("count") or 0)
+                outcome = hwm.perform_rebase(
+                    core,"all",align_only=False,expected_cycle_id=cycle,
+                    expected_open_ids=[str(row.get("broker_trade_id") or "") for row in rows],
+                    preserve_campaign_counters=True,counter_offsets=offsets,
+                )
+                if not outcome.get("ok"):
+                    raise HTTPException(status_code=409,detail=outcome)
+                after = {
+                    counter_side:int(adaptive._campaign_entry_count(
+                        core,counter_side,adaptive._open_links(core)
+                    ).get("count") or 0)
+                    for counter_side in ("long","short")
+                }
+        finally:
+            harvest_lock.release()
+        return {
+            "ok":True,"status":"XAU_HIGHWATER_ONLY_RESET",
+            "previous_hwm_r":outcome["previous"]["r"],
+            "previous_hwm_gbp":outcome["previous"]["gbp"],
+            "new_hwm_r":outcome["baseline"]["new_hwm_r"],
+            "new_hwm_gbp":outcome["baseline"]["new_hwm_gbp"],
+            "current_basket_r":outcome["baseline"]["current_r"],
+            "current_basket_gbp":outcome["baseline"]["current_gbp"],
+            "open_count":outcome["baseline"]["open_count"],
+            "new_cycle_id":outcome["new_cycle_id"],
+            "next_harvest_threshold_r":30,
+            "entry_counters_before":offsets,"entry_counters_after":after,
+            "broker_orders_sent":False,"open_positions_and_stops_unchanged":True,
+            "position_sizing_and_entry_rules_unchanged":True,
+            "previous_executed_harvest_preserved":True,
+        }
 
     async def reset(request: Request, x_webhook_secret: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         expected = str(getattr(core,"WEBHOOK_SECRET","") or "")
@@ -188,10 +280,16 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     if pv is None:
         raise RuntimeError("XAU combined reset preview route registration failed")
     app.router.routes.remove(pv);app.router.routes.insert(0,pv)
+    app.add_api_route(HIGHWATER_ONLY_ROUTE,highwater_only_reset,methods=["POST"],include_in_schema=False)
+    hv=next((r for r in reversed(app.router.routes)
+             if getattr(r,"path","")==HIGHWATER_ONLY_ROUTE and getattr(r,"endpoint",None) is highwater_only_reset),None)
+    if hv is None:
+        raise RuntimeError("XAU high-water-only reset route registration failed")
+    app.router.routes.remove(hv);app.router.routes.insert(0,hv)
     old.DASHBOARD_SNIPPET = DASHBOARD_SNIPPET
     _INSTALLED=True
-    return {"installed":True,"version":VERSION,"route_count":2,
-            "hwm_and_harvest_reset":True,"retroactive_align_available":True,
+    return {"installed":True,"version":VERSION,"route_count":3,
+            "hwm_and_harvest_reset":True,"highwater_only_reset_available":True,"retroactive_align_available":True,
             "broker_order_writes":False,"practice_hwm_untouched":True}
 
 
