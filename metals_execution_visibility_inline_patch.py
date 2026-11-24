@@ -9,7 +9,7 @@ from typing import Any, Dict
 import metals_execution_visibility_patch as visibility
 import metals_xag_live_signal_status_panel as xag_live_panel
 
-VERSION = "metals_signals_lane_separated_outcomes_v2_2026_11_24"
+VERSION = "metals_hourly_live_open_yes_no_v1_2026_11_24"
 
 
 def _label(state: str) -> tuple[str, str]:
@@ -62,10 +62,7 @@ def _compact_signals_table(
     rows = re.findall(r"<tr>(.*?)</tr>", old_table, flags=re.DOTALL)
     if not rows:
         return rendered
-    headers = (
-        "<th>Time</th><th>Asset</th><th>Candidate</th>"
-        "<th>Candidate Gate</th><th>XAG Practice Guard</th><th>Live Outcome</th><th>Detail</th>"
-    )
+    headers = "<th>Time</th><th>Asset</th><th>Trade opened?</th><th>Detail</th>"
     compact_rows = []
     for row_html in rows[1:]:
         cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.DOTALL)
@@ -73,49 +70,35 @@ def _compact_signals_table(
             continue
         values = [_plain_cell(cell) for cell in cells]
         rid = values[0]
-        is_candidate = values[5].upper() == "TRUE"
-        eligible = values[6].upper() == "TRUE"
         asset = values[2]
-        candidate = values[7] if is_candidate else "—"
-        eligibility = "Yes" if eligible else "No"
-        guard = values[8] if asset == "XAGUSD" else "—"
         if asset == "XAGUSD":
-            if "XAG_GUARD_PENDING_FAIL_CLOSED" in guard:
-                guard = guard.replace("XAG_GUARD_PENDING_FAIL_CLOSED", "PENDING · fail-closed")
             live = xag_live.get(rid) or {}
-            live_state = str(live.get("state") or "")
-            if live_state == "LIVE TRACKED":
-                result, result_class = "LIVE TRACKED", "pos"
-                reason = "broker-linked live position"
-            elif live_state and live_state != "NO LIVE EXECUTION AUDIT":
-                result = live_state
-                result_class = "warn" if "BLOCK" in live_state or "FAILED" in live_state else "flat"
-                reason = str(live.get("reason") or "live audit recorded")
+            if live.get("opened"):
+                result, result_class, reason = "YES", "pos", "Broker trade linked"
             else:
-                result, result_class = "NO LIVE AUDIT", "flat"
-                reason = "No live XAG decision recorded for this signal"
+                result, result_class = "NO", "flat"
+                live_reason = str(live.get("reason") or "")
+                reason = "No live trade linked" if not live_reason or "not evidence of eligibility" in live_reason else live_reason
         elif (outcome := outcomes.get(rid)):
-            result, result_class, reason = _display_for(outcome, qualities.get(rid, ""))
-        elif is_candidate and not eligible:
-            result, result_class, reason = "BLOCKED", "neg", values[12]
-        elif is_candidate:
-            result, result_class, reason = "ELIGIBLE · NO LIVE LINK", "warn", "No broker-linked execution found"
+            if outcome.get("broker_trade_id") or str(outcome.get("execution_state") or "").upper() == "OPENED":
+                result, result_class, reason = "YES", "pos", "Broker trade linked"
+            else:
+                result, result_class = "NO", "flat"
+                label, _, detail = _display_for(outcome, qualities.get(rid, ""))
+                reason = detail if label not in {"NO EXECUTION RECORD", "—"} else "No live trade linked"
         else:
-            result, result_class, reason = "NO CANDIDATE", "flat", values[12]
+            result, result_class, reason = "NO", "flat", "No live trade linked"
         compact_rows.append(
             "<tr>"
             f"<td>{html.escape(values[1])}</td>"
             f"<td><strong>{html.escape(asset)}</strong></td>"
-            f"<td>{html.escape(candidate)}</td>"
-            f"<td>{html.escape(eligibility)}</td>"
-            f"<td>{html.escape(guard or '—')}</td>"
             f"<td class=\"{result_class}\"><strong>{html.escape(result)}</strong></td>"
             f"<td>{html.escape(reason or '—')}</td>"
             "</tr>"
         )
     compact = (
         '<div class="table-scroll"><table><thead><tr>' + headers + '</tr></thead><tbody>'
-        + ("".join(compact_rows) or '<tr><td colspan="7">No recent Metals signals.</td></tr>')
+        + ("".join(compact_rows) or '<tr><td colspan="4">No recent Metals signals.</td></tr>')
         + '</tbody></table></div>'
     )
     return rendered[:match.start()] + compact + rendered[match.end():]
@@ -184,8 +167,8 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         rendered = re.sub(
             r'<div class="section-note small"><strong>Latest 30 Metals Signals\.</strong>.*?</div>',
             '<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> '
-            'The XAG Practice Guard is separate from the live lane. Live Outcome uses broker links/live audits; '
-            'Candidate Gate eligibility alone does not mean a trade opened.</div>',
+            'YES means a live broker trade is linked to that signal. NO means no live trade opened from it. '
+            'Practice-guard diagnostics are separate.</div>',
             rendered, count=1, flags=re.DOTALL,
         )
         try:
@@ -223,8 +206,9 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
     checks = {
         "compact_header_present": all(
             f"<th>{label}</th>" in probe
-            for label in ("Time", "Asset", "Candidate", "Candidate Gate", "XAG Practice Guard", "Live Outcome", "Detail")
+            for label in ("Time", "Asset", "Trade opened?", "Detail")
         ),
+        "practice_guard_hidden_from_open_outcome_table": "XAG Practice Guard" not in probe,
         "duplicate_outcomes_section_removed": "Live XAU Execution Outcomes" not in probe,
         "opened_overrides_watch_classification": opened_unit == (
             "OPENED", "pos", "broker trade linked",
