@@ -11,7 +11,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-VERSION = "metals_xau_manual_hwm_rebase_v1_2026_11_12"
+VERSION = "metals_xau_manual_hwm_rebase_v2_2026_11_24"
 _HWM_LOCK = threading.RLock()
 _INSTALLED_HWM = False
 
