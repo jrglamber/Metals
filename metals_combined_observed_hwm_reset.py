@@ -164,78 +164,72 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
 
 
 DASHBOARD_SNIPPET = r"""
+<section id="pep-combined-observed-peak-reset-controls" style="margin:14px 0;padding:12px;border:1px solid rgba(88,166,255,.45);border-radius:10px">
+  <h3 style="margin:4px 0 10px;padding:0">Combined observed peak (reporting only)</h3>
+  <p class="section-note">Resets the combined XAU + XAG SHORT reporting peak to current verified combined open P&amp;L. This does not reset either harvest high-water, change 30R ladders, or alter trades.</p>
+  <div id="pep-combined-peak-status" role="status" aria-live="polite" style="font-size:13px;overflow-wrap:anywhere">Checking verified combined broker P&amp;L…</div>
+  <label for="pep-combined-peak-secret">WEBHOOK_SECRET (not the dashboard access token)</label>
+  <input id="pep-combined-peak-secret" type="password" autocomplete="off" placeholder="Enter WEBHOOK_SECRET" aria-label="WEBHOOK_SECRET"
+    style="max-width:420px;width:100%;padding:9px;border-radius:7px;border:1px solid #687386;background:#0d1117;color:#f3f4f6">
+  <label style="display:flex;gap:7px;align-items:flex-start;font-size:13px;margin:8px 0">
+    <input id="pep-combined-peak-ack" type="checkbox">
+    <span>I acknowledge this resets only the historical reporting peak to the current combined broker P&amp;L.</span>
+  </label>
+  <button id="pep-combined-peak-reset" type="button" disabled style="padding:9px 11px;border-radius:7px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700">
+    Reset combined observed peak
+  </button>
+</section>
 <script id="pep-combined-observed-peak-reset">
 (function(){
   'use strict';
   if(window.__pepCombinedPeakResetInstalled)return;
   window.__pepCombinedPeakResetInstalled=true;
-  var busy=false,attempts=0;
-  function attach(){
-    var top=document.getElementById('topTiles');
-    if(!top)return false;
-    var cards=Array.from(top.querySelectorAll('.card'));
-    var card=cards.find(function(c){
-      var label=c.querySelector('.label');
-      return label&&String(label.textContent||'').trim()==='Combined Observed Peak · LIVE XAU + XAG SHORT';
-    });
-    if(!card||card.querySelector('#pep-combined-peak-controls'))return !!card;
-    var controls=document.createElement('div');
-    controls.id='pep-combined-peak-controls';
-    controls.style.cssText='display:grid;gap:7px;margin-top:10px;text-align:left';
-    controls.innerHTML=
-      '<input id="pep-combined-peak-secret" type="password" autocomplete="off" placeholder="WEBHOOK_SECRET (not dashboard token)" aria-label="WEBHOOK_SECRET" style="width:100%;min-width:0;padding:8px;border-radius:7px;border:1px solid #687386;background:#0d1117;color:#f3f4f6">'+
-      '<label style="display:flex;gap:7px;align-items:flex-start;font-size:12px"><input id="pep-combined-peak-ack" type="checkbox"><span>Reset this reporting peak to current verified combined open P&amp;L. XAU/XAG harvest high waters and trades stay unchanged.</span></label>'+
-      '<button id="pep-combined-peak-reset" type="button" disabled style="justify-self:start;padding:7px 9px;border-radius:7px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700">Reset combined observed peak</button>'+
-      '<div id="pep-combined-peak-status" role="status" aria-live="polite" style="font-size:12px;overflow-wrap:anywhere">Checking verified combined broker P&amp;L…</div>';
-    card.appendChild(controls);
-    var secret=controls.querySelector('#pep-combined-peak-secret');
-    var ack=controls.querySelector('#pep-combined-peak-ack');
-    var button=controls.querySelector('#pep-combined-peak-reset');
-    var status=controls.querySelector('#pep-combined-peak-status');
-    var allowed=false;
-    function sync(){button.disabled=busy||!allowed||!secret.value.trim()||!ack.checked;}
-    async function refresh(){
-      allowed=false;sync();
-      try{
-        var r=await fetch('/api/live-metals-combined-peak-reset/preview',{cache:'no-store'});
-        var d=await r.json();
-        allowed=!!(r.ok&&d.ok&&d.allowed);
-        if(allowed){
-          var b=d.baseline;
-          status.textContent='Verified current combined open P&L: £'+Number(b.current_gbp).toFixed(2)+
-            ' across '+Number(b.open_count)+' trade(s). Reset sets the reporting peak to this value.';
-        }else status.textContent='Reset unavailable: '+((d.blockers||[]).join(', ')||'combined broker proof unavailable')+'.';
-      }catch(e){allowed=false;status.textContent='Could not verify combined broker P&amp;L. No reset made.';}
-      sync();
-    }
-    secret.addEventListener('input',sync);ack.addEventListener('change',sync);
-    button.addEventListener('click',async function(){
-      if(button.disabled)return;
-      busy=true;sync();status.textContent='Resetting reporting-only combined peak…';
-      try{
-        var r=await fetch('/api/live-metals-combined-peak-reset/reset',{
-          method:'POST',headers:{'Content-Type':'application/json','X-Webhook-Secret':secret.value},
-          body:JSON.stringify({confirm:'RESET_COMBINED_OBSERVED_PEAK',acknowledge_reporting_only:true})
-        });
-        var d=await r.json();
-        if(!r.ok){
-          var detail=d.detail;
-          var message=typeof detail==='string'?detail:(detail&&detail.reason?detail.reason:JSON.stringify(detail||d));
-          if(r.status===401)message='WEBHOOK_SECRET was rejected. Use the same secret as the XAU/XAG reset controls.';
-          throw Error(message);
-        }
-        status.textContent='Reporting peak reset to £'+Number(d.new_peak_gbp).toFixed(2)+'. Harvest settings and open trades were not changed.';
-        secret.value='';ack.checked=false;allowed=false;
-        setTimeout(function(){window.location.reload();},900);
-      }catch(e){status.textContent='Reset failed: '+(e.message||'request failed')+'. No reset confirmed.';}
-      finally{busy=false;sync();}
-    });
-    refresh();setInterval(refresh,30000);return true;
+  var busy=false;
+  var status=document.getElementById('pep-combined-peak-status');
+  var secret=document.getElementById('pep-combined-peak-secret');
+  var ack=document.getElementById('pep-combined-peak-ack');
+  var button=document.getElementById('pep-combined-peak-reset');
+  if(!status||!secret||!ack||!button)return;
+  var allowed=false;
+  function sync(){button.disabled=busy||!allowed||!secret.value.trim()||!ack.checked;}
+  async function refresh(){
+    allowed=false;sync();
+    try{
+      var r=await fetch('/api/live-metals-combined-peak-reset/preview',{cache:'no-store'});
+      var d=await r.json();
+      allowed=!!(r.ok&&d.ok&&d.allowed);
+      if(allowed){
+        var b=d.baseline;
+        status.textContent='Verified current combined open P&L: £'+Number(b.current_gbp).toFixed(2)+
+          ' across '+Number(b.open_count)+' trade(s). Previous reporting peak: '+
+          (d.previous_peak_gbp==null?'not initialized':'£'+Number(d.previous_peak_gbp).toFixed(2))+'.';
+      }else status.textContent='Reset unavailable: '+((d.blockers||[]).join(', ')||'combined broker proof unavailable')+'.';
+    }catch(e){allowed=false;status.textContent='Could not verify combined broker P&L. No reset made.';}
+    sync();
   }
-  var top=document.getElementById('topTiles');
-  if(top)new MutationObserver(function(){attach();}).observe(top,{childList:true,subtree:true});
-  var timer=setInterval(function(){if(attach()||++attempts>120)clearInterval(timer);},250);
-  attach();
+  secret.addEventListener('input',sync);ack.addEventListener('change',sync);
+  button.addEventListener('click',async function(){
+    if(button.disabled)return;
+    busy=true;sync();status.textContent='Resetting reporting-only combined peak…';
+    try{
+      var r=await fetch('/api/live-metals-combined-peak-reset/reset',{
+        method:'POST',headers:{'Content-Type':'application/json','X-Webhook-Secret':secret.value},
+        body:JSON.stringify({confirm:'RESET_COMBINED_OBSERVED_PEAK',acknowledge_reporting_only:true})
+      });
+      var d=await r.json();
+      if(!r.ok){
+        var detail=d.detail;
+        var message=typeof detail==='string'?detail:(detail&&detail.reason?detail.reason:JSON.stringify(detail||d));
+        if(r.status===401)message='WEBHOOK_SECRET was rejected. Use the same secret as the XAU/XAG harvest reset controls.';
+        throw Error(message);
+      }
+      status.textContent='Reporting peak reset to £'+Number(d.new_peak_gbp).toFixed(2)+'. Harvest settings and open trades were not changed.';
+      secret.value='';ack.checked=false;allowed=false;
+      setTimeout(function(){window.location.reload();},900);
+    }catch(e){status.textContent='Reset failed: '+(e.message||'request failed')+'. No reset confirmed.';}
+    finally{busy=false;sync();}
+  });
+  refresh();setInterval(refresh,30000);
 })();
 </script>
-"""
+""";

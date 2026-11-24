@@ -259,16 +259,28 @@ class XagLiveWordingMiddleware:
                             text = text.replace('</body>', _LATEST_OPENED_TILE_SCRIPT + '</body>', 1)
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
-                        if "pep-xau-campaign-reset" not in text:
-                            add += manual_campaign_reset.DASHBOARD_SNIPPET
+                        reset_panel = ""
+                        if "pep-metals-reset-controls" not in text:
+                            # Keep every state-changing reporting/harvest reset in one clearly named group.
+                            # These controls still call their independent authenticated endpoints.
+                            reset_controls = (
+                                manual_campaign_reset.DASHBOARD_SNIPPET
+                                + xag_highwater_reset.DASHBOARD_SNIPPET
+                                + combined_hwm_reset.DASHBOARD_SNIPPET
+                            )
+                            reset_panel = (
+                                '<details id="pep-metals-reset-controls" class="dashboard-group" style="margin:10px 0">'
+                                '<summary>Metals Reset Controls</summary>'
+                                '<div class="section-note">All reset actions are separate and explicitly confirmed. '
+                                'They change only the selected XAU/XAG cycle or the reporting peak described in each control.</div>'
+                                '<div style="padding:10px">'
+                                + reset_controls
+                                + '</div></details>'
+                            )
                         if "pep-xag-live-health" not in text:
                             add += live_xag_health.DASHBOARD_SNIPPET
                         if "pep-xag-ladder-js" not in text:
                             add += live_xag_harvest_dashboard.DASHBOARD_SNIPPET
-                        if "pep-xag-highwater-reset" not in text:
-                            add += xag_highwater_reset.DASHBOARD_SNIPPET
-                        if "pep-combined-observed-peak-reset" not in text:
-                            add += combined_hwm_reset.DASHBOARD_SNIPPET
                         if "pep-metals-period-accounting-script" not in text:
                             # Financial summary goes ABOVE legacy diagnostics.
                             anchor = "<h2>Details</h2>"
@@ -277,12 +289,13 @@ class XagLiveWordingMiddleware:
                                 text = text.replace(anchor, panel + anchor, 1)
                             else:
                                 text = text.replace("</body>", panel + "</body>", 1)
-                        if add:
+                        if reset_panel or add:
                             anchor = "<h2>Details</h2>"
+                            insert = reset_panel + add
                             if anchor in text:
-                                text = text.replace(anchor, anchor + add, 1)
+                                text = text.replace(anchor, anchor + insert, 1)
                             else:
-                                text = text.replace("</body>", add + "</body>", 1)
+                                text = text.replace("</body>", insert + "</body>", 1)
                     body = text.encode("utf-8")
                 except Exception as exc:
                     print("METALS_TOP_HTML_REWRITE_FAILED "
