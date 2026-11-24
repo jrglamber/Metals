@@ -398,6 +398,50 @@ def build_bundle(core, xag_reader=None, now=None):
             manifest["forward_capture"]={
                 "status":"UNAVAILABLE","reason_type":type(exc).__name__,
                 "prior_history_backfilled":False,"execution_authority":False}
+        # Forward-only basket-full early MFE25 shadow, never broker fills.
+        try:
+            from metals_basket_full_early_exit_shadow import (
+                export_rows as _basket_shadow_export, VERSION as _basket_shadow_version)
+            shadow = _basket_shadow_export(core)
+            shadow_sample_fields = [
+                "id","sampled_at_utc","asset","status","reason",
+                "broker_risk_used_gbp","broker_risk_cap_gbp","nav_gbp",
+                "broker_open_count","budget_full","young_short_count",
+                "legacy_young_excluded","execution_authority"]
+            shadow_trade_fields = [
+                "asset","broker_trade_id","policy","first_seen_utc",
+                "opened_at_utc","last_observed_utc","observed_mfe_r",
+                "armed_at_utc","armed_mfe_r","early_exit_at_utc",
+                "early_exit_observed_r","early_exit_mark_gbp",
+                "actual_broker_close_at_utc","actual_gross_realised_gbp",
+                "last_status","notes","execution_authority"]
+            _csv(zf,"live-metals-basket-full-shadow-budget.csv",
+                 shadow["budget"],shadow_sample_fields)
+            _csv(zf,"live-metals-basket-full-shadow-trades.csv",
+                 shadow["trades"],shadow_trade_fields)
+            manifest["basket_full_early_exit_shadow"] = {
+                "version":_basket_shadow_version,
+                "status":"COLLECTING" if shadow["budget"] else "NO_FORWARD_SAMPLES_YET",
+                "sample_count":len(shadow["budget"]),
+                "trade_policy_rows":len(shadow["trades"]),
+                "scope":"XAU_SHORT_AND_XAG_SHORT;XAU_LONG_ATR2_NOT_MODELLED",
+                "hypothetical_policies":["ANY_POSITIVE","MFE_1R",
+                                         "MFE_1R_12H","MFE_2R"],
+                "requires_actual_broker_budget":True,
+                "uses_only_existing_confirmed_live_positions":True,
+                "not_full_path_or_broker_fill_backtest":True,
+                "no_backfill_pre_deployment":True,
+                "execution_authority":False,"broker_order_writes":False,
+                "live_entry_stop_exit_unchanged":True,
+            }
+        except Exception as exc:
+            zf.writestr("live-metals-basket-full-shadow-unavailable.json",
+                json.dumps({"status":"UNAVAILABLE",
+                            "error_type":type(exc).__name__,
+                            "execution_authority":False}))
+            manifest["basket_full_early_exit_shadow"] = {
+                "status":"UNAVAILABLE","error_type":type(exc).__name__,
+                "execution_authority":False}
         zf.writestr("manifest.json",json.dumps(manifest,indent=2,default=str))
         zf.writestr("README.txt",("LIVE Metals analysis, not practice/demo. UTC events bucketed into Europe/London dates.\n"
           "XAU source = broker-synced XAU transaction ledger since its accounting epoch; verify separately before treating as independently complete lifetime history.\n"
