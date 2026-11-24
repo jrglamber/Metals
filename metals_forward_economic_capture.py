@@ -347,6 +347,16 @@ def capture_once(core):
     from metals_reporting_snapshot import snapshot
     report = snapshot(core)
     result = _capture(core,report)
+    # Independent, execution-disabled basket-full exit shadow. Any failure in
+    # this research layer must NEVER impact the live economic-equity recorder,
+    # order routing, stop managers, or broker reconciliation.
+    try:
+        from metals_basket_full_early_exit_shadow import capture as _shadow_capture
+        result["basket_full_shadow"] = _shadow_capture(core, result["sampled_at_utc"])
+    except Exception as exc:
+        result["basket_full_shadow"] = {"ok":False,"research_only":True,
+            "error_type":type(exc).__name__,"execution_authority":False}
+        print("METALS_BASKET_FULL_SHADOW ERROR "+type(exc).__name__,flush=True)
     with _lock:
         _state["last_sample_at_utc"]=result["sampled_at_utc"]
         _state["last_status"]=result["status"]
