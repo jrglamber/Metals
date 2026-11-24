@@ -88,6 +88,47 @@ def baseline(core: Any, broker: Dict[str, Any], open_rows: List[Dict[str, Any]],
     }
 
 
+def baseline_for_any_xau_basket(core: Any, broker: Dict[str, Any], open_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Reconcile the full XAU basket and calculate a fresh broker baseline.
+
+    Unlike the campaign reset baseline, this does not cap position count or
+    require one direction. It never changes positions, entry counters, or risk.
+    """
+    if broker.get("ok") is not True:
+        return {"ok": False, "reason": "live_oanda_xau_snapshot_unavailable"}
+    trades = list(broker.get("all_xau_trades") or [])
+    bids = [str(t.get("id") or "") for t in trades]
+    lids = [str(r.get("broker_trade_id") or "") for r in open_rows]
+    if (len(trades) != len(open_rows) or len(set(bids)) != len(bids)
+        or len(set(lids)) != len(lids) or set(bids) != set(lids)
+        or any(not value for value in bids + lids)):
+        return {"ok": False, "reason": "xau_broker_link_reconciliation_not_exact"}
+    by_id = {str(t["id"]): t for t in trades}
+    current_gbp = current_r = 0.0
+    for row in open_rows:
+        trade = by_id[str(row["broker_trade_id"])]
+        units = _f(trade.get("currentUnits"))
+        side = "long" if units is not None and units > 0 else "short" if units is not None and units < 0 else "flat"
+        if side == "flat" or str(row.get("side") or "").lower() != side:
+            return {"ok": False, "reason": "xau_broker_link_direction_mismatch"}
+        pnl = _f(trade.get("unrealizedPL"))
+        risk = _f(row.get("estimated_risk_amount"))
+        if risk is None or risk <= 0:
+            risk = _f(row.get("requested_risk_amount"))
+        if pnl is None or risk is None or risk <= 0:
+            return {"ok": False, "reason": "xau_fresh_broker_pl_or_trade_risk_unavailable"}
+        current_gbp += pnl
+        current_r += pnl / risk
+    return {
+        "ok": True, "open_count": len(trades),
+        "current_gbp": round(current_gbp, 6), "current_r": round(current_r, 8),
+        "new_hwm_gbp": max(0.0, round(current_gbp, 6)),
+        "new_hwm_r": max(0.0, round(current_r, 8)),
+        "broker_trade_ids": bids, "side": "all",
+        "broker_read_ok": True, "no_broker_orders": True,
+    }
+
+
 def pending_harvest_guard(conn: Any, cycle_id: str) -> Dict[str, Any]:
     """Refuse to orphan an in-progress partial harvest or queued broker close."""
     stages = [dict(r) for r in conn.execute(
@@ -114,7 +155,9 @@ def pending_harvest_guard(conn: Any, cycle_id: str) -> Dict[str, Any]:
 
 
 def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id: str,
-                   expected_open_ids: List[str], manual_reset_at: str = "") -> Dict[str, Any]:
+                   expected_open_ids: List[str], manual_reset_at: str = "",
+                   preserve_campaign_counters: bool = False,
+                   counter_offsets: Dict[str, int] | None = None) -> Dict[str, Any]:
     """One transaction for HWM/cycle/cursor/audit; no trade- or stop-order writes.
 
     Must be called with HWM_LOCK and XAU HARVEST_LOCK both held. A fresh
@@ -128,7 +171,8 @@ def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id:
             "SELECT broker_trade_id,side,estimated_risk_amount,requested_risk_amount "
             "FROM metals_xau_live_trade_links WHERE status='OPEN' ORDER BY id"
         ).fetchall()]
-    proof = baseline(core, fresh_broker, rows, side)
+    proof = (baseline_for_any_xau_basket(core, fresh_broker, rows)
+             if preserve_campaign_counters else baseline(core, fresh_broker, rows, side))
     if not proof.get("ok"):
         return proof
     if set(proof["broker_trade_ids"]) != set(expected_open_ids):
@@ -175,11 +219,18 @@ def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id:
         setter(conn, "active_harvest_cycle_id", new_cycle)
         setter(conn, "harvest_last_seen_hwm_r", proof["new_hwm_r"])
         setter(conn, "harvest_ever_initialized", "1")
-        setter(conn, "xau_adaptive_manual_campaign_"+side+"_hwm_aligned_cycle_id", new_cycle)
-        setter(conn, "xau_adaptive_manual_campaign_"+side+"_hwm_aligned_at", observed)
-        if not align_only:
-            setter(conn, "xau_adaptive_manual_campaign_"+side+"_cycle_id", new_cycle)
-            setter(conn, "xau_adaptive_manual_campaign_"+side+"_reset_at", observed)
+        if preserve_campaign_counters:
+            setter(conn, "xau_hwm_counter_preserved_cycle_id", new_cycle)
+            offsets = counter_offsets or {}
+            for counter_side in ("long", "short"):
+                setter(conn, "xau_hwm_counter_preserved_"+counter_side+"_count",
+                       str(max(0, int(offsets.get(counter_side, 0)))))
+        else:
+            setter(conn, "xau_adaptive_manual_campaign_"+side+"_hwm_aligned_cycle_id", new_cycle)
+            setter(conn, "xau_adaptive_manual_campaign_"+side+"_hwm_aligned_at", observed)
+            if not align_only:
+                setter(conn, "xau_adaptive_manual_campaign_"+side+"_cycle_id", new_cycle)
+                setter(conn, "xau_adaptive_manual_campaign_"+side+"_reset_at", observed)
         conn.execute(
             """INSERT INTO metals_xau_live_hwm_events(
                 created_at_utc,observed_at_utc,event_type,open_count,current_gbp,
@@ -191,6 +242,8 @@ def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id:
              "manual_xau_adaptive_campaign_reset",
              json.dumps({"prior": previous, "new_cycle_id":new_cycle,
                          "side":side,"align_only":align_only,
+                         "preserve_campaign_counters":preserve_campaign_counters,
+                         "campaign_counter_offsets":counter_offsets or {},
                          "original_manual_reset_at":manual_reset_at,
                          "broker_open_count":proof["open_count"],
                          "no_broker_orders":True,
@@ -207,6 +260,8 @@ def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id:
                          "new_cycle_id":new_cycle,
                          "broker_baseline":proof,
                          "align_only":align_only,
+                         "preserve_campaign_counters":preserve_campaign_counters,
+                         "campaign_counter_offsets":counter_offsets or {},
                          "no_broker_orders":True},default=str)),
         )
         conn.commit()
@@ -215,5 +270,7 @@ def perform_rebase(core: Any, side: str, *, align_only: bool, expected_cycle_id:
             "reset_at_utc":observed,"previous":previous,
             "baseline":proof,"next_harvest_threshold_r":30,
             "open_positions_and_stops_unchanged":True,
+            "campaign_counters_preserved":bool(preserve_campaign_counters),
+            "campaign_counter_offsets":counter_offsets or {},
             "previous_executed_harvest_preserved":True,
             "no_broker_orders":True}
