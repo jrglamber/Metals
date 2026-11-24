@@ -189,21 +189,21 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
 
 
 DASHBOARD_SNIPPET = r"""
-<div id="pep-xag-hwm-reset-controls" style="display:grid;gap:10px;margin:14px 0;padding:12px;border:1px solid rgba(88,166,255,.45);border-radius:10px">
-  <strong>Reset XAG high-water only</strong>
+<section id="pep-xag-hwm-reset-controls" style="margin:14px 0;padding:12px;border:1px solid rgba(88,166,255,.45);border-radius:10px">
+  <h3 style="margin:4px 0 10px;padding:0">XAG SHORT harvest high-water</h3>
   <div id="pep-xag-reset-hwm-state" role="status" aria-live="polite">Checking the live XAG basket…</div>
   <label for="pep-xag-reset-hwm-secret">WEBHOOK_SECRET (not the dashboard access token)</label>
   <input id="pep-xag-reset-hwm-secret" type="password" autocomplete="off" placeholder="Enter WEBHOOK_SECRET"
     style="max-width:420px;width:100%;padding:10px;border-radius:7px;border:1px solid #687386;background:#0d1117;color:#f3f4f6">
-  <label style="display:flex;gap:8px;align-items:flex-start">
+  <label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0">
     <input id="pep-xag-reset-hwm-ack" type="checkbox">
-    <span>I confirm a new XAG 30R harvest cycle from the current basket. Existing XAG trades, stops, sizing, entry rules and all XAU settings stay unchanged.</span>
+    <span>Reset only the XAG harvest baseline and restart its 30R ladder. Open XAG trades, stops, sizing, entry rules and all XAU settings stay unchanged.</span>
   </label>
   <button id="pep-xag-reset-hwm" type="button" disabled
-    style="justify-self:start;padding:9px 12px;border-radius:8px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700;cursor:pointer">
+    style="padding:9px 12px;border-radius:8px;border:1px solid #58a6ff;background:#14283e;color:#f3f4f6;font-weight:700;cursor:pointer">
     Reset XAG high-water + restart 30R ladder
   </button>
-</div>
+</section>
 <script id="pep-xag-highwater-reset">
 (function(){
   'use strict';
@@ -253,7 +253,7 @@ DASHBOARD_SNIPPET = r"""
         var detail=result.detail;
         var message=typeof detail==='string'?detail:
           (detail&&detail.reason?detail.reason:JSON.stringify(detail||result));
-        if(response.status===401)message='WEBHOOK_SECRET was rejected. Use the same WEBHOOK_SECRET as the XAU high-water reset.';
+        if(response.status===401)message='WEBHOOK_SECRET was rejected. Use the same WEBHOOK_SECRET as the XAU reset.';
         throw Error(message);
       }
       secret.value='';ack.checked=false;
