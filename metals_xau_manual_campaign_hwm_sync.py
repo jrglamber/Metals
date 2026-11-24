@@ -208,7 +208,7 @@ DASHBOARD_SNIPPET = r"""
  <div style="padding:12px">
  <label for="pep-xau-reset-side">Direction</label>
  <select id="pep-xau-reset-side" style="background:#161b22;color:#f3f4f6;border:1px solid #57606a;border-radius:7px;padding:8px">
- <option value="short">XAU short</option><option value="long">XAU long</option>
+ <option value="short">XAU short</option><option value="long">XAU long</option><option value="xag_short">XAG short — guard status</option>
  </select>
  <button type="button" id="pep-xau-reset-refresh">Check eligibility</button>
  <div id="pep-xau-reset-preview" class="section-note" style="margin-top:10px">Check live XAU eligibility.</div>
@@ -228,12 +228,31 @@ DASHBOARD_SNIPPET = r"""
  const result=document.getElementById('pep-xau-reset-result');
  let last=null;
  function show(el,txt){el.textContent=txt;el.style.display='block';el.style.whiteSpace='pre-wrap';}
+ async function responseJson(r){
+   const body=await r.text();
+   try{return JSON.parse(body)}catch(_){throw Error('Server returned HTTP '+r.status+' without JSON: '+body.slice(0,140))}
+ }
  async function refresh(){
    apply.disabled=true;align.disabled=true;last=null;
+   if(side.value==='xag_short'){
+     show(check,'Checking XAG SHORT live guard status…');
+     try{
+       const r=await fetch('/api/xag-short-live-health',{cache:'no-store'});
+       const d=await responseJson(r);
+       if(!r.ok||!d.ok)throw Error(d.error||'XAG health unavailable');
+       show(check,'XAG SHORT guard: '+d.execution_health+
+         ' | Broker shorts: '+d.broker_open_short_count+
+         ' | Tracked: '+d.tracked_open_count+
+         ' | Unlinked: '+d.untracked_broker_count+
+         ' | Unresolved orders: '+d.unresolved_entry_intent_count+
+         '.\\nXAG entry allowance resets automatically only after broker-confirmed flat. Manual XAG reset is unavailable while the basket is live; its HWM, harvest and positions are left untouched.');
+     }catch(e){show(check,'XAG guard status unavailable: '+(e.message||e));}
+     return;
+   }
    show(check,'Reading live OANDA positions, high-water and harvest safety…');
    try{
      const r=await fetch('/api/xau/adaptive-campaign-reset/v2/preview?side='+encodeURIComponent(side.value),{cache:'no-store'});
-     const d=await r.json();
+     const d=await responseJson(r);
      if(!r.ok)throw Error(d.detail||'Preview failed');
      last=d;
      const base=d.baseline||{}, recent=d.recent_closed||{};
@@ -249,7 +268,7 @@ DASHBOARD_SNIPPET = r"""
    }catch(e){show(check,'Preview unavailable: '+(e.message||e));}
  }
  async function submit(alignOnly){
-   if(!last || !(alignOnly?last.alignment_allowed:last.allowed))return;
+   if(side.value==='xag_short'||!last || !(alignOnly?last.alignment_allowed:last.allowed))return;
    const msg=(alignOnly?'Align high-water for the manual XAU reset you already completed?':
      'Start a fresh XAU campaign with new high-water and harvest cycle?')+
      '\n\nPrevious HWM will be archived, new HWM is current OANDA P&L (0 minimum).'+
@@ -265,7 +284,7 @@ DASHBOARD_SNIPPET = r"""
        body:JSON.stringify({side:side.value,confirm:'RESET_XAU_ADAPTIVE_CAMPAIGN',
          acknowledge_recent_results:true,align_previous_hwm_only:alignOnly}),cache:'no-store'
      });
-     const d=await r.json();
+     const d=await responseJson(r);
      if(!r.ok||!d.ok)throw Error(JSON.stringify(d.detail||d));
      show(result,'XAU '+side.value.toUpperCase()+' reset confirmed. HWM '+
        Number(d.old_hwm_r).toFixed(2)+'R → '+Number(d.new_hwm_r).toFixed(2)+

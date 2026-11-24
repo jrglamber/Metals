@@ -104,7 +104,8 @@ def pending_harvest_guard(conn: Any, cycle_id: str) -> Dict[str, Any]:
     ]
     queue = conn.execute(
         "SELECT COUNT(*) AS n FROM metals_xau_live_action_queue "
-        "WHERE action='CLOSE' AND (reason LIKE 'LIVE_XAU_HARVEST_%' OR reason LIKE '%HARVEST%') "
+        "WHERE action='CLOSE' AND (LEFT(reason, LENGTH('LIVE_XAU_HARVEST_'))='LIVE_XAU_HARVEST_' "
+        "OR STRPOS(UPPER(reason), 'HARVEST') > 0) "
         "AND UPPER(status) NOT IN ('CLOSED','EXECUTED','DONE','CANCELLED','FAILED_FINAL','COMPLETE')"
     ).fetchone()
     inflight = int(queue["n"] or 0) if queue is not None else 0
