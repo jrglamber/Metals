@@ -44,7 +44,12 @@ def _plain_cell(value: str) -> str:
 
 
 def _compact_signals_table(rendered: str, outcomes: Dict[str, Dict[str, Any]], qualities: Dict[str, str]) -> str:
-    match = re.search(r"<table>.*?</table>", rendered, flags=re.DOTALL)
+    # The page can contain other signal tables (for example the independent
+    # XAG live audit). Target only the model-candidate table this renderer owns.
+    match = next((
+        candidate for candidate in re.finditer(r"<table>.*?</table>", rendered, flags=re.DOTALL)
+        if "<th>Model Candidate</th>" in candidate.group(0)
+    ), None)
     if not match:
         return rendered
     old_table = match.group(0)
