@@ -151,6 +151,13 @@ _STANDARD_LAYOUT = r'''
       if(v==null||v===''||!isFinite(num))return '—';
       return num.toFixed(n==null?2:n);
     }
+    function tradeAge(iso){
+      var opened=Date.parse(iso||'');
+      if(!isFinite(opened))return '—';
+      var minutes=Math.max(0,Math.floor((Date.now()-opened)/60000));
+      var days=Math.floor(minutes/1440), hours=Math.floor((minutes%1440)/60), mins=minutes%60;
+      return days ? days+'d '+hours+'h' : hours ? hours+'h '+mins+'m' : mins+'m';
+    }
     function render(data){
       var body=d.querySelector('.pep-body');
       if(!body)return;
@@ -172,7 +179,7 @@ _STANDARD_LAYOUT = r'''
       }
       var html='<div class="table-scroll"><table><thead><tr>'+
         '<th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L (GBP)</th>'+
-        '<th>Opened</th><th>OANDA ID</th><th>Recorded SL</th><th>Manager</th><th>Tracking</th>'+
+        '<th>Opened</th><th>Trade Age</th><th>OANDA ID</th><th>Recorded SL</th><th>Manager</th><th>Tracking</th>'+
         '</tr></thead><tbody>';
       rows.forEach(function(x){
         var track=String(x.tracking||'—');
@@ -180,7 +187,7 @@ _STANDARD_LAYOUT = r'''
         html+='<tr><td><strong>'+e(x.instrument)+'</strong></td><td>'+e(x.side)+
           '</td><td>'+e(fmt(x.units,1))+'</td><td>'+e(fmt(x.entry_price,3))+
           '</td><td>'+e(x.unrealized_gbp==null?'—':'£'+fmt(x.unrealized_gbp,2))+
-          '</td><td>'+e(x.opened_at_utc)+'</td><td>'+e(x.broker_trade_id)+
+          '</td><td>'+e(x.opened_at_utc)+'</td><td>'+e(tradeAge(x.opened_at_utc))+'</td><td>'+e(x.broker_trade_id)+
           '</td><td>'+e(fmt(x.stop_price,3))+'</td><td>'+e(x.manager||'—')+
           '</td><td'+warn+'>'+e(track)+'</td></tr>';
       });
