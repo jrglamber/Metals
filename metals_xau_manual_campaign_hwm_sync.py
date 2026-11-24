@@ -16,7 +16,7 @@ import metals_adaptive_stacking_override as adaptive
 import metals_xau_manual_campaign_reset as old
 import metals_xau_manual_highwater_reset as hwm
 
-VERSION = "metals_xau_manual_campaign_hwm_sync_v2_2026_11_12"
+VERSION = "metals_xau_manual_campaign_hwm_sync_v3_2026_11_24"
 ROUTE = "/api/xau/adaptive-campaign-reset/reset"
 HIGHWATER_ONLY_ROUTE = "/api/xau/adaptive-campaign-reset/highwater-only"
 _INSTALLED = False
