@@ -103,6 +103,51 @@ class ExportTests(unittest.TestCase):
         self.assertFalse(m['xau']['transaction_sync_fresh_within_15_minutes'])
         self.assertIsNone(m['this_week_net_gbp'])
 
+    def test_nav_gate_rejects_are_sanitized_read_only_shadow_evidence(self):
+        with self.core.get_conn() as conn:
+            conn.execute("""CREATE TABLE metals_demo_execution_audit
+                (id INTEGER PRIMARY KEY, created_at_utc TEXT, raw_signal_id INTEGER,
+                 action TEXT,status TEXT,message TEXT,raw_json TEXT)""")
+            conn.execute("""CREATE TABLE metals_xag_live_execution_audit
+                (id INTEGER PRIMARY KEY, created_at_utc TEXT, raw_signal_id INTEGER,
+                 action TEXT,status TEXT,reason TEXT,raw_json TEXT)""")
+            xau = {"response": {
+                "cap_pct_nav": 2.4, "nav_gbp": 5800.0,
+                "risk_used_gbp": 144.4, "cap_gbp": 139.2,
+                "new_risk_with_buffer_gbp": 7.7, "open_xau": 19,
+                "irrelevant_sensitive_field": "DO_NOT_EXPOSE"}}
+            xag = {"cap_pct_nav": 0.85, "nav_gbp": 5800.0,
+                   "current_risk_gbp": 50.7, "budget_gbp": 49.3,
+                   "candidate_risk_buffered_gbp": 2.3, "open_xag": 24,
+                   "broker_token": "DO_NOT_EXPOSE"}
+            conn.execute("INSERT INTO metals_demo_execution_audit VALUES(?,?,?,?,?,?,?)",
+                (1,"2026-11-24T17:00:00Z",4321,"xau_nav_budget","BLOCKED",
+                 "xau_nav_budget_exhausted",json.dumps(xau)))
+            conn.execute("INSERT INTO metals_xag_live_execution_audit VALUES(?,?,?,?,?,?,?)",
+                (1,"2026-11-24T17:00:01Z",4322,"entry_governance","BLOCKED",
+                 "xag_nav_risk_budget_exhausted",json.dumps(xag)))
+            conn.execute("INSERT INTO metals_xag_live_execution_audit VALUES(?,?,?,?,?,?,?)",
+                (2,"2026-11-24T17:00:02Z",4323,"entry","OPENED","opened",json.dumps(xag)))
+        m=self.archive()
+        self.assertTrue(m["budget_block_research"]["shadow_only"])
+        self.assertFalse(m["budget_block_research"]["broker_order_writes"])
+        self.assertEqual(m["budget_block_research"]["lanes"]["XAU"]["count"],1)
+        self.assertEqual(m["budget_block_research"]["lanes"]["XAG"]["count"],1)
+        xau_rows=self.csv("live-xau-nav-budget-blocks.csv")
+        xag_rows=self.csv("live-xag-nav-budget-blocks.csv")
+        self.assertEqual(len(xau_rows),1)
+        self.assertEqual(len(xag_rows),1)
+        self.assertEqual(xau_rows[0]["risk_used_gbp"],"144.4")
+        self.assertEqual(xag_rows[0]["new_risk_buffered_gbp"],"2.3")
+        self.assertEqual(xau_rows[0]["proof_valid"],"True")
+        self.assertNotIn("DO_NOT_EXPOSE",str(xau_rows)+str(xag_rows))
+        self.assertEqual(xau_rows[0]["side"],"UNKNOWN_MATCH_VIA_SIGNAL")
+
+    def test_missing_nav_audit_tables_are_explicitly_unavailable(self):
+        m=self.archive()
+        self.assertEqual(m["budget_block_research"]["lanes"]["XAU"]["status"],"UNAVAILABLE")
+        self.assertIn("live-xau-nav-budget-blocks-unavailable.json",self.z.namelist())
+
     def test_mismatching_xag_proof_is_rejected(self):
         def mismatch(core):
             p=verified(core)
