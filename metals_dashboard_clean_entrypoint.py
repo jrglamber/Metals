@@ -154,9 +154,7 @@ _STANDARD_LAYOUT = r'''
     function tradeAge(iso){
       var opened=Date.parse(iso||'');
       if(!isFinite(opened))return '—';
-      var minutes=Math.max(0,Math.floor((Date.now()-opened)/60000));
-      var days=Math.floor(minutes/1440), hours=Math.floor((minutes%1440)/60), mins=minutes%60;
-      return days ? days+'d '+hours+'h' : hours ? hours+'h '+mins+'m' : mins+'m';
+      return Math.floor(Math.max(0,Date.now()-opened)/3600000)+'h';
     }
     function render(data){
       var body=d.querySelector('.pep-body');
