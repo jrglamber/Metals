@@ -8,10 +8,20 @@ harvest/stacking high-water controls.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import isfinite
 
-VERSION = "metals_combined_observed_hwm_v1_2026_11_16"
+VERSION = "metals_combined_observed_hwm_v2_2026_11_24"
 _TABLE = "metals_combined_live_pnl_observed_hwm"
+
+
+def _timestamp(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("Missing broker snapshot timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Naive broker snapshot timestamp")
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _finite(value):
@@ -32,8 +42,7 @@ def observe(core, proof):
         raise ValueError("Incorrect combined high-water scope")
     pnl = _finite(proof.get("open_pnl_gbp"))
     observed_at = proof.get("observed_at_utc")
-    if not isinstance(observed_at, str) or not observed_at:
-        raise ValueError("Missing broker snapshot timestamp")
+    observed_at = _timestamp(observed_at)
     start_hwm = max(0.0, pnl)
     with core.get_conn() as conn:
         conn.execute(
@@ -56,8 +65,9 @@ def observe(core, proof):
         conn.execute(
             """UPDATE metals_combined_live_pnl_observed_hwm
                SET high_water_gbp=?, high_water_at_utc=?
-               WHERE id=1 AND high_water_gbp < ?""",
-            (pnl, observed_at, pnl),
+               WHERE id=1 AND high_water_gbp < ?
+                 AND high_water_at_utc <= ?""",
+            (pnl, observed_at, pnl, observed_at),
         )
         row = conn.execute(
             """SELECT started_at_utc, high_water_gbp, high_water_at_utc
