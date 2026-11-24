@@ -50,6 +50,7 @@ def rows(core: Any, limit: int = 12) -> List[Dict[str, Any]]:
             result.append({
                 "signal_id":rid,"candle":sig.get("timestamp_readable") or "",
                 "state":state,"reason":reason,"audit_time":a.get("created_at_utc") or "",
+                "opened":bool(l.get("broker_trade_id")),
             })
     return result
 
