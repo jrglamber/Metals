@@ -1,11 +1,4 @@
-"""Inline final XAU execution state in Latest 30 Metals Signals.
-
-Presentation-only overlay. The existing candidate columns describe pre-execution
-eligibility. This patch adds the actual live XAU outcome beside that eligibility
-state so an approved candidate can visibly read OPENED, INTENTIONAL SKIP, or the
-real execution blocker on the same row. Non-executable watch candidates are
-shown explicitly as WATCH ONLY rather than leaking legacy cleaner blocker text.
-"""
+"""Render a compact, single-outcome view of recent Metals signals."""
 from __future__ import annotations
 
 import html
@@ -15,7 +8,7 @@ from typing import Any, Dict
 
 import metals_execution_visibility_patch as visibility
 
-VERSION = "metals_xau_execution_visibility_inline_v3_2026_10_16"
+VERSION = "metals_signals_compact_authoritative_outcome_v1_2026_11_24"
 
 
 def _label(state: str) -> tuple[str, str]:
@@ -31,11 +24,84 @@ def _label(state: str) -> tuple[str, str]:
 
 def _display_for(row: Dict[str, Any], signal_quality: str) -> tuple[str, str, str]:
     quality = str(signal_quality or "").strip().lower()
-    if quality in {"watch_candidate", "watch", "watch_only"}:
-        return "WATCH ONLY", "warn", "watch_candidate — not executable"
-    label, cls = _label(str(row.get("execution_state") or ""))
+    state = str(row.get("execution_state") or "").strip().upper()
+    # A broker-linked trade is the authoritative outcome. A model's earlier
+    # watch classification must never hide an order that actually opened.
+    if state == "OPENED":
+        return "OPENED", "pos", str(row.get("reason") or "broker trade linked")
+    if state == "NO_EXECUTION_RECORD" and quality in {"watch_candidate", "watch", "watch_only"}:
+        return "WATCH ONLY", "warn", "candidate marked non-executable; no live trade link found"
+    label, cls = _label(state)
     reason = str(row.get("reason") or "") or "—"
     return label, cls, reason
+
+
+def _plain_cell(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"</(?:strong|b|span|em)\s*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", "", value)
+    return html.unescape(value).strip()
+
+
+def _compact_signals_table(rendered: str, outcomes: Dict[str, Dict[str, Any]], qualities: Dict[str, str]) -> str:
+    match = re.search(r"<table>.*?</table>", rendered, flags=re.DOTALL)
+    if not match:
+        return rendered
+    old_table = match.group(0)
+    rows = re.findall(r"<tr>(.*?)</tr>", old_table, flags=re.DOTALL)
+    if not rows:
+        return rendered
+    headers = (
+        "<th>Time</th><th>Asset</th><th>Candidate</th>"
+        "<th>Eligible</th><th>XAG Guard</th><th>Outcome</th><th>Reason</th>"
+    )
+    compact_rows = []
+    for row_html in rows[1:]:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.DOTALL)
+        if len(cells) < 16:
+            continue
+        values = [_plain_cell(cell) for cell in cells]
+        rid = values[0]
+        is_candidate = values[5].upper() == "TRUE"
+        eligible = values[6].upper() == "TRUE"
+        asset = values[2]
+        candidate = values[7] if is_candidate else "—"
+        eligibility = "Yes" if eligible else "No"
+        guard = values[8] if asset == "XAGUSD" else "—"
+        outcome = outcomes.get(rid)
+        if outcome:
+            result, result_class, reason = _display_for(outcome, qualities.get(rid, ""))
+        elif asset == "XAGUSD":
+            if is_candidate and eligible:
+                result, result_class = "GUARD PASSED", "pos"
+            elif is_candidate:
+                result, result_class = "GUARD BLOCKED", "neg"
+            else:
+                result, result_class = "NO CANDIDATE", "flat"
+            reason = values[12] or "XAG live execution details are in the separate live audit"
+        elif is_candidate and not eligible:
+            result, result_class, reason = "BLOCKED", "neg", values[12]
+        elif is_candidate:
+            result, result_class, reason = "ELIGIBLE · NO LIVE LINK", "warn", "No broker-linked execution found"
+        else:
+            result, result_class, reason = "NO CANDIDATE", "flat", values[12]
+        compact_rows.append(
+            "<tr>"
+            f"<td>{html.escape(values[1])}</td>"
+            f"<td><strong>{html.escape(asset)}</strong></td>"
+            f"<td>{html.escape(candidate)}</td>"
+            f"<td>{html.escape(eligibility)}</td>"
+            f"<td>{html.escape(guard or '—')}</td>"
+            f"<td class=\"{result_class}\"><strong>{html.escape(result)}</strong></td>"
+            f"<td>{html.escape(reason or '—')}</td>"
+            "</tr>"
+        )
+    compact = (
+        '<div class="table-scroll"><table><thead><tr>' + headers + '</tr></thead><tbody>'
+        + ("".join(compact_rows) or '<tr><td colspan="7">No recent Metals signals.</td></tr>')
+        + '</tbody></table></div>'
+    )
+    return rendered[:match.start()] + compact + rendered[match.end():]
 
 
 def _recent_xau_signal_qualities(core: Any, limit: int) -> Dict[str, str]:
@@ -93,49 +159,19 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         except Exception:
             outcomes = {}
         qualities = _recent_xau_signal_qualities(core, max(30, int(limit or 30)))
-
-        # Keep the two final-execution columns directly beside Production Eligible.
-        header = "<th>Production Eligible</th>"
-        if header in rendered and "<th>Final XAU Execution</th>" not in rendered:
-            rendered = rendered.replace(
-                header,
-                header + "<th>Final XAU Execution</th><th>Execution Reason</th>",
-                1,
-            )
-
-        table_end = rendered.find("</table>")
-        if table_end < 0:
-            return rendered
-        head = rendered[:table_end]
-        tail = rendered[table_end:]
-
-        def amend_row(match: re.Match[str]) -> str:
-            inner = match.group(1)
-            first = re.match(r"\s*<td>(\d+)</td>", inner)
-            if not first:
-                return match.group(0)
-            rid = first.group(1)
-            row = outcomes.get(rid)
-            if row:
-                label, cls, reason = _display_for(row, qualities.get(rid, ""))
-                cells = (
-                    f'<td class="{cls}"><strong>{html.escape(label)}</strong></td>'
-                    f'<td>{html.escape(reason)}</td>'
-                )
-            else:
-                # XAG and non-live historical rows do not have a live-XAU broker outcome.
-                cells = '<td class="flat">—</td><td>—</td>'
-
-            # Insert immediately after the seventh existing cell: ID, Candle, Asset,
-            # Long, Short, Model Candidate, Production Eligible.
-            ends = list(re.finditer(r"</td>", inner))
-            if len(ends) < 7:
-                return match.group(0)
-            pos = ends[6].end()
-            return "<tr>" + inner[:pos] + cells + inner[pos:] + "</tr>"
-
-        head = re.sub(r"<tr>(.*?)</tr>", amend_row, head, flags=re.DOTALL)
-        return head + tail
+        rendered = re.sub(
+            r'<details><summary>Live XAU Execution Outcomes</summary>.*?</details>',
+            '', rendered, flags=re.DOTALL,
+        )
+        # Keep one concise table with a single final outcome for each signal.
+        rendered = re.sub(
+            r'<div class="section-note small"><strong>Latest 30 Metals Signals\.</strong>.*?</div>',
+            '<div class="section-note small"><strong>Latest 30 Metals Signals.</strong> '
+            'One row per signal. Outcome reflects the actual broker link when available; '
+            'eligibility alone does not mean a trade opened.</div>',
+            rendered, count=1, flags=re.DOTALL,
+        )
+        return _compact_signals_table(rendered, outcomes, qualities)
 
     core._metals_latest_30_signals_html = patched
     core.METALS_XAU_EXECUTION_VISIBILITY_INLINE_VERSION = VERSION
@@ -143,7 +179,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
 
     probe = patched(8)
     watch_unit = _display_for(
-        {"execution_state": "BLOCKED", "reason": "legacy blocker text"},
+        {"execution_state": "NO_EXECUTION_RECORD", "reason": ""},
+        "watch_candidate",
+    )
+    opened_unit = _display_for(
+        {"execution_state": "OPENED", "reason": "broker trade linked"},
         "watch_candidate",
     )
     # This self-test must be independent of current live history. A prior version
@@ -157,8 +197,14 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "",
     )
     checks = {
-        "final_execution_header_present": "Final XAU Execution" in probe,
-        "execution_reason_header_present": "Execution Reason" in probe,
+        "compact_header_present": all(
+            f"<th>{label}</th>" in probe
+            for label in ("Time", "Asset", "Candidate", "Eligible", "XAG Guard", "Outcome", "Reason")
+        ),
+        "duplicate_outcomes_section_removed": "Live XAU Execution Outcomes" not in probe,
+        "opened_overrides_watch_classification": opened_unit == (
+            "OPENED", "pos", "broker trade linked",
+        ),
         "half_frequency_skip_renderer": skip_unit == (
             "SKIPPED — 0.5× THROTTLE",
             "warn",
@@ -167,7 +213,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
         "watch_candidate_semantic_label": watch_unit == (
             "WATCH ONLY",
             "warn",
-            "watch_candidate — not executable",
+            "candidate marked non-executable; no live trade link found",
         ),
     }
     if not all(checks.values()):
