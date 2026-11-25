@@ -428,5 +428,56 @@ class MatureStopTransitionTests(unittest.TestCase):
         self.assertEqual(req.call_count,1)
 
 
+
+class XagManagerPostgresMaturityRegressionTests(unittest.TestCase):
+    """Guard against PostgreSQL IndeterminateDatatype in 48-candle manager."""
+
+    def test_mature_xag_reconciles_and_writes_typed_48h_checkpoint(self):
+        from contextlib import contextmanager
+        reviewed_sql = []
+        class PostgresLikeConnection:
+            def execute(self, sql, params):
+                self.sql = sql
+                # PostgreSQL cannot infer the type of a bare ? IS NOT NULL.
+                if "AND ? IS NOT NULL" in sql:
+                    raise RuntimeError("IndeterminateDatatype: could not determine data type of parameter")
+                reviewed_sql.append((sql, params))
+                return None
+            def commit(self):
+                pass
+        pg = PostgresLikeConnection()
+        @contextmanager
+        def get_conn():
+            yield pg
+        class LiveCore:
+            get_conn = staticmethod(get_conn)
+            safe_float = staticmethod(Core.safe_float)
+            _metals_demo_trade_metrics = staticmethod(lambda link: {
+                "ok": True, "hold_candles": 48, "current_r": 0.9,
+                "mfe_r": 1.0, "mae_r": -0.2,
+                "current_price": 40.0, "fixed_48h_price": 40.0,
+                "fixed_48h_r": 0.9,
+            })
+        live_core = LiveCore()
+        link = {
+            "id": 1001, "raw_signal_id": 800, "broker_trade_id": "123456",
+            "status": "OPEN", "entry_price": 43.0, "stop_price": 45.2,
+            "current_stop_price": 45.2, "manager_last_review_signal_id": None,
+            "manager_high_water_r": 0.0,
+        }
+        with patch.object(live, "_reconcile", return_value={"ok": True}), \
+             patch.object(live, "_local_open", return_value=[link]), \
+             patch.object(live, "_update_stop",
+                          return_value={"ok": True, "status": "UPDATED_BROKER_VERIFIED"}) as stop:
+            outcome = live._manager_tick(live_core, 900)
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["reviewed"], 1)
+        self.assertEqual(outcome["results"][0]["decision"], "EXTEND")
+        stop.assert_called_once()
+        self.assertEqual(len(reviewed_sql), 1)
+        self.assertIn("CAST(? AS DOUBLE PRECISION) IS NOT NULL", reviewed_sql[0][0])
+        self.assertEqual(reviewed_sql[0][1][-1], 1001)
+
+
 if __name__=="__main__":
     unittest.main()
