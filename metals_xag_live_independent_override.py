@@ -249,7 +249,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                         "reason":mgr.get("reason"),
                         "stop_updates":sum(
                             isinstance(x.get("stop_result"),dict)
-                            and x["stop_result"].get("ok") is True
+                            and x["stop_result"].get("status") == "UPDATED_BROKER_VERIFIED"
                             for x in mgr.get("results") or []),
                         "closes_requested":sum(
                             x.get("decision")=="CLOSE_MFE25_GIVEBACK"
@@ -277,7 +277,7 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 "reviewed":mgr.get("reviewed"),"reason":mgr.get("reason"),
                 "stop_updates":sum(
                     isinstance(x.get("stop_result"),dict)
-                    and x["stop_result"].get("ok") is True
+                    and x["stop_result"].get("status") == "UPDATED_BROKER_VERIFIED"
                     for x in mgr.get("results") or []),
                 "closes_requested":sum(
                     x.get("decision")=="CLOSE_MFE25_GIVEBACK"
