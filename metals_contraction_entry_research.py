@@ -111,7 +111,7 @@ def analyse(samples, links):
                     delta,n=_matched(maps[j],current)
                     result["delta_%dh_gbp"%hours]=delta
                     result["matched_%dh"%hours]=n
-                    result[POLICIES[hours==3 and 2 or 1]]=_flag(delta)
+                    result[POLICIES[1 if hours==1 else 2]]=_flag(delta)
             j=prior.get(3)
             if j is not None:
                 # Fix the incumbent cohort across all samples, requiring
