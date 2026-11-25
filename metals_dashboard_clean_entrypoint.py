@@ -166,7 +166,15 @@ _STANDARD_LAYOUT = r'''
       var headline='<div class="pep-empty"><strong>LIVE Metals open: '+e(total)+
         '</strong> · XAU '+e(xauCount)+' · XAG SHORT '+e(xagCount)+
         ' · XAG broker links '+e(recon)+'</div>';
+      var managerCount=(data.xag_mature_manager_trade_count==null?'—':String(data.xag_mature_manager_trade_count));
+      var managerCurrent=(data.xag_mature_manager_current_count==null?'—':String(data.xag_mature_manager_current_count));
+      headline+='<div class="pep-empty">XAG 48-candle manager: latest signal reviewed '+
+        e(managerCurrent)+' / '+e(managerCount)+' mature positions</div>';
       var alerts='';
+      if(data.xag_mature_manager_stale_count>0){
+        alerts+='<div class="lazy-error">XAG: '+e(data.xag_mature_manager_stale_count)+
+          ' mature trades do not show a review on the latest hourly XAG signal. Check exit-manager health.</div>';
+      }
       if(!data.xau_ok)alerts+='<div class="lazy-error">LIVE XAU broker snapshot unavailable. Existing XAG rows shown; total not confirmed.</div>';
       if(!data.xag_ok)alerts+='<div class="lazy-error">LIVE XAG Short broker snapshot unavailable. Existing XAU rows shown; this is NOT zero XAG positions.</div>';
       if(data.xag_ok&&!data.xag_broker_link_reconciled)alerts+='<div class="lazy-error">LIVE XAG Short broker/database ownership mismatch — check execution health before new orders.</div>';
@@ -177,21 +185,40 @@ _STANDARD_LAYOUT = r'''
       }
       var html='<div class="table-scroll"><table><thead><tr>'+
         '<th>Instrument</th><th>Side</th><th>Units</th><th>Entry</th><th>Unrealised P/L (GBP)</th>'+
-        '<th>Opened</th><th>Trade Age</th><th>OANDA ID</th><th>Recorded SL</th><th>Manager</th><th>Tracking</th>'+
+        '<th>Opened</th><th>Trade Age</th><th>OANDA ID</th><th>Recorded SL</th><th>Manager</th>'+
+        '<th>MFE (R)</th><th>MAE (R)</th><th>Now (R~)</th>'+
+        '<th>Giveback from MFE~</th><th>75% MFE floor</th><th>Manager review</th>'+
+        '<th>Decision</th><th>Tracking</th>'+
         '</tr></thead><tbody>';
       rows.forEach(function(x){
         var track=String(x.tracking||'—');
         var warn=track.indexOf('UNLINKED')>=0?' class="warn"':'';
+        var giveback=x.mfe_giveback_r_approx==null?'—':
+          fmt(x.mfe_giveback_r_approx,2)+'R ('+fmt(x.mfe_giveback_pct_approx,1)+'%)';
+        var review=(x.manager_review_candles==null?'—':fmt(x.manager_review_candles,0)+'c')+
+          ' / '+String(x.manager_review_status||'—');
         html+='<tr><td><strong>'+e(x.instrument)+'</strong></td><td>'+e(x.side)+
           '</td><td>'+e(fmt(x.units,1))+'</td><td>'+e(fmt(x.entry_price,3))+
           '</td><td>'+e(x.unrealized_gbp==null?'—':'£'+fmt(x.unrealized_gbp,2))+
           '</td><td>'+e(x.opened_at_utc)+'</td><td>'+e(tradeAge(x.opened_at_utc))+'</td><td>'+e(x.broker_trade_id)+
           '</td><td>'+e(fmt(x.stop_price,3))+'</td><td>'+e(x.manager||'—')+
+          '</td><td>'+e(x.manager_mfe_r==null?'—':fmt(x.manager_mfe_r,2)+'R')+
+          '</td><td>'+e(x.manager_mae_r==null?'—':fmt(x.manager_mae_r,2)+'R')+
+          '</td><td>'+e(x.current_r_approx==null?'—':fmt(x.current_r_approx,2)+'R')+
+          '</td><td>'+e(giveback)+
+          '</td><td>'+e(x.mfe25_floor_r==null?'—':fmt(x.mfe25_floor_r,2)+'R')+
+          '</td><td>'+e(review)+
+          '</td><td>'+e(x.manager_last_decision||'—')+
           '</td><td'+warn+'>'+e(track)+'</td></tr>';
       });
       body.innerHTML=headline+alerts+html+'</tbody></table></div>'+
         '<div class="pep-empty">LIVE XAU and LIVE XAG SHORT only; practice XAG excluded. '+
         'XAG recorded stops and manager data come from its own live ledger. '+
+        'For XAG, MFE/MAE are from the last hourly manager review; Now R~ is an '+
+        'indicative OANDA GBP-mark R and giveback ~ is not the execution trigger. '+
+        'Manager review shows completed candles (c) and latest-signal status; '+
+        '48 clock-hours alone is not sufficient for exit eligibility. '+
+        'XAU MFE/MAE are not yet supplied by this combined positions API. '+
         'Realised P/L and XAU HWM tiles remain separately reported.</div>';
     }
     async function refreshLive(){
