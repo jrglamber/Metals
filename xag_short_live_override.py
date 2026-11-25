@@ -325,8 +325,10 @@ def _verified_broker_open_short(core: Any, broker_trade_id: str) -> Dict[str, An
         else:
             return {"ok": False, "reason": "broker_attached_stop_order_detail_unavailable"}
     stop_price = _num(core, stop.get("price"))
-    # A pending attached stop and a price ABOVE a short's entry are mandatory.
-    if (stop_price is None or stop_price <= entry
+    # A valid pending attached stop is mandatory. After MFE25 locks profit,
+    # its stop can legitimately sit BELOW the short entry: reject missing/
+    # nonpositive prices, not appropriately tightened profit-protecting stops.
+    if (stop_price is None or stop_price <= 0
         or (stop.get("state") and str(stop.get("state")).upper() != "PENDING")
         or (stop.get("tradeID") and str(stop.get("tradeID")) != broker_trade_id)):
         return {"ok": False, "reason": "broker_short_protective_stop_invalid"}
@@ -614,8 +616,8 @@ def _update_stop(core: Any, link: Dict[str, Any], stop_price: float) -> Dict[str
                 (_now(), actual, int(link["id"])),
             )
             conn.commit()
-        _audit(core, link.get("raw_signal_id"), "stop_update", "UPDATED_BROKER_VERIFIED",
-               f"MFE25 stop verified at broker={actual}", int(link["id"]), bid)
+        _audit(core, link.get("raw_signal_id"), "stop_update", "UPDATED",
+               f"MFE25 stop BROKER_VERIFIED at {actual}", int(link["id"]), bid)
         return {"ok":True,"status":"UPDATED_BROKER_VERIFIED","stop_price":actual}
     reason = ("postwrite_broker_stop_unverified" if not broker_after.get("ok") else
               "broker_stop_not_tightened")
