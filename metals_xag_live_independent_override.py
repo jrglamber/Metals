@@ -232,8 +232,29 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 return old_router(rid, source=source, *args, **kwargs)
             candidate = _candidate(core, row)
             if not candidate.get("demo_candidate") or str(candidate.get("demo_side") or "").lower() != "short":
-                # Preserve research/non-candidate diagnostics, with no live order.
-                return old_router(rid, source=source, *args, **kwargs)
+                # Preserve existing research/non-candidate behaviour. However
+                # existing LIVE shorts need a 48-candle exit review on EVERY
+                # fresh XAG hourly signal, not only fresh short entry candidates.
+                out = old_router(rid, source=source, *args, **kwargs)
+                if _fresh_signal(row):
+                    with live._ENTRY_LOCK:
+                        try:
+                            mgr = live._manager_tick(core, rid)
+                        except Exception as exc:
+                            mgr = {"ok": False, "reason": "manager_tick_failed:" + type(exc).__name__}
+                    print("XAG_LIVE_MFE25_ALL_SIGNAL_REVIEW " + json.dumps({
+                        "signal_id":rid,"source":"noncandidate",
+                        "manager_ok":mgr.get("ok") is True,
+                        "reviewed":mgr.get("reviewed"),
+                        "reason":mgr.get("reason"),
+                        "stop_updates":sum(
+                            isinstance(x.get("stop_result"),dict)
+                            and x["stop_result"].get("ok") is True
+                            for x in mgr.get("results") or []),
+                        "closes_requested":sum(
+                            x.get("decision")=="CLOSE_MFE25_GIVEBACK"
+                            for x in mgr.get("results") or [])}), flush=True)
+                return out
             # Non-idempotent order submission is serialized; persistent order
             # intents also protect against multiple web/worker processes.
             with live._ENTRY_LOCK:
@@ -242,10 +263,25 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                     out = approval
                 else:
                     out = live._execute_live(core, rid, approval)
-            try:
-                mgr = live._manager_tick(core, rid)
-            except Exception as exc:
-                mgr = {"ok": False, "reason": f"manager_tick_failed:{type(exc).__name__}"}
+            # Serialized with the same XAG broker-ownership and entry lock
+            # used by the independent reconciler. Management already existed;
+            # this fixes missed eligible reviews, not the 48-candle policy.
+            with live._ENTRY_LOCK:
+                try:
+                    mgr = live._manager_tick(core, rid)
+                except Exception as exc:
+                    mgr = {"ok": False, "reason": f"manager_tick_failed:{type(exc).__name__}"}
+            print("XAG_LIVE_MFE25_ALL_SIGNAL_REVIEW " + json.dumps({
+                "signal_id":rid,"source":"short_candidate",
+                "manager_ok":mgr.get("ok") is True,
+                "reviewed":mgr.get("reviewed"),"reason":mgr.get("reason"),
+                "stop_updates":sum(
+                    isinstance(x.get("stop_result"),dict)
+                    and x["stop_result"].get("ok") is True
+                    for x in mgr.get("results") or []),
+                "closes_requested":sum(
+                    x.get("decision")=="CLOSE_MFE25_GIVEBACK"
+                    for x in mgr.get("results") or [])}), flush=True)
             out = dict(out)
             out["xag_short_live"] = dict(out)
             out["xag_short_live_manager"] = mgr
