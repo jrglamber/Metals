@@ -341,6 +341,23 @@ class MatureStopTransitionTests(unittest.TestCase):
             self.assertEqual(audit["status"],"NOT_CANDIDATE")
             self.assertEqual(audit["reason"],"xag_model_not_qualifying_short_candidate")
 
+    def test_existing_upstream_xag_manager_result_prevents_duplicate_same_signal_review(self):
+        old=independent._INSTALLED
+        independent._INSTALLED=False
+        self.addCleanup(setattr, independent, "_INSTALLED", old)
+        first_review={"ok":True,"reviewed":20,"results":[
+            {"link_id":n,"decision":"EXTEND"} for n in range(20)]}
+        self.core.execute_metals_demo_candidate=lambda *a,**kw: {
+            "ok":True,"asset":"XAGUSD",
+            "xag_short_live_manager":first_review}
+        with patch.object(live,"_reconcile",return_value={"ok":True}), \
+             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \
+             patch.object(live,"_manager_tick") as duplicate:
+            independent.install(self.core,self._app())
+            outcome=self.core.execute_metals_demo_candidate(101)
+        self.assertEqual(outcome["xag_short_live_manager"],first_review)
+        duplicate.assert_not_called()
+
     def test_xau_stays_unchanged_and_stale_xag_signal_does_not_run_manager(self):
         old=independent._INSTALLED
         independent._INSTALLED=False
