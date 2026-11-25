@@ -691,7 +691,7 @@ def _manager_tick(core: Any, raw_signal_id: int) -> Dict[str, Any]:
                        manager_last_decision=?,manager_last_reason=?,
                        fixed_48h_price=COALESCE(fixed_48h_price,?),
                        fixed_48h_r=COALESCE(fixed_48h_r,?),
-                       fixed_48h_recorded_at_utc=CASE WHEN fixed_48h_r IS NULL AND ? IS NOT NULL THEN ? ELSE fixed_48h_recorded_at_utc END
+                       fixed_48h_recorded_at_utc=CASE WHEN fixed_48h_r IS NULL AND CAST(? AS DOUBLE PRECISION) IS NOT NULL THEN ? ELSE fixed_48h_recorded_at_utc END
                    WHERE id=?""",
                 (_now(), hwm, mfe_r, mae_r, int(raw_signal_id), hold, decision, reason,
                  fixed_price, fixed_r, fixed_r, _now(), int(link["id"])),
