@@ -335,6 +335,11 @@ class MatureStopTransitionTests(unittest.TestCase):
             mgr.assert_called_once_with(self.core,101)
             entry.assert_not_called()
             self.assertEqual(len(self.old_calls),1)
+            audit=self.core.db.execute(
+                "SELECT status,reason FROM metals_xag_live_execution_audit "
+                "WHERE raw_signal_id=101 ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertEqual(audit["status"],"NOT_CANDIDATE")
+            self.assertEqual(audit["reason"],"xag_model_not_qualifying_short_candidate")
 
     def test_xau_stays_unchanged_and_stale_xag_signal_does_not_run_manager(self):
         old=independent._INSTALLED
