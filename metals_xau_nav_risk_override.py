@@ -118,7 +118,15 @@ def install(core, app):
     def status():
         try:
             state = broker_snapshot(core)
+            # Read-only preview: failure must not hide a verified existing budget.
+            next_risks = {}
+            for side in ("long", "short"):
+                try:
+                    next_risks[side] = round(next_order_risk(core, side, state), 2)
+                except Exception:
+                    next_risks[side] = None
             return {"ok":True, "version":VERSION, "active":True,
+                    "next_trade_buffered_risk_gbp":next_risks,
                     "risk_basis":"current_liquidation_quote_to_broker_stop",
                     "cap_pct_nav":CAP_PCT_NAV, "nav_gbp":round(state["nav"],2),
                     "open_xau":state["open"], "risk_used_gbp":round(state["used"],2),
