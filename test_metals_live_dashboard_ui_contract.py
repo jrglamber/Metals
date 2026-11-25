@@ -25,6 +25,19 @@ class LiveMetalsUiContractTests(unittest.TestCase):
         self.assertIn("pep-metals-risk-budget-script",self.top)
         self.assertIn("if(!document.hidden)refresh()",self.top)
 
+    def test_next_trade_budget_is_a_live_buffered_preview(self):
+        self.assertIn("next_trade_buffered_risk_gbp", self.top)
+        self.assertIn("New trade requires", self.top)
+        self.assertIn("incl. 10% buffer", self.top)
+        self.assertIn("Unavailable", self.top)
+        xau=Path("metals_xau_nav_risk_override.py").read_text()
+        xag=Path("metals_xag_nav_risk_override.py").read_text()
+        self.assertIn("next_order_risk(core, side, state)", xau)
+        self.assertIn('for side in ("long", "short")', xau)
+        self.assertIn("candidate_risk(core, state)", xag)
+        self.assertIn("next_trade_buffered_risk_gbp", xau)
+        self.assertIn("next_trade_buffered_risk_gbp", xag)
+
     def test_one_combined_live_open_table_with_xau_and_xag_manager_metrics(self):
         self.assertIn("xau_open.snapshot(core)",self.layout)
         self.assertIn("xag_open.snapshot(core)",self.layout)

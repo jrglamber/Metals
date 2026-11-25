@@ -185,7 +185,13 @@ def install(core, app):
     def status():
         try:
             state = snapshot(core)
+            # Read-only preview: preserve the existing budget if sizing is unavailable.
+            try:
+                next_risk = round(candidate_risk(core, state), 2)
+            except Exception:
+                next_risk = None
             return {"ok":True, "installed":True, "version":VERSION,
+                    "next_trade_buffered_risk_gbp":{"short":next_risk},
                     "cap_pct_nav":CAP_PCT_NAV, "nav_gbp":round(state["nav"],2),
                     "open_xag":state["open"],
                     "risk_used_gbp":round(state["used"],2),

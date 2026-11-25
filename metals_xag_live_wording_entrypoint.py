@@ -135,6 +135,19 @@ _RISK_BUDGET_TILE_SCRIPT = r"""
   grid.appendChild(card);
   return card;
  }
+ function nextRisk(data){
+   var r=data&&data.next_trade_buffered_risk_gbp;
+   function valid(v){return typeof v==='number'&&isFinite(v)&&v>0}
+   function display(v){return valid(v)?cash(v):'Unavailable'}
+   var value;
+   if(data&&data.open_xau!=null){
+     var l=r&&r.long,s=r&&r.short;
+     value=valid(l)&&valid(s)&&l===s?cash(l)+' (either side)':
+       'Long '+display(l)+' · Short '+display(s);
+   }else{value=display(r&&r.short)}
+   return '<div class="pep-budget-numbers">New trade requires <strong>'+value+
+     '</strong> (incl. 10% buffer)</div>';
+ }
  function lane(label,data){
    if(!data||data.ok!==true){
      return '<div class="pep-budget-lane"><div class="pep-budget-title">'+label+
@@ -151,6 +164,7 @@ _RISK_BUDGET_TILE_SCRIPT = r"""
       '<div class="pep-budget-numbers">Allowance <strong>'+cash(cap)+'</strong>'+
       ' · Used <strong>'+cash(used)+'</strong>'+
       ' · Available <strong>'+cash(free)+'</strong></div>'+
+      nextRisk(data)+
       '<div class="pep-budget-bar" role="img" aria-label="'+esc(label)+' risk budget usage '+
           Math.round(ratio*100)+' percent">'+
         '<div class="pep-budget-fill '+className+'" style="width:'+width+'%"></div></div>'+
