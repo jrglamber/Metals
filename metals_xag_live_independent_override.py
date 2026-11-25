@@ -247,6 +247,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                         "manager_ok":mgr.get("ok") is True,
                         "reviewed":mgr.get("reviewed"),
                         "reason":mgr.get("reason"),
+                        "mature_reviews":sum(x.get("decision") in ("EXTEND", "CLOSE_MFE25_GIVEBACK") for x in mgr.get("results") or []),
+                        "young_holds":sum(x.get("decision")=="HOLD_MIN_48" for x in mgr.get("results") or []),
+                        "stop_update_failures":sum(isinstance(x.get("stop_result"),dict)
+                            and x["stop_result"].get("ok") is False
+                            for x in mgr.get("results") or []),
                         "stop_updates":sum(
                             isinstance(x.get("stop_result"),dict)
                             and x["stop_result"].get("status") == "UPDATED_BROKER_VERIFIED"
@@ -275,6 +280,11 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 "signal_id":rid,"source":"short_candidate",
                 "manager_ok":mgr.get("ok") is True,
                 "reviewed":mgr.get("reviewed"),"reason":mgr.get("reason"),
+                "mature_reviews":sum(x.get("decision") in ("EXTEND", "CLOSE_MFE25_GIVEBACK") for x in mgr.get("results") or []),
+                "young_holds":sum(x.get("decision")=="HOLD_MIN_48" for x in mgr.get("results") or []),
+                "stop_update_failures":sum(isinstance(x.get("stop_result"),dict)
+                    and x["stop_result"].get("ok") is False
+                    for x in mgr.get("results") or []),
                 "stop_updates":sum(
                     isinstance(x.get("stop_result"),dict)
                     and x["stop_result"].get("status") == "UPDATED_BROKER_VERIFIED"
