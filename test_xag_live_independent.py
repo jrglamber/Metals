@@ -450,7 +450,6 @@ class XagManagerPostgresMaturityRegressionTests(unittest.TestCase):
         def get_conn():
             yield pg
         class LiveCore:
-            get_conn = staticmethod(get_conn)
             safe_float = staticmethod(Core.safe_float)
             _metals_demo_trade_metrics = staticmethod(lambda link: {
                 "ok": True, "hold_candles": 48, "current_r": 0.9,
@@ -459,6 +458,7 @@ class XagManagerPostgresMaturityRegressionTests(unittest.TestCase):
                 "fixed_48h_r": 0.9,
             })
         live_core = LiveCore()
+        live_core.get_conn = get_conn
         link = {
             "id": 1001, "raw_signal_id": 800, "broker_trade_id": "123456",
             "status": "OPEN", "entry_price": 43.0, "stop_price": 45.2,
