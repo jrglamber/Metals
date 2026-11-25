@@ -5,6 +5,8 @@ on:
       - recovery-pre-analysis-contract-20261010
     paths:
       - 'metals_dashboard_clean_entrypoint.py'
+      - 'metals_xag_live_wording_entrypoint.py'
+      - 'test_metals_live_dashboard_ui_contract.py'
       - 'metals_live_positions_combined.py'
       - 'metals_xau_live_open_positions_panel.py'
       - 'test_metals_live_xau_open_positions_panel.py'
@@ -30,7 +32,7 @@ jobs:
           python-version: '3.11'
       - name: Read-only combined XAU/XAG MFE visibility regression tests
         run: |
-          python -m py_compile metals_xag_live_open_positions_panel.py metals_xau_live_open_positions_panel.py metals_live_recent_closed_combined.py metals_recent_closed_dom_override.py metals_recent_closed_live_patch.py metals_live_positions_combined.py metals_dashboard_clean_entrypoint.py
-          python -m unittest -v test_xag_live_open_positions_panel test_metals_live_xau_open_positions_panel test_metals_live_recent_closed_combined test_metals_live_positions_combined
+          python -m py_compile metals_xag_live_open_positions_panel.py metals_xau_live_open_positions_panel.py metals_live_recent_closed_combined.py metals_recent_closed_dom_override.py metals_recent_closed_live_patch.py metals_live_positions_combined.py metals_dashboard_clean_entrypoint.py metals_xag_live_wording_entrypoint.py test_metals_live_dashboard_ui_contract.py
+          python -m unittest -v test_xag_live_open_positions_panel test_metals_live_xau_open_positions_panel test_metals_live_recent_closed_combined test_metals_live_positions_combined test_metals_live_dashboard_ui_contract
       - name: Fetch production HTML and broker-confirmed LIVE positions
         run: python smoke_metals_live_dashboard.py
