@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone
 
 VERSION = "xau_nav_mark_to_stop_budget_v1_2026_11_23"
-CAP_PCT_NAV = 2.40  # existing nominal 24 entries x approved 0.10% NAV per entry
+CAP_PCT_NAV = 3.00  # user-approved NAV entry allowance, 2026-11-25
 SLIPPAGE_BUFFER = 1.10
 _LOCK = threading.RLock()
 
