@@ -312,9 +312,9 @@ class MatureStopTransitionTests(unittest.TestCase):
         old=independent._INSTALLED
         independent._INSTALLED=False
         self.addCleanup(setattr, independent, "_INSTALLED", old)
-        with patch.object(live,"_reconcile",return_value={"ok":True}), \\
-             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \\
-             patch.object(live,"_manager_tick",return_value={"ok":True,"reviewed":4,"results":[]}) as mgr, \\
+        with patch.object(live,"_reconcile",return_value={"ok":True}), \
+             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \
+             patch.object(live,"_manager_tick",return_value={"ok":True,"reviewed":4,"results":[]}) as mgr, \
              patch.object(live,"_execute_live") as entry:
             independent.install(self.core,self._app())
             ret=self.core.execute_metals_demo_candidate(101)
@@ -327,8 +327,8 @@ class MatureStopTransitionTests(unittest.TestCase):
         old=independent._INSTALLED
         independent._INSTALLED=False
         self.addCleanup(setattr, independent, "_INSTALLED", old)
-        with patch.object(live,"_reconcile",return_value={"ok":True}), \\
-             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \\
+        with patch.object(live,"_reconcile",return_value={"ok":True}), \
+             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \
              patch.object(live,"_manager_tick",return_value={"ok":True}) as mgr:
             independent.install(self.core,self._app())
             self.core.execute_metals_demo_candidate(102)
@@ -352,8 +352,8 @@ class MatureStopTransitionTests(unittest.TestCase):
                 "stopLossOrder":{"price":str(stop),"state":"PENDING",
                                  "tradeID":"201"}}}}
         link={"id":201,"raw_signal_id":201,"broker_trade_id":"201"}
-        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
-             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \
              patch.object(live,"_request",side_effect=req):
             result=live._update_stop(self.core,link,42.2)
         self.assertTrue(result["ok"])
@@ -374,8 +374,8 @@ class MatureStopTransitionTests(unittest.TestCase):
                 "stopLossOrder":{"price":"44.0","state":"PENDING",
                                  "tradeID":"202"}}}}
         link={"id":202,"raw_signal_id":202,"broker_trade_id":"202"}
-        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
-             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \
              patch.object(live,"_request",side_effect=req):
             result=live._update_stop(self.core,link,42.0)
         self.assertFalse(result["ok"])
@@ -394,8 +394,8 @@ class MatureStopTransitionTests(unittest.TestCase):
                 "stopLossOrder":{"price":"41.0","state":"PENDING",
                                  "tradeID":"203"}}}}
         link={"id":203,"raw_signal_id":203,"broker_trade_id":"203"}
-        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
-             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \
              patch.object(live,"_request",side_effect=req):
             result=live._update_stop(self.core,link,42.0)
         self.assertTrue(result["ok"])
@@ -407,8 +407,8 @@ class MatureStopTransitionTests(unittest.TestCase):
     def test_no_broker_stop_verification_never_writes(self):
         insert_link(self.core,204,status="OPEN")
         link={"id":204,"raw_signal_id":204,"broker_trade_id":"204"}
-        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
-             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \
              patch.object(live,"_request",return_value={"ok":False}) as req:
             result=live._update_stop(self.core,link,42.0)
         self.assertFalse(result["ok"])
