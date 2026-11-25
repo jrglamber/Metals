@@ -12,6 +12,7 @@ from typing import Any, Dict
 
 import metals_unified_entrypoint as base
 import metals_xag_live_open_positions_panel as xag_open
+import metals_xau_live_open_positions_panel as xau_open
 from metals_live_positions_combined import combine as combine_live_open
 
 analysis = base.analysis
@@ -26,24 +27,14 @@ def _scalar(v: Any) -> Any:
 
 @core.app.get("/api/live-xau-open-positions")
 def live_xau_open_positions() -> Dict[str, Any]:
+    """OANDA open XAU both sides + exact live trade link manager evidence."""
     try:
-        snap = core.metals_xau_live_broker_snapshot() or {}
-        trades = []
-        for t in snap.get("owned_open_trades") or []:
-            units = float(core.safe_float(t.get("currentUnits")) or 0.0)
-            trades.append({
-                "id": core.safe_str(t.get("id")),
-                "instrument": core.safe_str(t.get("instrument")),
-                "side": "short" if units < 0 else "long",
-                "units": units,
-                "open_time": core.safe_str(t.get("openTime")),
-                "price": core.safe_str(t.get("price")),
-                "unrealized_pl": core.safe_float(t.get("unrealizedPL")),
-            })
-        return {"ok": bool(snap.get("ok", True)), "scope": "LIVE_XAU_ONLY", "count": len(trades), "trades": trades}
+        return xau_open.snapshot(core)
     except Exception as exc:
-        return {"ok": False, "scope": "LIVE_XAU_ONLY", "count": 0, "trades": [], "error": f"{type(exc).__name__}: {exc}"}
-
+        return {"ok": False, "scope": "LIVE_XAU_BOTH_SIDES",
+                "trades": [], "count": None,
+                "reason": type(exc).__name__,
+                "broker_order_writes": False}
 
 
 @core.app.get("/api/live-metals-open-positions")
@@ -218,7 +209,8 @@ _STANDARD_LAYOUT = r'''
         'indicative OANDA GBP-mark R and giveback ~ is not the execution trigger. '+
         'Manager review shows completed candles (c) and latest-signal status; '+
         '48 clock-hours alone is not sufficient for exit eligibility. '+
-        'XAU MFE/MAE are not yet supplied by this combined positions API. '+
+        'XAU LONG and SHORT MFE/MAE use their respective live manager ledger; '+
+        'the 75% MFE25 floor applies only to MFE25 shorts, not ATR2 longs. '+
         'Realised P/L and XAU HWM tiles remain separately reported.</div>';
     }
     async function refreshLive(){
