@@ -17,8 +17,12 @@ class FakeCore:
                 id INTEGER PRIMARY KEY,raw_signal_id INTEGER,broker_trade_id TEXT,
                 side TEXT,status TEXT,current_stop_price REAL,stop_price REAL,
                 active_exit_policy TEXT,manager_last_decision TEXT,
-                manager_high_water_r REAL,estimated_risk_amount REAL
+                manager_high_water_r REAL,estimated_risk_amount REAL,
+                manager_mfe_r REAL,manager_mae_r REAL,
+                manager_last_review_candles INTEGER,
+                manager_last_review_signal_id INTEGER,manager_last_reason TEXT
             );
+            CREATE TABLE raw_signals(id INTEGER PRIMARY KEY,pair TEXT);
         """)
         self.db.executemany(
             "INSERT INTO metals_xag_live_trade_links "
@@ -29,6 +33,16 @@ class FakeCore:
              (2,3112,"107399","short","OPEN",47.6,47.6,"MFE_GIVEBACK_25",2.0),
              (3,3132,"107528","short","OPEN",47.7,47.7,"MFE_GIVEBACK_25",2.0)]
         )
+        self.db.execute("INSERT INTO raw_signals(id,pair) VALUES(3539,'XAGUSD')")
+        self.db.execute("""UPDATE metals_xag_live_trade_links SET
+            manager_mfe_r=0.8,manager_mae_r=-0.25,manager_high_water_r=0.8,
+            manager_last_review_candles=52,manager_last_review_signal_id=3539,
+            manager_last_decision='EXTEND',manager_last_reason='XAG SHORT MFE25 active'
+            WHERE id=1""")
+        self.db.execute("""UPDATE metals_xag_live_trade_links SET
+            manager_mfe_r=1.0,manager_mae_r=-0.50,
+            manager_last_review_candles=50,manager_last_review_signal_id=3535
+            WHERE id=2""")
         self.db.commit()
     @contextmanager
     def get_conn(self):
@@ -62,6 +76,21 @@ class LiveXagOpenPositionsTests(unittest.TestCase):
         self.assertEqual(result["count"],3)
         self.assertEqual(result["short_count"],3)
         self.assertEqual(result["tracked_count"],3)
+        self.assertEqual(result["mature_manager_trade_count"],2)
+        self.assertEqual(result["mature_manager_current_count"],1)
+        self.assertEqual(result["mature_manager_stale_count"],1)
+        first=result["positions"][0]
+        self.assertEqual(first["manager_mfe_r"],0.8)
+        self.assertEqual(first["manager_mae_r"],-0.25)
+        self.assertEqual(first["manager_review_candles"],52)
+        self.assertEqual(first["manager_review_status"],"CURRENT")
+        self.assertEqual(first["manager_last_reason"],"XAG SHORT MFE25 active")
+        self.assertAlmostEqual(first["current_r_approx"],0.625)
+        self.assertAlmostEqual(first["mfe_giveback_r_approx"],0.175)
+        self.assertAlmostEqual(first["mfe_giveback_pct_approx"],21.88,places=2)
+        self.assertEqual(first["mfe25_floor_r"],0.6)
+        self.assertEqual(result["positions"][1]["manager_review_status"],"PRIOR_SIGNAL")
+        self.assertIsNone(result["positions"][2]["mfe_giveback_r_approx"])
         self.assertEqual(result["untracked_broker_count"],0)
         self.assertTrue(result["broker_link_reconciled"])
         self.assertEqual(result["unrealized_gbp"],2.90)
@@ -70,6 +99,11 @@ class LiveXagOpenPositionsTests(unittest.TestCase):
         self.assertIn("MFE_GIVEBACK_25",html)
         self.assertIn("£2.90",html)
         self.assertIn("Practice XAG positions are excluded",html)
+        self.assertIn("MFE (R)",html)
+        self.assertIn("MAE (R)",html)
+        self.assertIn("Giveback from MFE",html)
+        self.assertIn("21.9%",html)
+        self.assertIn("52c / CURRENT",html)
         self.assertNotIn("No LIVE XAG trades currently open",html)
 
     def test_error_does_not_claim_zero_live_positions(self):
