@@ -103,6 +103,93 @@ _HTML_REPLACEMENTS = (
 
 
 
+_RISK_BUDGET_TILE_SCRIPT = r"""
+<style id="pep-metals-risk-budget-style">
+#pep-metals-risk-budgets{min-width:0;grid-column:span 2}
+#pep-metals-risk-budgets .pep-budget-lane{padding:9px 0;border-top:1px solid rgba(255,255,255,.12)}
+#pep-metals-risk-budgets .pep-budget-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:700}
+#pep-metals-risk-budgets .pep-budget-numbers{font-size:.84rem;line-height:1.5;margin-top:3px}
+#pep-metals-risk-budgets .pep-budget-bar{height:6px;overflow:hidden;border-radius:8px;background:rgba(255,255,255,.12);margin:8px 0 5px}
+#pep-metals-risk-budgets .pep-budget-fill{height:100%;background:#4ade80}
+#pep-metals-risk-budgets .pep-budget-fill.over{background:#fb923c}
+#pep-metals-risk-budgets .pep-budget-status{font-size:.78rem;opacity:.85}
+@media(max-width:750px){#pep-metals-risk-budgets{grid-column:1/-1}}
+</style>
+<script id="pep-metals-risk-budget-script">
+(function(){
+ var values=null,loading=false;
+ function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(ch){
+   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','"':'&quot;',"'":'&#39;'}[ch]})}
+ function cash(v){var x=Number(v);return v==null||!isFinite(x)?'—':'£'+x.toFixed(2)}
+ function ensure(){
+  var top=document.getElementById('topTiles');if(!top)return null;
+  var card=top.querySelector('[data-pep-nav-risk-budget="1"]');
+  if(card)return card;
+  var first=top.querySelector('.card');
+  var grid=first&&first.parentElement;
+  if(!grid)return null;
+  card=document.createElement('div');card.className='card';card.id='pep-metals-risk-budgets';
+  card.setAttribute('data-pep-nav-risk-budget','1');
+  card.innerHTML='<div class="label">NAV Risk Budgets · Live Metals</div>'+
+     '<div class="small">Checking broker-verified risk capacity…</div>';
+  grid.appendChild(card);
+  return card;
+ }
+ function lane(label,data){
+   if(!data||data.ok!==true){
+     return '<div class="pep-budget-lane"><div class="pep-budget-title">'+label+
+       '<span>Unverified</span></div><div class="pep-budget-status">'+
+       'Budget evidence unavailable — new entries fail closed; no available-capacity claim.</div></div>';
+   }
+   var cap=Number(data.cap_gbp),used=Number(data.risk_used_gbp),pct=Number(data.cap_pct_nav);
+   if(!isFinite(cap)||cap<=0||!isFinite(used)||used<0)return lane(label,null);
+   var free=Math.max(0,cap-used),over=Math.max(0,used-cap),
+       ratio=Math.max(0,used/cap),width=Math.min(100,ratio*100),
+       className=over>0?'over':'';
+   return '<div class="pep-budget-lane"><div class="pep-budget-title">'+
+      esc(label)+' <span>'+esc(pct.toFixed(2))+'% NAV</span></div>'+
+      '<div class="pep-budget-numbers">Allowance <strong>'+cash(cap)+'</strong>'+
+      ' · Used <strong>'+cash(used)+'</strong>'+
+      ' · Available <strong>'+cash(free)+'</strong></div>'+
+      '<div class="pep-budget-bar" role="img" aria-label="'+esc(label)+' risk budget usage '+
+          Math.round(ratio*100)+' percent">'+
+        '<div class="pep-budget-fill '+className+'" style="width:'+width+'%"></div></div>'+
+      '<div class="pep-budget-status">'+
+      (over>0?'Over budget by '+cash(over)+' — new entries blocked':
+       free<=0.005?'Budget exhausted — new entries blocked':
+       cash(free)+' uncommitted before candidate stop-risk buffer')+
+      ' · '+esc(String(data.open_xau==null?(data.open_xag==null?'—':data.open_xag):data.open_xau))+
+      ' open trades</div></div>';
+ }
+ function render(){
+   var card=ensure();if(!card||!values)return;
+   var content='<div class="label">NAV Risk Budgets · Live Metals</div>'+
+       lane('XAU · long + short',values.xau)+lane('XAG · short',values.xag)+
+       '<div class="small">Risk = current broker liquidation quote to verified stop. '+
+       'An available amount does not guarantee an entry: the next trade must fit with its buffer.</div>';
+   if(card.innerHTML!==content)card.innerHTML=content;
+ }
+ async function refresh(){
+   if(loading)return;loading=true;
+   var paths=['/api/xau-nav-budget','/api/xag-nav-budget'];
+   var results=await Promise.all(paths.map(async function(path){
+      try{var r=await fetch(path,{cache:'no-store'});
+       if(!r.ok)throw Error('HTTP '+r.status);
+       return await r.json();
+      }catch(_e){return {ok:false,new_entries_fail_closed:true}}
+   }));
+   values={xau:results[0],xag:results[1]};
+   loading=false;render();
+ }
+ var top=document.getElementById('topTiles');
+ if(top)new MutationObserver(render).observe(top,{childList:true});
+ render();refresh();
+ setInterval(function(){if(!document.hidden)refresh()},90000);
+})();
+</script>
+"""
+
+
 _LATEST_OPENED_TILE_SCRIPT = r"""
 <script id="pep-latest-live-trades-opened">
 (function(){
@@ -257,6 +344,8 @@ class XagLiveWordingMiddleware:
                         text = combined_open_pnl.rewrite_dashboard_html(text)
                         if 'pep-latest-live-trades-opened' not in text:
                             text = text.replace('</body>', _LATEST_OPENED_TILE_SCRIPT + '</body>', 1)
+                        if 'pep-metals-risk-budget-script' not in text:
+                            text = text.replace('</body>', _RISK_BUDGET_TILE_SCRIPT + '</body>', 1)
                     if scope.get("path") in {"/", "/dashboard"}:
                         add = ""
                         reset_panel = ""
