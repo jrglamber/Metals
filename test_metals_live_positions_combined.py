@@ -11,7 +11,7 @@ class CombinedLivePositionsTests(unittest.TestCase):
     def xag(self):
         return {"ok":True,"count":3,"short_count":3,"broker_link_reconciled":True,"untracked_broker_count":0,
             "positions":[
-              {"asset":"XAG_USD","side":"SHORT","units":-1,"entry_price":47.1,"broker_trade_id":"301","tracked":True,"opened_at_utc":"2026-11-05T20:00:00Z","manager":"MFE_GIVEBACK_25"},
+              {"asset":"XAG_USD","side":"SHORT","units":-1,"entry_price":47.1,"broker_trade_id":"301","tracked":True,"opened_at_utc":"2026-11-05T20:00:00Z","manager":"MFE_GIVEBACK_25","manager_mfe_r":2.2,"manager_mae_r":-0.6,"current_r_approx":1.7,"mfe_giveback_r_approx":0.5,"mfe_giveback_pct_approx":22.73,"mfe25_floor_r":1.65,"manager_review_candles":52,"manager_review_status":"CURRENT","last_manager_decision":"EXTEND"},
               {"asset":"XAG_USD","side":"SHORT","units":-1,"entry_price":47.2,"broker_trade_id":"302","tracked":True,"opened_at_utc":"2026-11-06T20:00:00Z","manager":"MFE_GIVEBACK_25"},
               {"asset":"XAG_USD","side":"SHORT","units":-1,"entry_price":47.3,"broker_trade_id":"303","tracked":True,"opened_at_utc":"2026-11-12T15:00:07Z","manager":"MFE_GIVEBACK_25"}]}
     def test_both_live_lanes_and_five_total(self):
@@ -20,6 +20,14 @@ class CombinedLivePositionsTests(unittest.TestCase):
         self.assertEqual((out["xau_count"],out["xag_short_count"],out["count"]),(2,3,5))
         self.assertEqual([x["instrument"] for x in out["trades"]],["XAU_USD"]*2+["XAG_USD"]*3)
         self.assertTrue(out["practice_excluded"])
+        xag=out["trades"][2]
+        self.assertEqual(xag["manager_mfe_r"],2.2)
+        self.assertEqual(xag["manager_mae_r"],-0.6)
+        self.assertEqual(xag["mfe_giveback_r_approx"],0.5)
+        self.assertEqual(xag["mfe25_floor_r"],1.65)
+        self.assertEqual(xag["manager_review_candles"],52)
+        self.assertEqual(xag["manager_review_status"],"CURRENT")
+        self.assertEqual(xag["manager_last_decision"],"EXTEND")
     def test_missing_broker_data_not_false_zero(self):
         out=combine(self.xau(),{"ok":False,"reason":"OANDA down"})
         self.assertTrue(out["partial"])
@@ -38,6 +46,13 @@ class CombinedLivePositionsTests(unittest.TestCase):
         out=combine(self.xau(),x)
         self.assertEqual(out["trades"][-1]["tracking"],"UNLINKED — CHECK")
         self.assertFalse(out["xag_broker_link_reconciled"])
+    def test_open_trades_html_exposes_xag_manager_progress(self):
+        src=pathlib.Path("metals_dashboard_clean_entrypoint.py").read_text()
+        for phrase in ("MFE (R)","MAE (R)","Giveback from MFE~",
+                       "75% MFE floor","Manager review","manager_review_status",
+                       "xag_mature_manager_stale_count"):
+            self.assertIn(phrase,src)
+
     def test_native_loader_and_top_tile_use_combined_route(self):
         src=pathlib.Path("metals_dashboard_clean_entrypoint.py").read_text()
         self.assertIn('@core.app.get("/api/live-metals-open-positions")',src)
