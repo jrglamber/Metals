@@ -107,6 +107,19 @@ class BrokerReconcileTests(unittest.TestCase):
         self.assertEqual(self.core.db.execute(
             "SELECT COUNT(*) FROM metals_xag_live_execution_audit WHERE status='RECOVERED_BROKER_OPEN'"
         ).fetchone()[0],2)
+    def test_recovery_accepts_broker_pending_stop_below_entry_after_profit_ratchet(self):
+        insert_link(self.core,126)
+        trade=open_trade(126,price=43.0,stop=42.0)
+        with self.stub([trade],{"126":trade}):
+            result=live._reconcile(self.core)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recovered_historical_live_count"],1)
+        row=self.core.db.execute(
+            "SELECT current_stop_price,status FROM metals_xag_live_trade_links WHERE id=126"
+        ).fetchone()
+        self.assertEqual(row["current_stop_price"],42.0)
+        self.assertEqual(row["status"],"OPEN")
+
     def test_recovery_refuses_missing_stop_and_leaves_closed_record(self):
         insert_link(self.core,123)
         bad=open_trade(123)
