@@ -83,8 +83,9 @@ def snapshot(core: Any) -> Dict[str, Any]:
         # mean it is indicative, never an execution trigger.
         current_r_approx = (pnl / risk if pnl is not None and risk is not None
                             and risk > 0 else None)
-        peak_r = (max(0.0, *[v for v in (mfe, high_water) if v is not None])
-                  if mfe is not None or high_water is not None else None)
+        # The deployed XAG MFE25 trigger is exactly 75% of manager_mfe_r;
+        # the separately retained manager high-water field is not its floor.
+        peak_r = max(0.0, mfe) if mfe is not None else None
         giveback_r_approx = (max(0.0, peak_r - current_r_approx)
                              if peak_r is not None and current_r_approx is not None
                              and peak_r > 0 else None)
