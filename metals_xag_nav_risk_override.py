@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 VERSION = "xag_nav_mark_to_stop_budget_v1_2026_11_23"
-CAP_PCT_NAV = 0.85  # 24 existing one-unit £2-risk entries / ~£5758 verified NAV
+CAP_PCT_NAV = 1.20  # user-approved NAV entry allowance, 2026-11-25
 OPERATIONAL_MAX_OPEN = 96
 BUFFER = 1.10
 
