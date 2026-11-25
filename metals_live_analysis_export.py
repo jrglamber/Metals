@@ -442,6 +442,33 @@ def build_bundle(core, xag_reader=None, now=None):
             manifest["basket_full_early_exit_shadow"] = {
                 "status":"UNAVAILABLE","error_type":type(exc).__name__,
                 "execution_authority":False}
+        # Observed-entry contraction research derived from existing snapshots.
+        # No live worker, broker requests, trade hooks or extra persistence.
+        try:
+            from metals_contraction_entry_research import (
+                analyse, summarize, FIELDS, SUMMARY_FIELDS, VERSION as contraction_version)
+            from metals_forward_economic_capture import export_rows as contraction_marks
+            links = {asset:_link_records(core,table,link_fields)
+                     for asset,table in (("XAU","metals_xau_live_trade_links"),
+                                         ("XAG","metals_xag_live_trade_links"))}
+            contraction = analyse(contraction_marks(core),links)
+            _csv(zf,"live-metals-contraction-entry-challengers.csv",contraction,FIELDS)
+            _csv(zf,"live-metals-contraction-entry-summary.csv",summarize(contraction),SUMMARY_FIELDS)
+            manifest["contraction_entry_research"] = {
+                "version":contraction_version,"status":"AVAILABLE" if contraction else "NO_OBSERVED_ENTRIES",
+                "entries":len(contraction),"scope":"ACTUAL_LIVE_ENTRIES_ONLY",
+                "significant_giveback_fraction":0.25,"peak_window_hours":3,
+                "protective_release_window_hours":1,"maximum_sample_gap_seconds":900,
+                "unknown_is_not_block_or_allow":True,"realised_basis":"GROSS_TRADE_LINK",
+                "protective_release_is_observed_proxy_not_causal_budget_attribution":True,
+                "not_full_portfolio_replay":True,"execution_authority":False,
+                "broker_order_writes":False}
+        except Exception as exc:
+            manifest["contraction_entry_research"] = {
+                "status":"UNAVAILABLE","reason_type":type(exc).__name__,
+                "execution_authority":False}
+            zf.writestr("live-metals-contraction-entry-unavailable.json",
+                json.dumps(manifest["contraction_entry_research"]))
         zf.writestr("manifest.json",json.dumps(manifest,indent=2,default=str))
         zf.writestr("README.txt",("LIVE Metals analysis, not practice/demo. UTC events bucketed into Europe/London dates.\n"
           "XAU source = broker-synced XAU transaction ledger since its accounting epoch; verify separately before treating as independently complete lifetime history.\n"
