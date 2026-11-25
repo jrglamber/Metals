@@ -38,6 +38,33 @@ def validate():
         raise AssertionError("Live XAG broker/database ownership mismatch")
     if any(t.get("tracking")!="TRACKED" for t in xs if t.get("lane")=="XAG_SHORT_LIVE"):
         raise AssertionError("One or more live XAG trades not linked to live ledger")
+    # Verify the actual production response includes the per-trade manager
+    # evidence; avoid printing broker IDs, prices, or individual returns.
+    xag_rows=[t for t in xs if t.get("lane")=="XAG_SHORT_LIVE"]
+    for row in xag_rows:
+        for key in ("manager_mfe_r","manager_mae_r","current_r_approx",
+                    "mfe_giveback_r_approx","manager_review_candles",
+                    "manager_review_status","manager_last_decision"):
+            if key not in row:
+                raise AssertionError("XAG manager column missing: "+key)
+    mature=sum(bool(t.get("manager_review_candles") is not None
+                    and t["manager_review_candles"]>=48) for t in xag_rows)
+    current=sum(bool(t.get("manager_review_candles") is not None
+                     and t["manager_review_candles"]>=48 and
+                     t.get("manager_review_status")=="CURRENT") for t in xag_rows)
+    if (mature != data.get("xag_mature_manager_trade_count") or
+        current != data.get("xag_mature_manager_current_count")):
+        raise AssertionError("XAG manager aggregate counts disagree with individual positions")
+    print("LIVE_XAG_MFE_REVIEW_SUMMARY "+json.dumps({
+        "broker_open_xag":xag,"mature_48_completed_candles":mature,
+        "mature_reviewed_on_latest_xag_signal":current,
+        "mature_stale_or_missing":mature-current,
+        "last_xag_signal_observed":data.get("xag_latest_signal_id") is not None,
+        "mfe_recorded_count":sum(t.get("manager_mfe_r") is not None for t in xag_rows),
+        "mae_recorded_count":sum(t.get("manager_mae_r") is not None for t in xag_rows),
+        "giveback_indicative_count":sum(t.get("mfe_giveback_r_approx") is not None
+                                        for t in xag_rows)
+    }))
     page=get("/dashboard")
     marker="fetch('/api/live-metals-open-positions'"
     if marker not in page:
