@@ -232,6 +232,18 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 return old_router(rid, source=source, *args, **kwargs)
             candidate = _candidate(core, row)
             if not candidate.get("demo_candidate") or str(candidate.get("demo_side") or "").lower() != "short":
+                # An absent live link is only an outcome. Persist the actual
+                # entry eligibility decision separately, so diagnostics do not
+                # mistake a noncandidate signal for a risk-budget rejection.
+                try:
+                    live._audit(
+                        core, rid, "entry_governance", "NOT_CANDIDATE",
+                        "xag_model_not_qualifying_short_candidate",
+                        raw={"model_candidate": bool(candidate.get("demo_candidate")),
+                             "model_side": str(candidate.get("demo_side") or "")[:16]})
+                except Exception as audit_exc:
+                    print("XAG_NONCANDIDATE_AUDIT_FAILED " +
+                          type(audit_exc).__name__, flush=True)
                 # Preserve existing research/non-candidate behaviour. However
                 # existing LIVE shorts need a 48-candle exit review on EVERY
                 # fresh XAG hourly signal, not only fresh short entry candidates.
