@@ -286,5 +286,134 @@ class LiveOrderAttemptTests(unittest.TestCase):
         self.assertFalse(x["broker_open_unrealized_complete"])
 
 
+class MatureStopTransitionTests(unittest.TestCase):
+    """Existing 48-candle policy should run regardless of entry candidacy."""
+
+    def setUp(self):
+        self.core=Core()
+        self.addCleanup(self.core.db.close)
+        self.old_calls=[]
+        self.core.execute_metals_demo_candidate=lambda *a,**kw: self.old_calls.append(a) or {"ok":True}
+        for sid,pair,age in ((101,"XAGUSD",0),(102,"XAUUSD",0),(103,"XAGUSD",180)):
+            stamp=(datetime.now(timezone.utc)-timedelta(minutes=age)).isoformat()
+            self.core.db.execute(
+                "INSERT INTO raw_signals(id,pair,received_at_utc,timestamp_readable) "
+                "VALUES(?,?,?,?)",(sid,pair,stamp,"2026-11-25 06:00"))
+        self.core.db.commit()
+
+    def _app(self):
+        class App:
+            def __init__(self): self.router=type("Router",(),{"routes":[]})()
+            def add_api_route(self,path,fn,methods,include_in_schema):
+                self.router.routes.append(type("Route",(),{"path":path,"endpoint":fn})())
+        return App()
+
+    def test_fresh_non_candidate_xag_still_triggers_live_exit_manager_no_new_entries(self):
+        old=independent._INSTALLED
+        independent._INSTALLED=False
+        self.addCleanup(setattr, independent, "_INSTALLED", old)
+        with patch.object(live,"_reconcile",return_value={"ok":True}), \\
+             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \\
+             patch.object(live,"_manager_tick",return_value={"ok":True,"reviewed":4,"results":[]}) as mgr, \\
+             patch.object(live,"_execute_live") as entry:
+            independent.install(self.core,self._app())
+            ret=self.core.execute_metals_demo_candidate(101)
+            self.assertTrue(ret["ok"])
+            mgr.assert_called_once_with(self.core,101)
+            entry.assert_not_called()
+            self.assertEqual(len(self.old_calls),1)
+
+    def test_xau_stays_unchanged_and_stale_xag_signal_does_not_run_manager(self):
+        old=independent._INSTALLED
+        independent._INSTALLED=False
+        self.addCleanup(setattr, independent, "_INSTALLED", old)
+        with patch.object(live,"_reconcile",return_value={"ok":True}), \\
+             patch.object(independent,"_candidate",return_value={"demo_candidate":False}), \\
+             patch.object(live,"_manager_tick",return_value={"ok":True}) as mgr:
+            independent.install(self.core,self._app())
+            self.core.execute_metals_demo_candidate(102)
+            self.core.execute_metals_demo_candidate(103)
+            mgr.assert_not_called()
+            self.assertEqual(len(self.old_calls),2)
+
+    def test_actual_broker_stop_ratchet_verified_only_after_successful_readback(self):
+        insert_link(self.core,201,status="OPEN")
+        self.core.db.execute("UPDATE metals_xag_live_trade_links SET current_stop_price=44.0 WHERE id=201")
+        self.core.db.commit()
+        states=iter([44.0,42.2])
+        writes=[]
+        def req(_core,path,method="GET",body=None):
+            if method=="PUT":
+                writes.append((path,body))
+                return {"ok":True,"status_code":200,"data":{"stopLossOrderTransaction":{}}}
+            stop=next(states)
+            return {"ok":True,"data":{"trade":{"id":"201","instrument":"XAG_USD",
+                "state":"OPEN","currentUnits":"-1","price":"43.0",
+                "stopLossOrder":{"price":str(stop),"state":"PENDING",
+                                 "tradeID":"201"}}}}
+        link={"id":201,"raw_signal_id":201,"broker_trade_id":"201"}
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+             patch.object(live,"_request",side_effect=req):
+            result=live._update_stop(self.core,link,42.2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"],"UPDATED_BROKER_VERIFIED")
+        self.assertEqual(len(writes),1)
+        saved=self.core.db.execute("SELECT current_stop_price FROM metals_xag_live_trade_links WHERE id=201").fetchone()[0]
+        self.assertEqual(saved,42.2)
+
+    def test_http_200_without_a_new_broker_stop_is_not_reported_success(self):
+        insert_link(self.core,202,status="OPEN")
+        self.core.db.execute("UPDATE metals_xag_live_trade_links SET current_stop_price=44.0 WHERE id=202")
+        self.core.db.commit()
+        def req(_core,path,method="GET",body=None):
+            if method=="PUT":
+                return {"ok":True,"status_code":200,"data":{"orderCancelTransaction":{"reason":"MARKET_HALTED"}}}
+            return {"ok":True,"data":{"trade":{"id":"202","instrument":"XAG_USD",
+                "state":"OPEN","currentUnits":"-1","price":"43.0",
+                "stopLossOrder":{"price":"44.0","state":"PENDING",
+                                 "tradeID":"202"}}}}
+        link={"id":202,"raw_signal_id":202,"broker_trade_id":"202"}
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+             patch.object(live,"_request",side_effect=req):
+            result=live._update_stop(self.core,link,42.0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.core.db.execute(
+            "SELECT current_stop_price FROM metals_xag_live_trade_links WHERE id=202"
+        ).fetchone()[0],44.0)
+
+    def test_broker_stop_stronger_than_local_never_loosened(self):
+        insert_link(self.core,203,status="OPEN")
+        self.core.db.execute("UPDATE metals_xag_live_trade_links SET current_stop_price=44.0 WHERE id=203")
+        self.core.db.commit()
+        def req(_core,path,method="GET",body=None):
+            self.assertEqual(method,"GET")
+            return {"ok":True,"data":{"trade":{"id":"203","instrument":"XAG_USD",
+                "state":"OPEN","currentUnits":"-1","price":"43.0",
+                "stopLossOrder":{"price":"41.0","state":"PENDING",
+                                 "tradeID":"203"}}}}
+        link={"id":203,"raw_signal_id":203,"broker_trade_id":"203"}
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+             patch.object(live,"_request",side_effect=req):
+            result=live._update_stop(self.core,link,42.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"],"UNCHANGED_BROKER_TIGHTER")
+        self.assertEqual(self.core.db.execute(
+            "SELECT current_stop_price FROM metals_xag_live_trade_links WHERE id=203"
+        ).fetchone()[0],41.0)
+
+    def test_no_broker_stop_verification_never_writes(self):
+        insert_link(self.core,204,status="OPEN")
+        link={"id":204,"raw_signal_id":204,"broker_trade_id":"204"}
+        with patch.object(live,"config_status",return_value={"management_writes_allowed":True}), \\
+             patch.object(live.sizing_probe,"snapshot",return_value={"display_precision":3}), \\
+             patch.object(live,"_request",return_value={"ok":False}) as req:
+            result=live._update_stop(self.core,link,42.0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(req.call_count,1)
+
+
 if __name__=="__main__":
     unittest.main()
