@@ -55,6 +55,51 @@ def validate():
     if (mature != data.get("xag_mature_manager_trade_count") or
         current != data.get("xag_mature_manager_current_count")):
         raise AssertionError("XAG manager aggregate counts disagree with individual positions")
+    xau_rows=[t for t in xs if t.get("lane")=="XAU_LIVE"]
+    for row in xau_rows:
+        for key in ("manager_mfe_r","manager_mae_r","current_r_approx",
+                    "mfe_giveback_r_approx","manager_review_candles",
+                    "manager_review_status","manager_last_decision"):
+            if key not in row:
+                raise AssertionError("XAU manager column missing: "+key)
+    if data.get("xau_broker_link_reconciled") is not True:
+        raise AssertionError("XAU broker open long/short population not fully ledger linked")
+    print("LIVE_XAU_MFE_REVIEW_SUMMARY "+json.dumps({
+        "broker_open_xau":len(xau_rows),
+        "mfe_recorded_count":sum(t.get("manager_mfe_r") is not None for t in xau_rows),
+        "mae_recorded_count":sum(t.get("manager_mae_r") is not None for t in xau_rows),
+        "manager_reviewed_count":sum(t.get("manager_review_candles") is not None for t in xau_rows)}))
+
+    recent=json.loads(get("/api/live-metals-recently-closed?limit=50"))
+    if not recent.get("ok") or recent.get("scope")!="LIVE_XAU_LONG_SHORT_AND_XAG_SHORT":
+        raise AssertionError("Combined recent-closed LIVE Metals API unavailable")
+    closed=recent.get("rows") or []
+    if recent.get("count")!=len(closed):
+        raise AssertionError("Combined recent closed count mismatch")
+    if any(row.get("asset") not in ("XAUUSD","XAGUSD") or
+           not row.get("broker_trade_id") or not row.get("closed_at_utc") for row in closed):
+        raise AssertionError("Recent-closed feed contains unverified or invalid row")
+    if not recent.get("practice_excluded"):
+        raise AssertionError("Recent closed live feed does not exclude demo")
+    print("LIVE_CLOSED_METALS_COMBINED "+json.dumps({
+        "recent_rows":len(closed),
+        "xau_rows":recent.get("xau_count"),
+        "xag_rows":recent.get("xag_count"),
+        "trade_pnl_net_cash_proven":not recent.get("trade_pl_not_net_broker_cash")}))
+
+    for asset,path in (("XAU","/api/xau-nav-budget"),
+                       ("XAG","/api/xag-nav-budget")):
+        budget=json.loads(get(path))
+        if budget.get("ok") is True:
+            cap,used=budget.get("cap_gbp"),budget.get("risk_used_gbp")
+            if not isinstance(cap,(int,float)) or not isinstance(used,(int,float)) or cap<=0 or used<0:
+                raise AssertionError(asset+" broker risk budget invalid")
+        elif not budget.get("new_entries_fail_closed"):
+            raise AssertionError(asset+" budget unverified but not fail closed")
+        print("LIVE_METALS_BUDGET_TILE_SOURCE "+json.dumps({
+            "asset":asset,"broker_verified":budget.get("ok") is True,
+            "fail_closed":budget.get("new_entries_fail_closed") is True}))
+
     print("LIVE_XAG_MFE_REVIEW_SUMMARY "+json.dumps({
         "broker_open_xag":xag,"mature_48_completed_candles":mature,
         "mature_reviewed_on_latest_xag_signal":current,
@@ -71,6 +116,10 @@ def validate():
         raise AssertionError("ACTUAL dashboard HTML does not contain the combined position loader")
     if "pep-standard-metals-layout-script" not in page:
         raise AssertionError("Actual native dashboard script absent")
+    if "pep-metals-risk-budget-script" not in page:
+        raise AssertionError("ACTUAL HTML missing XAU/XAG NAV risk budget tile script")
+    if "/api/xau-nav-budget" not in page or "/api/xag-nav-budget" not in page:
+        raise AssertionError("Live risk tile does not reference both actual broker NAV risk gates")
     if "LIVE XAG SHORT" not in page:
         raise AssertionError("XAG live label absent from rendered dashboard")
     print(f"PASS: actual HTML uses combined LIVE loader; XAU={xau}, XAG_SHORT={xag}, combined={len(xs)}; XAG ownership reconciled; practice excluded")
