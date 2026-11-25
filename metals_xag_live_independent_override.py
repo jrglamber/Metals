@@ -249,16 +249,28 @@ def install(core: Any, app: Any) -> Dict[str, Any]:
                 # fresh XAG hourly signal, not only fresh short entry candidates.
                 out = old_router(rid, source=source, *args, **kwargs)
                 if _fresh_signal(row):
-                    with live._ENTRY_LOCK:
-                        try:
-                            mgr = live._manager_tick(core, rid)
-                        except Exception as exc:
-                            mgr = {"ok": False, "reason": "manager_tick_failed:" + type(exc).__name__}
+                    # The preceding XAG live router already calls the manager
+                    # on each XAG signal and normally exposes that result.
+                    # Re-running it immediately produced misleading
+                    # reviewed=0 logs because all links had already been
+                    # stamped with this signal. Reuse authoritative first pass.
+                    upstream = out.get("xag_short_live_manager") if isinstance(out, dict) else None
+                    if isinstance(upstream, dict):
+                        mgr = upstream
+                        manager_source = "upstream_router"
+                    else:
+                        manager_source = "fallback_review"
+                        with live._ENTRY_LOCK:
+                            try:
+                                mgr = live._manager_tick(core, rid)
+                            except Exception as exc:
+                                mgr = {"ok": False, "reason": "manager_tick_failed:" + type(exc).__name__}
                     print("XAG_LIVE_MFE25_ALL_SIGNAL_REVIEW " + json.dumps({
                         "signal_id":rid,"source":"noncandidate",
+                        "manager_source":manager_source,
                         "manager_ok":mgr.get("ok") is True,
                         "reviewed":mgr.get("reviewed"),
-                        "reason":mgr.get("reason"),
+                        "reason":mgr.get("reason") or mgr.get("error"),
                         "mature_reviews":sum(x.get("decision") in ("EXTEND", "CLOSE_MFE25_GIVEBACK") for x in mgr.get("results") or []),
                         "young_holds":sum(x.get("decision")=="HOLD_MIN_48" for x in mgr.get("results") or []),
                         "stop_update_failures":sum(isinstance(x.get("stop_result"),dict)
