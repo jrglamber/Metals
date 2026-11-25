@@ -6,6 +6,8 @@ on:
       - 'xag_local_reconciliation_watchdog.py'
       - 'test_xag_local_reconciliation_watchdog.py'
       - 'metals_xag_live_independent_override.py'
+      - 'xag_short_live_override.py'
+      - 'test_xag_live_independent.py'
       - 'metals_xag_realised_verified.py'
       - 'test_metals_xag_realised_verified.py'
       - 'metals_live_open_pnl_display.py'
@@ -23,5 +25,5 @@ jobs:
           python-version: '3.11'
       - name: Compile and test read-only broker ownership and cash-display fail-closed contracts
         run: |
-          python -m py_compile xag_local_reconciliation_watchdog.py metals_xag_live_independent_override.py metals_live_open_pnl_display.py metals_xag_realised_verified.py
-          python -m unittest -v test_xag_local_reconciliation_watchdog test_metals_xag_realised_verified
+          python -m py_compile xag_local_reconciliation_watchdog.py metals_xag_live_independent_override.py xag_short_live_override.py test_xag_live_independent.py metals_live_open_pnl_display.py metals_xag_realised_verified.py
+          python -m unittest -v test_xag_live_independent test_xag_local_reconciliation_watchdog test_metals_xag_realised_verified
