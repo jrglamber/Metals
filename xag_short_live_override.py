@@ -539,6 +539,33 @@ def _close_link(core: Any, link: Dict[str, Any], reason: str) -> Dict[str, Any]:
     return {"ok": False, "retry": True, "response": last}
 
 
+def _broker_current_stop_for_short(core: Any, broker_trade_id: str) -> Dict[str, Any]:
+    """Require the exact OPEN XAG short and its current attached broker stop.
+
+    Unlike initial-stop recovery, this intentionally permits a ratcheted stop
+    BELOW entry: that's how a profitable short actually protects its gains.
+    """
+    resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{broker_trade_id}", "GET")
+    trade = _d((resp.get("data") or {}).get("trade")) if resp.get("ok") else {}
+    units = _num(core, trade.get("currentUnits"))
+    if (str(trade.get("id") or "") != broker_trade_id or
+        str(trade.get("state") or "").upper() != "OPEN" or
+        str(trade.get("instrument") or "").upper() != INSTRUMENT or
+        units is None or abs(float(units) + PILOT_UNITS) > 1e-8):
+        return {"ok":False,"reason":"broker_short_trade_identity_unverified"}
+    stop = _d(trade.get("stopLossOrder"))
+    stop_id = str(trade.get("stopLossOrderID") or "")
+    if not stop.get("price") and stop_id:
+        order = _request(core, f"/v3/accounts/{_account_id(core)}/orders/{stop_id}", "GET")
+        stop = _d((order.get("data") or {}).get("order")) if order.get("ok") else {}
+    price = _num(core, stop.get("price"))
+    if (price is None or float(price) <= 0 or
+        (stop.get("state") and str(stop.get("state")).upper() != "PENDING") or
+        (stop.get("tradeID") and str(stop.get("tradeID")) != broker_trade_id)):
+        return {"ok":False,"reason":"broker_attached_stop_unverified"}
+    return {"ok":True,"stop_price":float(price)}
+
+
 def _update_stop(core: Any, link: Dict[str, Any], stop_price: float) -> Dict[str, Any]:
     cfg = config_status(core)
     if not cfg.get("management_writes_allowed"):
@@ -550,21 +577,53 @@ def _update_stop(core: Any, link: Dict[str, Any], stop_price: float) -> Dict[str
         dp = int(probe.get("display_precision") or 3)
     except Exception:
         pass
-    body = {"stopLoss": {"timeInForce": "GTC", "price": f"{float(stop_price):.{dp}f}"}}
+    if dp < 0 or dp > 8 or not bid:
+        return {"ok":False,"reason":"invalid_broker_stop_precision_or_id"}
+    formatted = f"{float(stop_price):.{dp}f}"
+    desired = float(formatted)
+    broker_before = _broker_current_stop_for_short(core, bid)
+    if not broker_before.get("ok"):
+        _audit(core, link.get("raw_signal_id"), "stop_update", "BLOCKED",
+               broker_before.get("reason") or "broker_prewrite_stop_unverified",
+               int(link["id"]), bid)
+        return {"ok":False,"reason":broker_before.get("reason")}
+
+    old = broker_before["stop_price"]
+    # Never replace a tighter short stop with a looser one, even when the
+    # locally cached stop is stale. No broker order is needed in that case.
+    if desired >= old:
+        with core.get_conn() as conn:
+            conn.execute("UPDATE metals_xag_live_trade_links SET updated_at_utc=?,"
+                         "current_stop_price=? WHERE id=?",
+                         (_now(), old, int(link["id"])))
+            conn.commit()
+        return {"ok":True,"status":"UNCHANGED_BROKER_TIGHTER","stop_price":old}
+
+    body = {"stopLoss": {"timeInForce": "GTC", "price": formatted}}
     resp = _request(core, f"/v3/accounts/{_account_id(core)}/trades/{bid}/orders", "PUT", body)
-    if resp.get("ok"):
+    # HTTP 200 does not establish execution. OANDA can cancel an accepted
+    # request. Re-read the dependent stop before committing local 'UPDATED'.
+    broker_after = _broker_current_stop_for_short(core, bid)
+    if (broker_after.get("ok") and
+        broker_after["stop_price"] <= desired + 10**(-dp) and
+        broker_after["stop_price"] < old):
+        actual = broker_after["stop_price"]
         with core.get_conn() as conn:
             conn.execute(
                 "UPDATE metals_xag_live_trade_links SET updated_at_utc=?,current_stop_price=? WHERE id=?",
-                (_now(), float(stop_price), int(link["id"])),
+                (_now(), actual, int(link["id"])),
             )
             conn.commit()
-        _audit(core, link.get("raw_signal_id"), "stop_update", "UPDATED",
-               f"MFE25 stop={stop_price}", int(link["id"]), bid)
-        return {"ok": True, "stop_price": stop_price}
-    _audit(core, link.get("raw_signal_id"), "stop_update", "FAILED",
-           "MFE25 stop update failed", int(link["id"]), bid, {"response": resp})
-    return {"ok": False, "response": resp}
+        _audit(core, link.get("raw_signal_id"), "stop_update", "UPDATED_BROKER_VERIFIED",
+               f"MFE25 stop verified at broker={actual}", int(link["id"]), bid)
+        return {"ok":True,"status":"UPDATED_BROKER_VERIFIED","stop_price":actual}
+    reason = ("postwrite_broker_stop_unverified" if not broker_after.get("ok") else
+              "broker_stop_not_tightened")
+    _audit(core, link.get("raw_signal_id"), "stop_update", "UNVERIFIED",
+           reason, int(link["id"]), bid,
+           {"http_ok":resp.get("ok"),"broker_read_ok":broker_after.get("ok"),
+            "broker_failure_class":(resp.get("data") or {}).get("errorCode")})
+    return {"ok":False,"reason":reason}
 
 
 def _manager_tick(core: Any, raw_signal_id: int) -> Dict[str, Any]:
