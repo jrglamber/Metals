@@ -3,7 +3,8 @@
 Uses OANDA's account-currency ORDER_FILL, DAILY_FINANCING and optional
 DIVIDEND_ADJUSTMENT transactions. All broker trade IDs must match live
 XAG Short ownership; transactions are unique and history is complete.
-No orders, DB writes, broker secrets, or raw IDs in the response.
+No orders or broker secrets/raw IDs in the response. The only DB write is
+an isolated, non-authoritative cache of validated immutable transaction ranges.
 """
 from __future__ import annotations
 
@@ -15,8 +16,9 @@ import time
 from urllib.parse import urlencode
 
 from metals_xag_ledger_audit import _id, _utc, audit_links
+from metals_xag_transaction_checkpoint import Checkpoint
 
-VERSION = "xag_short_net_cash_ledger_checkpoint_v2_2026_11_26"
+VERSION = "xag_short_net_cash_ledger_checkpoint_v3_2026_11_26"
 MAX_TX_PAGES = 60  # Per worker pass, never an unbounded broker request loop.
 TX_RANGE_SIZE = 300
 CACHE_SECONDS = 180  # Successful full-history proof is expensive (many broker pages).
@@ -267,7 +269,7 @@ def transaction_financials(transactions, links, broker_trades, now=None):
 
 
 class TransactionHistory:
-    """A process-local, contiguous history checkpoint for one live account.
+    """A restart-safe, contiguous history checkpoint for one live account.
 
     OANDA transactions are immutable. Reuse only successfully read ranges
     beginning at the same first linked trade; a new account, changed boundary
@@ -288,8 +290,9 @@ class TransactionHistory:
         self.next_id = None
         self.rows = []
         self.pages = 0
+        self.pending = []
 
-    def read(self, account, earliest, last, request, max_pages=None):
+    def read(self, account, earliest, last, request, max_pages=None, checkpoint=None):
         max_pages = MAX_TX_PAGES if max_pages is None else max_pages
         key = (account, earliest)
         if self.key != key or self.next_id is None or last < self.next_id - 1:
@@ -297,6 +300,20 @@ class TransactionHistory:
             self.next_id = earliest
             self.rows = []
             self.pages = 0
+            self.pending = []
+            # Only a fully validated contiguous prefix can survive restart.
+            if checkpoint is not None:
+                try:
+                    loaded = checkpoint.load(account, earliest, last)
+                    for start, end, rows in loaded:
+                        self.rows.extend(rows)
+                        self.next_id = end + 1
+                        self.pages += 1
+                    if loaded:
+                        print(f"XAG_TRANSACTION_CHECKPOINT_LOADED pages={len(loaded)} "
+                              f"transactions={len(self.rows)}", flush=True)
+                except Exception as exc:
+                    print(f"XAG_TRANSACTION_CHECKPOINT_LOAD_FAILED type={type(exc).__name__}", flush=True)
         pages_read = 0
         blocker = None
         while self.next_id <= last and pages_read < max_pages:
@@ -321,8 +338,23 @@ class TransactionHistory:
             # Advance only after validating and storing the entire page.
             compact = [{k: t[k] for k in self._FIELDS if k in t} for t in items]
             self.rows.extend(compact)
+            if checkpoint is not None:
+                self.pending.append((start, end, compact))
             self.next_id = end + 1
             self.pages += 1
+        # Persist at most one bounded batch per refresh, outside broker calls.
+        # An unavailable DB cannot invalidate fresh broker evidence; pending
+        # pages are retried on subsequent refreshes. Never label unverified
+        # broker history complete solely because the cache exists.
+        if checkpoint is not None and self.pending:
+            batch = self.pending[:MAX_TX_PAGES]
+            try:
+                checkpoint.save(account, earliest, batch)
+                del self.pending[:len(batch)]
+                print(f"XAG_TRANSACTION_CHECKPOINT_SAVED pages={len(batch)} "
+                      f"pending={len(self.pending)}", flush=True)
+            except Exception as exc:
+                print(f"XAG_TRANSACTION_CHECKPOINT_SAVE_FAILED type={type(exc).__name__}", flush=True)
         complete = self.next_id > last
         if not complete and blocker is None:
             blocker = "transaction_history_backfill_pending"
@@ -391,7 +423,7 @@ def audit_live(core):
                 "transaction_history_complete":False}
 
     # Fetch all transaction kinds in bounded inclusive ranges. Grow the
-    # process-local checkpoint incrementally instead of imposing a lifetime
+    # persistent checkpoint incrementally instead of imposing a lifetime
     # transaction-span ceiling or repeating the entire history every refresh.
     def request_range(start, end):
         return xag._request(
@@ -399,7 +431,8 @@ def audit_live(core):
             urlencode({"from": start, "to": end}), "GET"
         )
 
-    progress = _history.read(account, earliest, last, request_range)
+    progress = _history.read(account, earliest, last, request_range,
+                             checkpoint=Checkpoint(core.get_conn))
     if not progress["transaction_history_complete"]:
         return {
             "ok": False, "version": VERSION, "account_currency": currency,
@@ -525,3 +558,4 @@ def export_verified_cash_events(core):
            - float(proof["realised_all_time_gbp"])) > 0.02:
         raise ValueError("XAG cash detail does not reconcile with verified all-time P&L")
     return {"proof": proof, "events": events}
+
