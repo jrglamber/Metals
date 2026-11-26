@@ -115,6 +115,133 @@ class TransactionAuditTests(unittest.TestCase):
         self.assertEqual(d["realised_week_gbp"],3.0)
 
 
+class TransactionHistoryCheckpointTests(unittest.TestCase):
+    def test_full_broker_audit_resumes_after_original_18000_id_limit(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch, MagicMock
+        from urllib.parse import urlparse, parse_qs
+        import metals_xag_transaction_audit as audit
+
+        first, last = 100, 18201  # Exactly 18,102 IDs, the production failure.
+        local_links = [{"broker_trade_id": str(first), "status": "CLOSED"}]
+        broker_trades = [{
+            "id": str(first), "instrument": "XAG_USD", "initialUnits": "-1",
+            "state": "CLOSED", "realizedPL": "4.20",
+            "closeTime": "2026-11-17T10:00:00Z",
+        }]
+        core = MagicMock()
+        core.get_conn.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = local_links
+        requests = []
+        checkpoint = [last]
+
+        def request(core_arg, url, method):
+            self.assertEqual(method, "GET")
+            base = "/v3/accounts/test-account"
+            if url == base + "/summary":
+                return {"ok": True, "data": {"account": {"currency": "GBP"},
+                                             "lastTransactionID": str(checkpoint[0])}}
+            if url.startswith(base + "/trades?"):
+                return {"ok": True, "data": {"trades": broker_trades}}
+            self.assertTrue(url.startswith(base + "/transactions/idrange?"))
+            q = parse_qs(urlparse(url).query)
+            start, end = int(q["from"][0]), int(q["to"][0])
+            self.assertLessEqual(end - start + 1, audit.TX_RANGE_SIZE)
+            requests.append((start, end))
+            transactions = []
+            for i in range(start, end + 1):
+                row = {"id": str(i), "type": "ORDER_CANCEL",
+                       "time": "2026-11-16T18:00:00Z", "raw_extra": "discard"}
+                if i == first:
+                    row = dict(opening(str(first)), id=str(first))
+                elif i == last:
+                    row = dict(closing(), id=str(last),
+                               tradesClosed=[{"tradeID": str(first),
+                                              "realizedPL": "4.20", "financing": "-0.02"}])
+                elif i == last + 1:
+                    row = dict(daily(), id=str(i), positionFinancings=[{
+                        "instrument": "XAG_USD", "financing": "-0.05",
+                        "openTradeFinancings": [{"tradeID": str(first), "financing": "-0.05"}],
+                    }])
+                transactions.append(row)
+            return {"ok": True, "data": {"transactions": transactions}}
+
+        fake_xag = SimpleNamespace(_account_id=lambda core: "test-account", _request=request)
+        history = audit.TransactionHistory()
+        with patch.dict(sys.modules, {"xag_short_live_override": fake_xag}), \
+                patch.object(audit, "_history", history):
+            partial = audit.audit_live(core)
+            self.assertFalse(partial["ok"])
+            self.assertFalse(partial["transaction_history_complete"])
+            self.assertFalse(partial["net_realised_gbp_verified"])
+            self.assertEqual(partial["blockers"], ["transaction_history_backfill_pending"])
+            self.assertNotIn("realised_all_time_gbp", partial)
+            self.assertEqual(partial["transaction_ids_remaining"], 102)
+            self.assertEqual(len(requests), 60)
+            self.assertNotIn("raw_extra", history.rows[1])
+
+            full = audit.audit_live(core)
+            self.assertTrue(full["ok"], full)
+            self.assertTrue(full["transaction_history_complete"])
+            self.assertTrue(full["broker_trade_cumulative_pl_verified"])
+            self.assertEqual(full["transaction_count"], 18102)
+            self.assertEqual(full["broker_transaction_pages_this_refresh"], 1)
+            self.assertEqual(len(requests), 61)
+            self.assertAlmostEqual(full["realised_all_time_gbp"], 4.13)
+            self.assertEqual(requests[-1], (first + 18000, last))
+            self.assertEqual(full["blockers"], [])
+
+            checkpoint[0] += 1
+            incremental = audit.audit_live(core)
+            self.assertTrue(incremental["ok"], incremental)
+            self.assertEqual(requests[-1], (last + 1, last + 1))
+            self.assertEqual(len(requests), 62)
+            self.assertEqual(incremental["transaction_count"], 18103)
+            self.assertAlmostEqual(incremental["realised_all_time_gbp"], 4.08)
+
+            unchanged = audit.audit_live(core)
+            self.assertTrue(unchanged["ok"])
+            self.assertEqual(len(requests), 62)
+            self.assertEqual(unchanged["broker_transaction_pages_this_refresh"], 0)
+
+    def test_failure_and_malformed_range_do_not_advance_checkpoint(self):
+        from metals_xag_transaction_audit import TransactionHistory
+        history = TransactionHistory()
+        history.read("A", 1, 600, lambda a, b: {
+            "ok": True, "data": {"transactions": [{"id": str(a)}]}
+        }, max_pages=1)
+        self.assertEqual(history.next_id, 301)
+        for response in (
+            {"ok": False},
+            {"ok": True, "data": {"transactions": None}},
+            {"ok": True, "data": {"transactions": [{"id": "300"}]}},
+            {"ok": True, "data": {"transactions": [{"id": "301"}, {"id": "301"}]}},
+        ):
+            result = history.read("A", 1, 600, lambda a, b: response)
+            self.assertFalse(result["transaction_history_complete"])
+            self.assertEqual(history.next_id, 301)
+            self.assertEqual(len(history.rows), 1)
+        result = history.read("A", 1, 600, lambda a, b: {
+            "ok": True, "data": {"transactions": [{"id": str(a)}]}
+        })
+        self.assertTrue(result["transaction_history_complete"])
+        self.assertEqual([r["id"] for r in history.rows], ["1", "301"])
+
+    def test_account_boundary_and_rewind_discard_old_rows(self):
+        from metals_xag_transaction_audit import TransactionHistory
+        history = TransactionHistory()
+        def request(a, b):
+            return {"ok": True, "data": {"transactions": [{"id": str(a)}]}}
+        history.read("A", 1, 600, request)
+        history.read("B", 1, 3, request)
+        self.assertEqual([r["id"] for r in history.rows], ["1"])
+        history.read("B", 2, 5, request)
+        self.assertEqual([r["id"] for r in history.rows], ["2"])
+        history.read("B", 2, 3, request)
+        self.assertEqual([r["id"] for r in history.rows], ["2"])
+        self.assertEqual(history.next_id, 4)
+
+
 class AuditCacheRecoveryTests(unittest.TestCase):
     class DeferredThread:
         pending = []
@@ -176,6 +303,21 @@ class AuditCacheRecoveryTests(unittest.TestCase):
                     self.finish_one()
                     self.assertEqual(audit._cache["retry_delay_seconds"],delay)
                     audit._at-=delay+1
+
+    def test_backfill_progress_retries_without_escalating_delay(self):
+        from unittest.mock import patch
+        audit=self.audit
+        with patch.object(audit.threading, "Thread", self.DeferredThread):
+            with patch.object(audit, "audit_live", return_value={
+                "ok": False, "blockers": ["transaction_history_backfill_pending"],
+                "transaction_history_complete": False,
+            }):
+                for _ in range(4):
+                    pending=audit.snapshot(None)
+                    self.assertFalse(pending["ok"])
+                    self.finish_one()
+                    self.assertEqual(audit._cache["retry_delay_seconds"],30)
+                    audit._at-=31
 
     def test_bounded_stale_success_is_timestamped_and_never_silent_forever(self):
         from unittest.mock import patch

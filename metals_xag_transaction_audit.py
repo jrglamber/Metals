@@ -16,8 +16,8 @@ from urllib.parse import urlencode
 
 from metals_xag_ledger_audit import _id, _utc, audit_links
 
-VERSION = "xag_short_net_cash_ledger_shadow_v1_2026_11_17"
-MAX_TX_PAGES = 60
+VERSION = "xag_short_net_cash_ledger_checkpoint_v2_2026_11_26"
+MAX_TX_PAGES = 60  # Per worker pass, never an unbounded broker request loop.
 TX_RANGE_SIZE = 300
 CACHE_SECONDS = 180  # Successful full-history proof is expensive (many broker pages).
 FAIL_CACHE_SECONDS = 30  # Retry a first transient failure within 30 seconds.
@@ -266,6 +266,80 @@ def transaction_financials(transactions, links, broker_trades, now=None):
     }
 
 
+class TransactionHistory:
+    """A process-local, contiguous history checkpoint for one live account.
+
+    OANDA transactions are immutable. Reuse only successfully read ranges
+    beginning at the same first linked trade; a new account, changed boundary
+    or rewound broker checkpoint discards the cache. Each refresh retains the
+    original bounded request budget. No incomplete history is ever promoted.
+    """
+
+    # Keep only fields used by transaction_financials, not raw broker quotes,
+    # account identifiers, or unrelated transaction metadata.
+    _FIELDS = (
+        "id", "type", "time", "instrument", "pl", "financing", "commission",
+        "guaranteedExecutionFee", "tradesClosed", "tradeReduced", "tradeOpened",
+        "positionFinancings", "openTradeDividendAdjustments", "dividendAdjustment",
+    )
+
+    def __init__(self):
+        self.key = None
+        self.next_id = None
+        self.rows = []
+        self.pages = 0
+
+    def read(self, account, earliest, last, request, max_pages=None):
+        max_pages = MAX_TX_PAGES if max_pages is None else max_pages
+        key = (account, earliest)
+        if self.key != key or self.next_id is None or last < self.next_id - 1:
+            self.key = key
+            self.next_id = earliest
+            self.rows = []
+            self.pages = 0
+        pages_read = 0
+        blocker = None
+        while self.next_id <= last and pages_read < max_pages:
+            start = self.next_id
+            end = min(last, start + TX_RANGE_SIZE - 1)
+            response = request(start, end)
+            pages_read += 1
+            if response.get("ok") is not True:
+                blocker = "broker_transactions_range_read_failed"
+                break
+            items = (response.get("data") or {}).get("transactions")
+            if not isinstance(items, list):
+                blocker = "broker_transactions_range_invalid"
+                break
+            ids = [_id(t.get("id")) if isinstance(t, dict) else None for t in items]
+            if (any(i is None or i < start or i > end for i in ids)
+                    or len(ids) != len(set(ids))):
+                blocker = "broker_transactions_range_invalid"
+                break
+            # The successful inclusive idrange response covers the entire
+            # requested interval, even if there are gaps in broker IDs.
+            # Advance only after validating and storing the entire page.
+            compact = [{k: t[k] for k in self._FIELDS if k in t} for t in items]
+            self.rows.extend(compact)
+            self.next_id = end + 1
+            self.pages += 1
+        complete = self.next_id > last
+        if not complete and blocker is None:
+            blocker = "transaction_history_backfill_pending"
+        return {
+            "transaction_history_complete": complete,
+            "broker_transaction_range_pages": self.pages,
+            "broker_transaction_pages_this_refresh": pages_read,
+            "transaction_id_span": last - earliest + 1,
+            "transaction_ids_covered": self.next_id - earliest,
+            "transaction_ids_remaining": max(0, last + 1 - self.next_id),
+            "blockers": [blocker] if blocker else [],
+        }
+
+
+_history = TransactionHistory()
+
+
 def audit_live(core):
     import xag_short_live_override as xag
     account=xag._account_id(core)
@@ -316,38 +390,29 @@ def audit_live(core):
                 "ownership_blockers":ownership.get("blockers"),
                 "transaction_history_complete":False}
 
-    # OANDA idrange is inclusive. Deliberately fetch all transaction types so
-    # costs are neither overlooked nor manufactured from a filtered subset.
-    transactions=[]; pages=0
-    end_limit=earliest+TX_RANGE_SIZE*MAX_TX_PAGES-1
-    if last>end_limit:
-        return {"ok":False,"version":VERSION,
-                "trade_ownership_verified":True,"transaction_history_complete":False,
-                "blockers":["transaction_range_safety_cap_exceeded"],
-                "transaction_id_span":last-earliest+1}
-    for start in range(earliest,last+1,TX_RANGE_SIZE):
-        end=min(last,start+TX_RANGE_SIZE-1)
-        resp=xag._request(
-            core,f"/v3/accounts/{account}/transactions/idrange?"+urlencode({"from":start,"to":end}),"GET"
+    # Fetch all transaction kinds in bounded inclusive ranges. Grow the
+    # process-local checkpoint incrementally instead of imposing a lifetime
+    # transaction-span ceiling or repeating the entire history every refresh.
+    def request_range(start, end):
+        return xag._request(
+            core, f"/v3/accounts/{account}/transactions/idrange?"+
+            urlencode({"from": start, "to": end}), "GET"
         )
-        if resp.get("ok") is not True:
-            return {"ok":False,"version":VERSION,"transaction_history_complete":False,
-                    "trade_ownership_verified":True,
-                    "blockers":["broker_transactions_range_read_failed"]}
-        items=(resp.get("data") or {}).get("transactions")
-        if not isinstance(items,list):
-            raise RuntimeError("OANDA transaction range payload malformed")
-        transactions.extend(items)
-        pages+=1
-    amounts=transaction_financials(transactions,links,trades)
+
+    progress = _history.read(account, earliest, last, request_range)
+    if not progress["transaction_history_complete"]:
+        return {
+            "ok": False, "version": VERSION, "account_currency": currency,
+            "trade_ownership_verified": True, "net_realised_gbp_verified": False,
+            **progress,
+        }
+    amounts=transaction_financials(_history.rows,links,trades)
     return {
         "ok":bool(amounts["ok"]),
         "version":VERSION,
         "account_currency":currency,
         "trade_ownership_verified":True,
-        "transaction_history_complete":True,
-        "broker_transaction_range_pages":pages,
-        "transaction_id_span":last-earliest+1,
+        **progress,
         "broker_trade_count":len(links),
         "broker_closed_xag_trades":ownership.get("broker_xag_short_closed"),
         "net_realised_gbp_verified":bool(amounts["ok"]),
@@ -378,7 +443,12 @@ def _refresh_snapshot(core):
             if result.get("ok") is True:
                 _consecutive_failures = 0
             else:
-                _consecutive_failures += 1
+                # Completing one bounded backfill pass is normal progress,
+                # not an outage. Retry on the existing first-failure cadence.
+                if result.get("blockers") == ["transaction_history_backfill_pending"]:
+                    _consecutive_failures = 1
+                else:
+                    _consecutive_failures += 1
                 result["retry_delay_seconds"] = min(
                     MAX_FAIL_CACHE_SECONDS,
                     FAIL_CACHE_SECONDS * (2 ** min(10, max(0, _consecutive_failures - 1))))
@@ -392,7 +462,7 @@ def _refresh_snapshot(core):
 def snapshot(core):
     """Nonblocking latest broker-verified cash proof, never a fabricated total.
 
-    The full audit can read 33+ OANDA transaction pages and exceed the Hub's
+    A cold audit can read up to 60 OANDA transaction pages and exceed the Hub's
     five-second request deadline. Refresh in one daemon worker while returning
     the last time-stamped proof for at most eight minutes; initial/cold state,
     expired proof, and failed audits stay unverified. Trading is unaffected.
