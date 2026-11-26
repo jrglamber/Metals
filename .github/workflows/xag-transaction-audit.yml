@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'metals_xag_transaction_audit.py'
+      - 'metals_xag_transaction_checkpoint.py'
+      - 'test_metals_xag_transaction_checkpoint.py'
       - 'metals_xag_realised_verified.py'
       - 'metals_live_open_pnl_display.py'
       - 'test_metals_xag_realised_verified.py'
@@ -14,6 +16,8 @@ on:
     branches: [recovery-pre-analysis-contract-20261010]
     paths:
       - 'metals_xag_transaction_audit.py'
+      - 'metals_xag_transaction_checkpoint.py'
+      - 'test_metals_xag_transaction_checkpoint.py'
       - 'metals_xag_realised_verified.py'
       - 'metals_live_open_pnl_display.py'
       - 'test_metals_xag_realised_verified.py'
@@ -33,8 +37,8 @@ jobs:
           python-version: '3.11'
       - name: Pure strict net-GBP accounting regressions
         run: |
-          python -m py_compile metals_xag_realised_verified.py test_metals_xag_realised_verified.py metals_xag_transaction_audit.py test_metals_xag_transaction_audit.py metals_xag_live_wording_entrypoint.py
-          python -m unittest -v test_metals_xag_transaction_audit test_metals_xag_realised_verified
+          python -m py_compile metals_xag_realised_verified.py test_metals_xag_realised_verified.py metals_xag_transaction_audit.py test_metals_xag_transaction_audit.py metals_xag_transaction_checkpoint.py test_metals_xag_transaction_checkpoint.py metals_xag_live_wording_entrypoint.py
+          python -m unittest -v test_metals_xag_transaction_audit test_metals_xag_transaction_checkpoint test_metals_xag_realised_verified
       - name: Broker-backed shadow transaction coverage with no order writes
         if: github.event_name != 'pull_request'
         run: |
