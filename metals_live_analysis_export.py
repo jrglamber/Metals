@@ -108,7 +108,16 @@ def _limited_rows(conn, table, cols, order):
 def _link_records(core, table, fields):
     with core.get_conn() as conn:
         items = _limited_rows(conn, table, "*", "id ASC")
-    return [{f: row.get(f) for f in fields} for row in items]
+    records = []
+    for row in items:
+        record = {f: row.get(f) for f in fields}
+        # The live link tables store the broker's authoritative open time as
+        # broker_open_time_utc; the export's stable public column is
+        # opened_at_utc. Map the source field instead of emitting blank cells.
+        if not record.get("opened_at_utc"):
+            record["opened_at_utc"] = row.get("broker_open_time_utc")
+        records.append(record)
+    return records
 
 
 _BUDGET_BLOCK_FIELDS = [
