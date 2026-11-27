@@ -158,4 +158,24 @@ class ExportTests(unittest.TestCase):
         self.assertIsNone(m['all_time_net_gbp'])
 
 
+    def test_trade_link_export_uses_broker_open_time(self):
+        expected = "2026-11-27T18:00:00+00:00"
+        with self.core.get_conn() as conn:
+            for table in ("metals_xau_live_trade_links", "metals_xag_live_trade_links"):
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN broker_trade_id TEXT")
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN side TEXT")
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN status TEXT")
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN opened_at_utc TEXT")
+                conn.execute("ALTER TABLE " + table + " ADD COLUMN broker_open_time_utc TEXT")
+                conn.execute(
+                    "INSERT INTO " + table +
+                    " (id,broker_trade_id,side,status,opened_at_utc,broker_open_time_utc) "
+                    "VALUES (1,'12345','short','CLOSED','',?)",
+                    (expected,),
+                )
+        self.archive()
+        for name in ("live-xau-trade-links.csv", "live-xag-short-trade-links.csv"):
+            self.assertEqual(self.csv(name)[0]["opened_at_utc"], expected)
+
+
 if __name__ == '__main__': unittest.main()
