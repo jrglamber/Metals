@@ -4,6 +4,9 @@ on:
     paths:
       - metals_young_basket_research.py
       - test_metals_young_basket_research.py
+      - metals_young_exposure_study.py
+      - test_metals_young_exposure_study.py
+      - YOUNG_BASKET_RESEARCH.md
       - .github/workflows/metals-young-basket-offline-tests.yml
   workflow_dispatch:
 permissions:
@@ -19,5 +22,5 @@ jobs:
           python-version: '3.11'
       - name: Run offline synthetic tests
         run: |
-          python -m py_compile metals_young_basket_research.py test_metals_young_basket_research.py
-          python -m unittest -v test_metals_young_basket_research
+          python -m py_compile metals_young_basket_research.py test_metals_young_basket_research.py metals_young_exposure_study.py test_metals_young_exposure_study.py
+          python -m unittest -v test_metals_young_basket_research test_metals_young_exposure_study
