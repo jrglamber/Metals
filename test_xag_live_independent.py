@@ -501,5 +501,12 @@ class XagManagerPostgresMaturityRegressionTests(unittest.TestCase):
         self.assertEqual(reviewed_sql[0][1][-1], 1001)
 
 
+class LiveXagStopConfigurationTests(unittest.TestCase):
+    def test_stop_is_4_5_percent_without_increasing_sizing(self):
+        self.assertEqual(live.SL_PCT, 4.5)
+        self.assertEqual(live.TARGET_RISK_GBP, 2.0)
+        self.assertEqual(live.PILOT_UNITS, 1.0)
+
+
 if __name__=="__main__":
     unittest.main()
