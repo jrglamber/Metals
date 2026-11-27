@@ -1,0 +1,26 @@
+name: Metals young basket offline study tests
+on:
+  pull_request:
+    paths:
+      - metals_young_basket_research.py
+      - test_metals_young_basket_research.py
+      - metals_young_exposure_study.py
+      - test_metals_young_exposure_study.py
+      - YOUNG_BASKET_RESEARCH.md
+      - .github/workflows/metals-young-basket-offline-tests.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run offline synthetic tests
+        run: |
+          python -m py_compile metals_young_basket_research.py test_metals_young_basket_research.py metals_young_exposure_study.py test_metals_young_exposure_study.py
+          python -m unittest -v test_metals_young_basket_research test_metals_young_exposure_study
