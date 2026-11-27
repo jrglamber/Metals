@@ -8,7 +8,7 @@ governance path so XAG LONG remains research-only and the 24-position /
 Safety:
 - XAG_USD only, SHORT only
 - exactly one whole XAG unit during pilot
-- ~£2 target risk with 5.24% emergency stop; fail closed above +25% risk
+- ~£2 target risk with 4.5% emergency stop; fail closed above +25% risk
 - broker stop must be attached and verified immediately after fill
 - dedicated XAG live tables; never writes XAG rows into XAU live tables
 - MFE25 after 48h, matching the current new-XAG-SHORT policy
@@ -36,7 +36,7 @@ SIDE = "short"
 POLICY = "MFE_GIVEBACK_25"
 POLICY_VERSION = "metals_xag_short_mfe25_48h_v1_2026_10_13"
 TARGET_RISK_GBP = 2.0
-SL_PCT = 5.24
+SL_PCT = 4.5
 PILOT_UNITS = 1.0
 MAX_RISK_OVERAGE_PCT = 25.0
 MAX_OPEN = 24
